@@ -53,5 +53,5 @@ print("Bot is running...")
 client.start()
 client.run_until_disconnected()
 
-if name == 'main':
-main() how to use
+if __name__ == "__main__":
+    main() how to use
