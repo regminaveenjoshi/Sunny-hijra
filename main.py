@@ -22,7 +22,12 @@ from pytgcalls.types.stream import StreamEnded
 # telegram_user_session.session file. Never print its contents.
 SESSION_NAME = "telegram_user_session"
 SESSION_FILE = Path(f"{SESSION_NAME}.session")
-session_file_b64 = os.getenv("SESSION_FILE_B64")
+# Railway limits the length of a single variable, so the Base64 data
+# can be split across SESSION_FILE_B64_1 and SESSION_FILE_B64_2.
+session_file_b64 = (
+    os.getenv("SESSION_FILE_B64", "")
+    or os.getenv("SESSION_FILE_B64_1", "") + os.getenv("SESSION_FILE_B64_2", "")
+)
 
 if session_file_b64 and not SESSION_FILE.exists():
     SESSION_FILE.write_bytes(base64.b64decode(session_file_b64))
