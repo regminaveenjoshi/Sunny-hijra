@@ -5,6 +5,7 @@ api_hash = "e7c1cd2b29c3687ee417f2b085947580"
 TARGET_USERS = {
     "NotYourChatgpt",
     "Stfuleo",
+    "darkwavenv",
     "Retired_Cheater"
 }
 
