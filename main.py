@@ -1,20 +1,31 @@
 import asyncio
+import base64
 import os
+from pathlib import Path
 
-from pyrogram import Client
 import pyrogram.errors as pyrogram_errors
 
-# Compatibility fix: some PyTgCalls versions expect GroupCallForbidden,
-# while Pyrogram exposes the exception as GroupcallForbidden.
+# Compatibility fix for PyTgCalls/Pyrogram exception-name mismatch.
 if (
     not hasattr(pyrogram_errors, "GroupCallForbidden")
     and hasattr(pyrogram_errors, "GroupcallForbidden")
 ):
     pyrogram_errors.GroupCallForbidden = pyrogram_errors.GroupcallForbidden
 
+from pyrogram import Client
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
 from pytgcalls.types.stream import StreamEnded
+
+
+# Railway variable SESSION_FILE_B64 should contain the Base64-encoded
+# telegram_user_session.session file. Never print its contents.
+SESSION_NAME = "telegram_user_session"
+SESSION_FILE = Path(f"{SESSION_NAME}.session")
+session_file_b64 = os.getenv("SESSION_FILE_B64")
+
+if session_file_b64 and not SESSION_FILE.exists():
+    SESSION_FILE.write_bytes(base64.b64decode(session_file_b64))
 
 # Set these in Railway Variables; don't hard-code secrets in source code.
 API_ID = int(os.environ["API_ID"])
