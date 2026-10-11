@@ -2,6 +2,16 @@ import asyncio
 import os
 
 from pyrogram import Client
+import pyrogram.errors as pyrogram_errors
+
+# Compatibility fix: some PyTgCalls versions expect GroupCallForbidden,
+# while Pyrogram exposes the exception as GroupcallForbidden.
+if (
+    not hasattr(pyrogram_errors, "GroupCallForbidden")
+    and hasattr(pyrogram_errors, "GroupcallForbidden")
+):
+    pyrogram_errors.GroupCallForbidden = pyrogram_errors.GroupcallForbidden
+
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
 from pytgcalls.types.stream import StreamEnded
