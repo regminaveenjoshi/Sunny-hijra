@@ -29,14 +29,16 @@ client = TelegramClient('my_session', api_id, api_hash)
 
 @client.on(events.NewMessage)
 async def auto_reply(event):
-if event.is_group:
-sender = await event.get_sender()
-if sender:
-username = sender.username
-user_id = str(sender.id)
+@client.on(events.NewMessage)
+async def auto_reply(event):
+    if not event.is_group:
+        return
 
-identifier = username if username in TARGET_USERS else (user_id if user_id in TARGET_USERS else None)  
-          
+    sender = await event.get_sender()
+    if not sender:
+        return
+
+    await event.reply("TERI BHENN KAAA KALAAA KALAAAA BHSODAAAA MRUUU.")
         if identifier:  
             if identifier not in user_indices:  
                 user_indices[identifier] = 0  
