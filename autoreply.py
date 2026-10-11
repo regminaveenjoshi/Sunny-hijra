@@ -1,7 +1,9 @@
 from telethon import TelegramClient, events
 
-api_id = 38088607
-api_hash = "e7c1cd2b29c3687ee417f2b085947580"
+import os
+
+api_id = int(os.environ["API_ID"])
+api_hash = os.environ["API_HASH"]
 TARGET_USERS = {
     "NotYourChatgpt",
     "Stfuleo",
