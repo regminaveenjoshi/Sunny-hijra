@@ -1,12 +1,7 @@
 /**
- * Hand Cricket Telegram Bot — Single file (bot.js)
- * Node.js + Telegraf + PostgreSQL (Supabase)
- *
- * Setup:
- * 1. npm install
- * 2. Copy .env.example → .env (BOT_TOKEN + DATABASE_URL)
- * 3. Run schema SQL once on Supabase (see bottom of this file)
- * 4. npm start
+ * Hand Cricket Telegram Bot — Single file
+ * Solo: auto batsman/bowler, no non-striker, just type 1-6
+ * Team: full /bat /bowl flow
  */
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
@@ -16,7 +11,7 @@ const crypto = require('crypto');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!BOT_TOKEN || !DATABASE_URL) {
-  console.error('Set BOT_TOKEN and DATABASE_URL in .env');
+  console.error('Set BOT_TOKEN and DATABASE_URL');
   process.exit(1);
 }
 
@@ -30,10 +25,21 @@ const bot = new Telegraf(BOT_TOKEN);
 const DEFAULT_OVERS = 5;
 const DEFAULT_TEAM_SIZE = 5;
 const MAX_BOWLER_OVERS = 4;
+const LOBBY_SECONDS = 60; // solo lobby timer
 
-// ─── DB helpers ──────────────────────────────────────────
-async function q(text, params = []) {
-  return pool.query(text, params);
+// matchId -> { timer, endsAt, chatId, hostId }
+const lobbies = new Map();
+
+function clearLobby(matchId) {
+  const L = lobbies.get(matchId);
+  if (L?.timer) clearTimeout(L.timer);
+  if (L?.tick) clearInterval(L.tick);
+  lobbies.delete(matchId);
+}
+
+// ─── DB ──────────────────────────────────────────────────
+async function q(sql, params = []) {
+  return pool.query(sql, params);
 }
 
 async function getActiveMatch(chatId) {
@@ -87,7 +93,10 @@ async function getPlayer(id) {
 }
 
 async function getTeam(matchId, label) {
-  const { rows } = await q(`SELECT * FROM match_teams WHERE match_id=$1 AND team_label=$2`, [matchId, label]);
+  const { rows } = await q(
+    `SELECT * FROM match_teams WHERE match_id=$1 AND team_label=$2`,
+    [matchId, label]
+  );
   return rows[0] || null;
 }
 
@@ -112,8 +121,9 @@ async function upsertUser(u) {
 }
 
 function name(p) {
-  if (!p) return '?';
-  return p.username ? `@${p.username}` : p.first_name || `User${p.telegram_id}`;
+  if (!p) return '—';
+  if (p.username) return `@${p.username}`;
+  return p.first_name || `User${p.telegram_id || ''}`;
 }
 
 function oversStr(balls) {
@@ -124,71 +134,172 @@ function isGroup(ctx) {
   return ctx.chat && (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup');
 }
 
+function line(char = '─', n = 22) {
+  return char.repeat(n);
+}
+
 // ─── Keyboards ───────────────────────────────────────────
 const mainKb = () =>
   Markup.inlineKeyboard([
     [Markup.button.callback('🎮 SOLO', 'm:solo'), Markup.button.callback('👥 TEAM', 'm:team')],
     [Markup.button.callback('👤 PROFILE', 'm:profile'), Markup.button.callback('🏆 BOARD', 'm:lb')],
-    [Markup.button.callback('📖 HOW TO PLAY', 'm:help')],
+    [Markup.button.callback('📖 HELP', 'm:help')],
   ]);
 
 const tossKb = (id) =>
   Markup.inlineKeyboard([
-    [Markup.button.callback('🏏 BAT FIRST', `toss:${id}:bat`), Markup.button.callback('🎳 BOWL FIRST', `toss:${id}:bowl`)],
+    [
+      Markup.button.callback('🏏 BAT FIRST', `toss:${id}:bat`),
+      Markup.button.callback('🎳 BOWL FIRST', `toss:${id}:bowl`),
+    ],
   ]);
 
 const bowlKb = (token) =>
   Markup.inlineKeyboard([
-    [Markup.button.callback('1️⃣', `bowl:${token}:1`), Markup.button.callback('2️⃣', `bowl:${token}:2`), Markup.button.callback('3️⃣', `bowl:${token}:3`)],
-    [Markup.button.callback('4️⃣', `bowl:${token}:4`), Markup.button.callback('5️⃣', `bowl:${token}:5`), Markup.button.callback('6️⃣', `bowl:${token}:6`)],
+    [
+      Markup.button.callback('1️⃣', `bowl:${token}:1`),
+      Markup.button.callback('2️⃣', `bowl:${token}:2`),
+      Markup.button.callback('3️⃣', `bowl:${token}:3`),
+    ],
+    [
+      Markup.button.callback('4️⃣', `bowl:${token}:4`),
+      Markup.button.callback('5️⃣', `bowl:${token}:5`),
+      Markup.button.callback('6️⃣', `bowl:${token}:6`),
+    ],
   ]);
 
-// ─── Scoreboard ──────────────────────────────────────────
+// ─── Solo: auto set batsman + bowler ──────────────────────
+async function soloAutoSetup(match, inn) {
+  if (match.mode !== 'solo') return inn;
+  const batPlayers = await getPlayers(match.id, inn.batting_team);
+  const bowlPlayers = await getPlayers(match.id, inn.bowling_team);
+  if (!batPlayers[0] || !bowlPlayers[0]) return inn;
+
+  const batsman = batPlayers[0];
+  const bowler = bowlPlayers[0];
+
+  await q(
+    `INSERT INTO batting_stats (innings_id, player_id) VALUES ($1,$2)
+     ON CONFLICT (innings_id, player_id) DO NOTHING`,
+    [inn.id, batsman.id]
+  );
+  await q(
+    `INSERT INTO bowling_stats (innings_id, player_id) VALUES ($1,$2)
+     ON CONFLICT (innings_id, player_id) DO NOTHING`,
+    [inn.id, bowler.id]
+  );
+
+  // Solo: only striker, no non-striker
+  await q(
+    `UPDATE innings SET
+       striker_player_id = COALESCE(striker_player_id, $2),
+       non_striker_player_id = NULL,
+       current_bowler_id = COALESCE(current_bowler_id, $3)
+     WHERE id = $1`,
+    [inn.id, batsman.id, bowler.id]
+  );
+  return getInnings(match.id);
+}
+
+// ─── Scoreboard (designed) ───────────────────────────────
 async function scoreboard(matchId) {
   const match = await getMatch(matchId);
-  if (!match) return 'No match';
+  if (!match) return '❌ Match not found';
+
   const inn = await getInnings(matchId);
-  let t = '🏏 HAND CRICKET — LIVE\n\n';
+  const isSolo = match.mode === 'solo';
+
+  let t = '';
+  t += `╔══════════════════════╗\n`;
+  t += `║  🏏 HAND CRICKET     ║\n`;
+  t += `╚══════════════════════╝\n\n`;
+
   if (['completed', 'cancelled'].includes(match.status)) {
-    t += `Status: ${match.status}\n`;
-    if (match.winner_team) t += `Winner: Team ${match.winner_team}`;
+    t += `Status: *${match.status.toUpperCase()}*\n`;
+    if (match.winner_team === 'tie') t += `🤝 *MATCH TIED*\n`;
+    else if (match.winner_team) t += `🏆 Winner: *Team ${match.winner_team}*\n`;
     return t;
   }
-  if (!inn) return t + 'Waiting…';
+
+  if (!inn) {
+    t += `⏳ Waiting for match to start…\n`;
+    return t;
+  }
+
   const bat = inn.batting_team;
   const bowl = inn.bowling_team;
-  t += `Team ${bat}: ${inn.total_runs}/${inn.total_wickets}\n`;
-  t += `Overs: ${oversStr(inn.balls_bowled)}/${match.total_overs}\n`;
-  if (match.target && inn.innings_number === 2) t += `Target: ${match.target} (Need ${Math.max(0, match.target - inn.total_runs)})\n`;
+  const totalOvers = match.total_overs || 5;
+  const crr =
+    inn.balls_bowled > 0
+      ? ((inn.total_runs * 6) / inn.balls_bowled).toFixed(2)
+      : '0.00';
+
+  t += `📊 *INNINGS ${inn.innings_number}*\n`;
+  t += `${line()}\n`;
+  t += `🅰️ Team ${bat}  »  *${inn.total_runs}/${inn.total_wickets}*\n`;
+  t += `⏱ Overs: *${oversStr(inn.balls_bowled)} / ${totalOvers}*\n`;
+  t += `📈 RR: *${crr}*\n`;
+
+  if (match.target && inn.innings_number === 2) {
+    const need = Math.max(0, match.target - inn.total_runs);
+    t += `🎯 Target: *${match.target}*  (Need *${need}*)\n`;
+  }
 
   const striker = await getPlayer(inn.striker_player_id);
   const non = await getPlayer(inn.non_striker_player_id);
   const bowler = await getPlayer(inn.current_bowler_id);
-  if (striker) t += `\n🏏 Striker: ${name(striker)}`;
-  if (non) t += `\n🧍🏻 Non-striker: ${name(non)}`;
-  if (bowler) t += `\n🎳 Bowler: ${name(bowler)}`;
 
-  t += `\n\nTEAM ${bat} BATTING\n`;
+  t += `\n${line()}\n`;
+  if (striker) t += `🏏 Striker   ${name(striker)}\n`;
+  if (!isSolo && non) t += `🧍🏻 Non-strike ${name(non)}\n`;
+  if (bowler) t += `🎳 Bowler    ${name(bowler)}\n`;
+
+  // Batting card
+  t += `\n┌─ BATTING Team ${bat} ─┐\n`;
   const bats = await getPlayers(matchId, bat);
   for (const p of bats) {
-    let e = '⚪';
-    if (striker && p.id === striker.id) e = '🏏';
-    else if (non && p.id === non.id) e = '🧍🏻';
-    const { rows: st } = await q(`SELECT * FROM batting_stats WHERE innings_id=$1 AND player_id=$2`, [inn.id, p.id]);
-    if (st[0]?.is_out) e = '❌';
-    t += `${p.roster_position}. ${e} ${name(p)}${st[0] ? ` (${st[0].runs})` : ''}\n`;
+    const { rows: st } = await q(
+      `SELECT * FROM batting_stats WHERE innings_id=$1 AND player_id=$2`,
+      [inn.id, p.id]
+    );
+    const s = st[0];
+    let icon = '⚪';
+    if (striker && p.id === striker.id) icon = '🏏';
+    else if (non && p.id === non.id) icon = '🧍🏻';
+    else if (s?.is_out) icon = '❌';
+    else if (s && (s.balls_faced || 0) > 0) icon = '✅';
+
+    const runs = s ? `${s.runs || 0}(${s.balls_faced || 0})` : '—';
+    t += `│ ${icon} ${p.roster_position}. ${name(p)}  ${runs}\n`;
+  }
+  t += `└${'─'.repeat(20)}┘\n`;
+
+  // Bowling card
+  t += `\n┌─ BOWLING Team ${bowl} ─┐\n`;
+  const bowls = await getPlayers(matchId, bowl);
+  const maxOv = match.max_overs_per_bowler || MAX_BOWLER_OVERS;
+  for (const p of bowls) {
+    const { rows: st } = await q(
+      `SELECT * FROM bowling_stats WHERE innings_id=$1 AND player_id=$2`,
+      [inn.id, p.id]
+    );
+    const s = st[0];
+    const bb = s?.balls_bowled || 0;
+    let icon = '🟢';
+    if (bowler && p.id === bowler.id) icon = '🎳';
+    else if (bb / 6 >= maxOv) icon = '✅';
+
+    const fig = s
+      ? `${s.wickets || 0}/${s.runs_conceded || 0} (${oversStr(bb)})`
+      : '—';
+    t += `│ ${icon} ${p.roster_position}. ${name(p)}  ${fig}\n`;
+  }
+  t += `└${'─'.repeat(20)}┘\n`;
+
+  if (isSolo) {
+    t += `\n💡 Solo: batsman group mein *1-6* type kare`;
   }
 
-  t += `\nTEAM ${bowl} BOWLING\n`;
-  const bowls = await getPlayers(matchId, bowl);
-  for (const p of bowls) {
-    let e = '🟢';
-    if (bowler && p.id === bowler.id) e = '🎳';
-    const { rows: st } = await q(`SELECT * FROM bowling_stats WHERE innings_id=$1 AND player_id=$2`, [inn.id, p.id]);
-    const bb = st[0]?.balls_bowled || 0;
-    if (bb / 6 >= (match.max_overs_per_bowler || MAX_BOWLER_OVERS)) e = '✅';
-    t += `${p.roster_position}. ${e} ${name(p)}${bb ? ` (${oversStr(bb)})` : ''}\n`;
-  }
   return t;
 }
 
@@ -196,20 +307,33 @@ async function scoreboard(matchId) {
 bot.start(async (ctx) => {
   await upsertUser(ctx.from);
   await ctx.reply(
-    '🏏 *HAND CRICKET*\n\nGroup mein match banao.\nPehle yahan /start dabao (bowling DM ke liye zaroori).',
+    `╔══════════════════════╗\n` +
+      `║  🏏 HAND CRICKET     ║\n` +
+      `╚══════════════════════╝\n\n` +
+      `Group mein match banao.\n` +
+      `Pehle yahan /start dabao (bowling DM ke liye).\n\n` +
+      `*Solo* → sirf 1-6 type karo, auto setup\n` +
+      `*Team* → /bat /bowl se select`,
     { parse_mode: 'Markdown', ...mainKb() }
   );
 });
 
 bot.command('help', async (ctx) => {
   await ctx.reply(
-    `📖 *How to play*\n\n` +
-      `Group: /startsolo ya /startteam\n` +
-      `/joinsolo · /join_a · /join_b\n` +
-      `/setcaptain_a 1 · /startmatch\n` +
-      `/bat 1 · /bowl 1\n` +
-      `Striker: group mein 1-6 type karo\n` +
-      `Bowler: private buttons se number choose\n` +
+    `📖 *HOW TO PLAY*\n\n` +
+      `*SOLO*\n` +
+      `/startsolo — lobby (60s timer)\n` +
+      `/joinsolo — join\n` +
+      `/leavesolo — leave\n` +
+      `/forcestart — host turant start (2 players)\n` +
+      `/extend30 — +30s lobby\n` +
+      `Timer khatam / force → toss → auto bat/bowl\n` +
+      `Batsman: group mein 1-6\n` +
+      `Bowler: private buttons\n\n` +
+      `*TEAM*\n` +
+      `/startteam → /join_a /join_b\n` +
+      `/setcaptain_a 1 → /startmatch\n` +
+      `/bat 1 · /bowl 1 → 1-6\n\n` +
       `Same number = OUT`,
     { parse_mode: 'Markdown' }
   );
@@ -217,15 +341,19 @@ bot.command('help', async (ctx) => {
 
 bot.action('m:solo', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply('Group mein bhejo: `/startsolo`', { parse_mode: 'Markdown' });
+  await ctx.reply('Group mein bhejo:\n`/startsolo`', { parse_mode: 'Markdown' });
 });
 bot.action('m:team', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply('Group mein bhejo: `/startteam` ya `/startteam 5 5`', { parse_mode: 'Markdown' });
+  await ctx.reply('Group mein bhejo:\n`/startteam` ya `/startteam 5 5`', {
+    parse_mode: 'Markdown',
+  });
 });
 bot.action('m:help', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply('Group: /startsolo or /startteam → join → /startmatch → /bat /bowl → type 1-6');
+  await ctx.reply(
+    'Solo: /startsolo → join → start → type 1-6\nTeam: /startteam → join → captains → /bat /bowl'
+  );
 });
 bot.action('m:profile', async (ctx) => {
   await ctx.answerCbQuery();
@@ -233,28 +361,103 @@ bot.action('m:profile', async (ctx) => {
   const { rows } = await q(`SELECT * FROM users WHERE telegram_id=$1`, [ctx.from.id]);
   const u = rows[0] || {};
   await ctx.reply(
-    `👤 ${ctx.from.username || ctx.from.first_name}\nMatches: ${u.matches_played || 0}\nWon: ${u.matches_won || 0}\nRuns: ${u.total_runs || 0}`
+    `👤 *${name(ctx.from)}*\n` +
+      `${line()}\n` +
+      `Matches: ${u.matches_played || 0}\n` +
+      `Won: ${u.matches_won || 0}  Lost: ${u.matches_lost || 0}\n` +
+      `Runs: ${u.total_runs || 0}  Wickets: ${u.total_wickets || 0}\n` +
+      `Best: ${u.highest_score || 0}`,
+    { parse_mode: 'Markdown' }
   );
 });
 bot.action('m:lb', async (ctx) => {
   await ctx.answerCbQuery();
   const { rows } = await q(
-    `SELECT username, first_name, matches_won, matches_played, total_runs FROM users WHERE matches_played>0 ORDER BY matches_won DESC LIMIT 10`
+    `SELECT username, first_name, matches_won, matches_played, total_runs
+     FROM users WHERE matches_played>0 ORDER BY matches_won DESC, total_runs DESC LIMIT 10`
   );
-  if (!rows.length) return ctx.reply('No data yet');
-  let t = '🏆 Leaderboard\n';
+  if (!rows.length) return ctx.reply('🏆 Abhi koi match nahi');
+  let t = `🏆 *LEADERBOARD*\n${line()}\n`;
   rows.forEach((r, i) => {
-    t += `${i + 1}. ${r.username ? '@' + r.username : r.first_name} — ${r.matches_won}W · ${r.total_runs} runs\n`;
+    const n = r.username ? `@${r.username}` : r.first_name || '?';
+    t += `${i + 1}. ${n} — ${r.matches_won}W · ${r.total_runs} runs\n`;
   });
-  await ctx.reply(t);
+  await ctx.reply(t, { parse_mode: 'Markdown' });
 });
 
-// ─── Create Solo ─────────────────────────────────────────
+// ─── Solo: start match (toss) from lobby ─────────────────
+async function beginSoloFromLobby(matchId, chatId, telegram) {
+  clearLobby(matchId);
+  const m = await getMatch(matchId);
+  if (!m || m.status !== 'waiting' || m.mode !== 'solo') return;
+
+  const players = await getPlayers(m.id);
+  if (players.length < 2) {
+    await telegram.sendMessage(
+      chatId,
+      `⏰ *Lobby time up!*\nPlayers: ${players.length}/2\nMatch cancelled. /startsolo dubara try karo.`,
+      { parse_mode: 'Markdown' }
+    );
+    await q(`UPDATE matches SET status='cancelled' WHERE id=$1`, [matchId]);
+    return;
+  }
+
+  const winner = Math.random() < 0.5 ? 'A' : 'B';
+  await q(`UPDATE matches SET status='toss', toss_winner_team=$2 WHERE id=$1`, [
+    matchId,
+    winner,
+  ]);
+
+  const a = players.find((p) => p.team_label === 'A');
+  const b = players.find((p) => p.team_label === 'B');
+
+  await telegram.sendMessage(
+    chatId,
+    `⚡ *SOLO CRICKET BEGINS!*\n` +
+      `${line('═')}\n` +
+      `👥 Players: *2*\n` +
+      `🏏 ${name(a)}  vs  ${name(b)}\n\n` +
+      `🪙 Toss: Team *${winner}* wins!\n` +
+      `👉 Captain choose Bat / Bowl:`,
+    { parse_mode: 'Markdown', ...tossKb(matchId) }
+  );
+}
+
+function startLobbyTimer(matchId, chatId, hostId, telegram, seconds = LOBBY_SECONDS) {
+  clearLobby(matchId);
+  const endsAt = Date.now() + seconds * 1000;
+
+  const timer = setTimeout(() => {
+    beginSoloFromLobby(matchId, chatId, telegram).catch(console.error);
+  }, seconds * 1000);
+
+  // Mid reminders
+  const tick = setInterval(async () => {
+    const left = Math.ceil((endsAt - Date.now()) / 1000);
+    if (left <= 0) {
+      clearInterval(tick);
+      return;
+    }
+    if (left === 30 || left === 10) {
+      try {
+        const pl = await getPlayers(matchId);
+        await telegram.sendMessage(
+          chatId,
+          `⏳ *${left}s* left to join!\n👥 Players: *${pl.length}/2*\nHost: /forcestart`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (_) {}
+    }
+  }, 1000);
+
+  lobbies.set(matchId, { timer, tick, endsAt, chatId, hostId });
+}
+
+// ─── SOLO ────────────────────────────────────────────────
 bot.command('startsolo', async (ctx) => {
-  if (!isGroup(ctx)) return ctx.reply('Group mein use karo');
+  if (!isGroup(ctx)) return ctx.reply('❌ Group mein use karo');
   try {
-    const existing = await getActiveMatch(ctx.chat.id);
-    if (existing) return ctx.reply('Pehle /endmatch karo');
+    if (await getActiveMatch(ctx.chat.id)) return ctx.reply('⚠️ Pehle /endmatch karo');
 
     const { rows } = await q(
       `INSERT INTO matches (group_chat_id, group_title, mode, host_telegram_id, team_size, total_overs, max_overs_per_bowler, status)
@@ -270,14 +473,31 @@ bot.command('startsolo', async (ctx) => {
        VALUES ($1,$2,'A',1,$3,$4,TRUE)`,
       [m.id, ctx.from.id, ctx.from.username || null, ctx.from.first_name || null]
     );
-    await q(`UPDATE match_teams SET captain_id=$2 WHERE match_id=$1 AND team_label='A'`, [m.id, ctx.from.id]);
+    await q(`UPDATE match_teams SET captain_id=$2 WHERE match_id=$1 AND team_label='A'`, [
+      m.id,
+      ctx.from.id,
+    ]);
     await upsertUser(ctx.from);
+
+    startLobbyTimer(m.id, ctx.chat.id, ctx.from.id, ctx.telegram, LOBBY_SECONDS);
+
     await ctx.reply(
-      `🏏 SOLO MATCH\n👑 Host: ${name(ctx.from)}\nStatus: Waiting\n\n/joinsolo se join karo\nPlayers 1/2\nHost: /startmatch`
+      `╔══ 🎮 SOLO MODE ══╗\n\n` +
+        `👑 Host: *${name(ctx.from)}*\n` +
+        `👥 Players: *1/2*\n` +
+        `⏱ Lobby: *${LOBBY_SECONDS}s*\n` +
+        `🎯 Same number = OUT\n\n` +
+        `📢 Join: /joinsolo\n` +
+        `🚪 Leave: /leavesolo\n\n` +
+        `⚡ Host commands:\n` +
+        `• /forcestart — turant start (2 players)\n` +
+        `• /extend30 — +30 seconds\n` +
+        `• /endmatch — cancel`,
+      { parse_mode: 'Markdown' }
     );
   } catch (e) {
     console.error(e);
-    await ctx.reply('Error: ' + e.message);
+    await ctx.reply('❌ ' + e.message);
   }
 });
 
@@ -285,45 +505,149 @@ bot.command('joinsolo', async (ctx) => {
   if (!isGroup(ctx)) return;
   try {
     const m = await getActiveMatch(ctx.chat.id);
-    if (!m || m.mode !== 'solo' || m.status !== 'waiting') return ctx.reply('No solo match waiting');
-    if (Number(m.host_telegram_id) === ctx.from.id) return ctx.reply('You are host');
-    if (await getPlayerByTg(m.id, ctx.from.id)) return ctx.reply('Already in');
+    if (!m || m.mode !== 'solo' || m.status !== 'waiting')
+      return ctx.reply('❌ Koi solo lobby open nahi');
+    if (Number(m.host_telegram_id) === ctx.from.id) return ctx.reply('❌ Tum host ho');
+    if (await getPlayerByTg(m.id, ctx.from.id)) return ctx.reply('❌ Already joined');
     const pl = await getPlayers(m.id);
-    if (pl.length >= 2) return ctx.reply('Full');
+    if (pl.length >= 2) return ctx.reply('❌ Full (2/2)');
+
     await q(
       `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, is_captain)
        VALUES ($1,$2,'B',1,$3,$4,TRUE)`,
       [m.id, ctx.from.id, ctx.from.username || null, ctx.from.first_name || null]
     );
-    await q(`UPDATE match_teams SET captain_id=$2 WHERE match_id=$1 AND team_label='B'`, [m.id, ctx.from.id]);
+    await q(`UPDATE match_teams SET captain_id=$2 WHERE match_id=$1 AND team_label='B'`, [
+      m.id,
+      ctx.from.id,
+    ]);
     await upsertUser(ctx.from);
-    await ctx.reply(`✅ ${name(ctx.from)} joined! 2/2\nHost: /startmatch`);
+
+    const left = lobbies.has(m.id)
+      ? Math.max(0, Math.ceil((lobbies.get(m.id).endsAt - Date.now()) / 1000))
+      : 0;
+
+    await ctx.reply(
+      `✅ *${name(ctx.from)}* joined!\n` +
+        `👥 Players: *2/2* — ready\n` +
+        (left ? `⏳ Lobby: ${left}s left\n` : '') +
+        `\n⚡ Host: /forcestart (turant) ya timer ka wait`,
+      { parse_mode: 'Markdown' }
+    );
   } catch (e) {
-    await ctx.reply(e.message);
+    await ctx.reply('❌ ' + e.message);
   }
 });
 
-// ─── Create Team ─────────────────────────────────────────
-bot.command('startteam', async (ctx) => {
-  if (!isGroup(ctx)) return ctx.reply('Group mein use karo');
+bot.command('leavesolo', async (ctx) => {
+  if (!isGroup(ctx)) return;
   try {
-    if (await getActiveMatch(ctx.chat.id)) return ctx.reply('Pehle /endmatch');
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m || m.mode !== 'solo' || m.status !== 'waiting') return ctx.reply('❌ No open lobby');
+    if (Number(m.host_telegram_id) === ctx.from.id)
+      return ctx.reply('❌ Host leave nahi kar sakta — /endmatch use karo');
+    const p = await getPlayerByTg(m.id, ctx.from.id);
+    if (!p) return ctx.reply('❌ Tum lobby mein nahi ho');
+    await q(`DELETE FROM match_players WHERE match_id=$1 AND telegram_id=$2`, [
+      m.id,
+      ctx.from.id,
+    ]);
+    const pl = await getPlayers(m.id);
+    await ctx.reply(`👋 ${name(ctx.from)} left.\n👥 Players: *${pl.length}/2*`, {
+      parse_mode: 'Markdown',
+    });
+  } catch (e) {
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
+bot.command('forcestart', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  try {
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m || m.mode !== 'solo' || m.status !== 'waiting')
+      return ctx.reply('❌ Solo lobby open nahi / already started');
+    if (Number(m.host_telegram_id) !== ctx.from.id) return ctx.reply('❌ Only host');
+
+    const pl = await getPlayers(m.id);
+    if (pl.length < 2)
+      return ctx.reply(`❌ Minimum 2 players chahiye (abhi ${pl.length}/2)`);
+
+    await ctx.reply(`⚡ *Force starting with ${pl.length} players!*`, {
+      parse_mode: 'Markdown',
+    });
+    await beginSoloFromLobby(m.id, ctx.chat.id, ctx.telegram);
+  } catch (e) {
+    console.error(e);
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
+bot.command('extend30', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  try {
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m || m.mode !== 'solo' || m.status !== 'waiting')
+      return ctx.reply('❌ No open solo lobby');
+    if (Number(m.host_telegram_id) !== ctx.from.id) return ctx.reply('❌ Only host');
+
+    const L = lobbies.get(m.id);
+    if (!L) return ctx.reply('❌ Lobby timer nahi mila');
+
+    const extra = 30;
+    const newLeft = Math.ceil((L.endsAt - Date.now()) / 1000) + extra;
+    startLobbyTimer(m.id, ctx.chat.id, ctx.from.id, ctx.telegram, newLeft);
+
+    await ctx.reply(`⏱️ Lobby *+${extra}s* — ab ~*${newLeft}s* bache hain`, {
+      parse_mode: 'Markdown',
+    });
+  } catch (e) {
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
+// ─── TEAM ────────────────────────────────────────────────
+bot.command('startteam', async (ctx) => {
+  if (!isGroup(ctx)) return ctx.reply('❌ Group mein use karo');
+  try {
+    if (await getActiveMatch(ctx.chat.id)) return ctx.reply('⚠️ Pehle /endmatch');
     const parts = ctx.message.text.split(/\s+/).slice(1);
     const size = parseInt(parts[0], 10) || DEFAULT_TEAM_SIZE;
     const overs = parseInt(parts[1], 10) || DEFAULT_OVERS;
+
     const { rows } = await q(
       `INSERT INTO matches (group_chat_id, group_title, mode, host_telegram_id, team_size, total_overs, max_overs_per_bowler, status)
        VALUES ($1,$2,'team',$3,$4,$5,$6,'waiting') RETURNING *`,
-      [ctx.chat.id, ctx.chat.title || null, ctx.from.id, size, overs, Math.min(MAX_BOWLER_OVERS, overs)]
+      [
+        ctx.chat.id,
+        ctx.chat.title || null,
+        ctx.from.id,
+        size,
+        overs,
+        Math.min(MAX_BOWLER_OVERS, overs),
+      ]
     );
     const m = rows[0];
-    for (const L of ['A', 'B']) await q(`INSERT INTO match_teams (match_id, team_label) VALUES ($1,$2)`, [m.id, L]);
+    for (const L of ['A', 'B']) {
+      await q(`INSERT INTO match_teams (match_id, team_label) VALUES ($1,$2)`, [m.id, L]);
+    }
     await upsertUser(ctx.from);
+
     await ctx.reply(
-      `🏏 TEAM MATCH\nSize: ${size} | Overs: ${overs}\n\n/join_a · /join_b\nHost: /setcaptain_a 1 · /startmatch`
+      `╔══ 👥 TEAM MATCH ══╗\n\n` +
+        `👑 Host: ${name(ctx.from)}\n` +
+        `👤 Size: *${size}*  |  ⏱ Overs: *${overs}*\n\n` +
+        `Join:\n` +
+        `• /join_a — Team A\n` +
+        `• /join_b — Team B\n\n` +
+        `Host:\n` +
+        `• /setcaptain_a 1\n` +
+        `• /setcaptain_b 1\n` +
+        `• /startmatch`,
+      { parse_mode: 'Markdown' }
     );
   } catch (e) {
-    await ctx.reply(e.message);
+    await ctx.reply('❌ ' + e.message);
   }
 });
 
@@ -331,10 +655,12 @@ async function joinTeam(ctx, label) {
   if (!isGroup(ctx)) return;
   try {
     const m = await getActiveMatch(ctx.chat.id);
-    if (!m || m.status !== 'waiting' || m.mode === 'solo') return ctx.reply('No team match waiting');
-    if (await getPlayerByTg(m.id, ctx.from.id)) return ctx.reply('Already joined');
+    if (!m || m.status !== 'waiting' || m.mode === 'solo')
+      return ctx.reply('❌ Team match waiting nahi');
+    if (await getPlayerByTg(m.id, ctx.from.id)) return ctx.reply('❌ Already in a team');
     const team = await getPlayers(m.id, label);
-    if (team.length >= m.team_size) return ctx.reply(`Team ${label} full`);
+    if (team.length >= m.team_size) return ctx.reply(`❌ Team ${label} full`);
+
     const { rows } = await q(
       `SELECT COALESCE(MAX(roster_position),0)+1 AS n FROM match_players WHERE match_id=$1 AND team_label=$2`,
       [m.id, label]
@@ -345,9 +671,14 @@ async function joinTeam(ctx, label) {
       [m.id, ctx.from.id, label, rows[0].n, ctx.from.username || null, ctx.from.first_name || null]
     );
     await upsertUser(ctx.from);
-    await ctx.reply(`✅ ${name(ctx.from)} → Team ${label} (${team.length + 1}/${m.team_size})`);
+
+    await ctx.reply(
+      `✅ ${name(ctx.from)} → *Team ${label}*\n` +
+        `👥 ${team.length + 1}/${m.team_size}`,
+      { parse_mode: 'Markdown' }
+    );
   } catch (e) {
-    await ctx.reply(e.message);
+    await ctx.reply('❌ ' + e.message);
   }
 }
 bot.command('join_a', (ctx) => joinTeam(ctx, 'A'));
@@ -359,63 +690,93 @@ bot.command('setcaptain_b', async (ctx) => setCap(ctx, 'B'));
 async function setCap(ctx, label) {
   if (!isGroup(ctx)) return;
   const m = await getActiveMatch(ctx.chat.id);
-  if (!m || Number(m.host_telegram_id) !== ctx.from.id) return ctx.reply('Only host');
+  if (!m || Number(m.host_telegram_id) !== ctx.from.id) return ctx.reply('❌ Only host');
   const pos = parseInt((ctx.message.text.split(/\s+/)[1] || ''), 10);
-  if (!pos) return ctx.reply(`Usage: /setcaptain_${label.toLowerCase()} <position>`);
+  if (!pos) return ctx.reply(`Usage: /setcaptain_${label.toLowerCase()} <number>`);
   const p = await getPlayerByPos(m.id, label, pos);
-  if (!p) return ctx.reply('Player not found');
-  await q(`UPDATE match_players SET is_captain=FALSE WHERE match_id=$1 AND team_label=$2`, [m.id, label]);
+  if (!p) return ctx.reply('❌ Player nahi mila');
+  await q(`UPDATE match_players SET is_captain=FALSE WHERE match_id=$1 AND team_label=$2`, [
+    m.id,
+    label,
+  ]);
   await q(`UPDATE match_players SET is_captain=TRUE WHERE id=$1`, [p.id]);
-  await q(`UPDATE match_teams SET captain_id=$2 WHERE match_id=$1 AND team_label=$3`, [m.id, p.telegram_id, label]);
+  await q(`UPDATE match_teams SET captain_id=$2 WHERE match_id=$1 AND team_label=$3`, [
+    m.id,
+    p.telegram_id,
+    label,
+  ]);
   await q(`UPDATE matches SET status='captains' WHERE id=$1`, [m.id]);
-  await ctx.reply(`👑 Team ${label} captain: ${name(p)}`);
+  await ctx.reply(`👑 Team ${label} captain: *${name(p)}*`, { parse_mode: 'Markdown' });
 }
 
 bot.command('team', async (ctx) => {
   if (!isGroup(ctx)) return;
   const m = await getActiveMatch(ctx.chat.id);
-  if (!m) return ctx.reply('No match');
-  let t = `Match ${m.mode} | ${m.status}\n`;
+  if (!m) return ctx.reply('❌ No match');
+  let t = `🏏 *${m.mode.toUpperCase()}* · ${m.status}\n${line()}\n`;
   for (const L of ['A', 'B']) {
     const team = await getTeam(m.id, L);
     const pl = await getPlayers(m.id, L);
-    t += `\nTeam ${L} (${pl.length}/${m.team_size})\n`;
+    t += `\n*Team ${L}* (${pl.length}/${m.team_size})\n`;
     for (const p of pl) {
-      t += `  ${p.roster_position}. ${name(p)}${Number(p.telegram_id) === Number(team?.captain_id) ? ' 👑' : ''}\n`;
+      const star = Number(p.telegram_id) === Number(team?.captain_id) ? ' 👑' : '';
+      t += `  ${p.roster_position}. ${name(p)}${star}\n`;
     }
+    if (!pl.length) t += `  (empty)\n`;
   }
-  await ctx.reply(t);
+  await ctx.reply(t, { parse_mode: 'Markdown' });
 });
 
 bot.command('endmatch', async (ctx) => {
   if (!isGroup(ctx)) return;
   const m = await getActiveMatch(ctx.chat.id);
-  if (!m) return ctx.reply('No match');
-  if (Number(m.host_telegram_id) !== ctx.from.id) return ctx.reply('Only host');
+  if (!m) return ctx.reply('❌ No match');
+  if (Number(m.host_telegram_id) !== ctx.from.id) return ctx.reply('❌ Only host');
+  clearLobby(m.id);
   await q(`UPDATE matches SET status='cancelled' WHERE id=$1`, [m.id]);
-  await ctx.reply('🛑 Match cancelled');
+  await ctx.reply('🛑 Match / lobby cancelled');
 });
 
-// ─── Start match + Toss ──────────────────────────────────
+// ─── Start + Toss ────────────────────────────────────────
 bot.command('startmatch', async (ctx) => {
   if (!isGroup(ctx)) return;
   try {
     const m = await getActiveMatch(ctx.chat.id);
-    if (!m) return ctx.reply('No match');
-    if (Number(m.host_telegram_id) !== ctx.from.id) return ctx.reply('Only host');
+    if (!m) return ctx.reply('❌ No match');
+    if (Number(m.host_telegram_id) !== ctx.from.id) return ctx.reply('❌ Only host');
+
+    // Solo waiting lobby → same as forcestart
+    if (m.mode === 'solo' && m.status === 'waiting') {
+      const pl = await getPlayers(m.id);
+      if (pl.length < 2)
+        return ctx.reply(`❌ Minimum 2 players (abhi ${pl.length}/2). /forcestart after join.`);
+      await ctx.reply(`⚡ *Starting solo…*`, { parse_mode: 'Markdown' });
+      await beginSoloFromLobby(m.id, ctx.chat.id, ctx.telegram);
+      return;
+    }
+
     const a = await getPlayers(m.id, 'A');
     const b = await getPlayers(m.id, 'B');
-    if (!a.length || !b.length) return ctx.reply('Both teams need players');
+    if (!a.length || !b.length) return ctx.reply('❌ Dono teams mein players chahiye');
     if (m.mode === 'team') {
       const tA = await getTeam(m.id, 'A');
       const tB = await getTeam(m.id, 'B');
-      if (!tA?.captain_id || !tB?.captain_id) return ctx.reply('Set both captains first');
+      if (!tA?.captain_id || !tB?.captain_id)
+        return ctx.reply('❌ Pehle dono captains set karo');
     }
     const winner = Math.random() < 0.5 ? 'A' : 'B';
-    await q(`UPDATE matches SET status='toss', toss_winner_team=$2 WHERE id=$1`, [m.id, winner]);
-    await ctx.reply(`🪙 TOSS\nTeam ${winner} wins!\nChoose:`, tossKb(m.id));
+    await q(`UPDATE matches SET status='toss', toss_winner_team=$2 WHERE id=$1`, [
+      m.id,
+      winner,
+    ]);
+    await ctx.reply(
+      `🪙 *TOSS*\n${line()}\n` +
+        `🏆 Team *${winner}* wins the toss!\n\n` +
+        `Choose:`,
+      { parse_mode: 'Markdown', ...tossKb(m.id) }
+    );
   } catch (e) {
-    await ctx.reply(e.message);
+    await ctx.reply('❌ ' + e.message);
   }
 });
 
@@ -424,55 +785,100 @@ bot.action(/^toss:(.+):(bat|bowl)$/, async (ctx) => {
   const choice = ctx.match[2];
   try {
     const m = await getMatch(matchId);
-    if (!m || m.status !== 'toss') return ctx.answerCbQuery('Invalid', { show_alert: true });
+    if (!m || m.status !== 'toss')
+      return ctx.answerCbQuery('Invalid', { show_alert: true });
+
     const team = await getTeam(m.id, m.toss_winner_team);
-    if (Number(team?.captain_id) !== ctx.from.id) {
+    const isCap = Number(team?.captain_id) === ctx.from.id;
+    if (!isCap) {
       const pl = await getPlayers(m.id, m.toss_winner_team);
       if (!pl.some((p) => Number(p.telegram_id) === ctx.from.id)) {
-        return ctx.answerCbQuery('Only toss winner captain', { show_alert: true });
+        return ctx.answerCbQuery('Only toss winner', { show_alert: true });
       }
     }
-    const batFirst = choice === 'bat' ? m.toss_winner_team : m.toss_winner_team === 'A' ? 'B' : 'A';
+
+    const batFirst =
+      choice === 'bat' ? m.toss_winner_team : m.toss_winner_team === 'A' ? 'B' : 'A';
     const bowlFirst = batFirst === 'A' ? 'B' : 'A';
+
     await q(
-      `UPDATE matches SET batting_first_team=$2, current_batting_team=$2, current_bowling_team=$3, current_innings=1, status='innings1' WHERE id=$1`,
+      `UPDATE matches SET batting_first_team=$2, current_batting_team=$2,
+       current_bowling_team=$3, current_innings=1, status='innings1' WHERE id=$1`,
       [m.id, batFirst, bowlFirst]
     );
     await q(
-      `INSERT INTO innings (match_id, innings_number, batting_team, bowling_team, ball_state) VALUES ($1,1,$2,$3,'idle')`,
+      `INSERT INTO innings (match_id, innings_number, batting_team, bowling_team, ball_state)
+       VALUES ($1,1,$2,$3,'idle')`,
       [m.id, batFirst, bowlFirst]
     );
-    await ctx.editMessageText(
-      `✅ Team ${m.toss_winner_team} chose ${choice.toUpperCase()}\n🏏 Team ${batFirst} bats\n🎳 Team ${bowlFirst} bowls\n\n/bat 1 then /bat 2\nThen /bowl 1`
-    );
+
+    let msg =
+      `✅ Team ${m.toss_winner_team} chose *${choice.toUpperCase()}*\n\n` +
+      `🏏 Batting: Team *${batFirst}*\n` +
+      `🎳 Bowling: Team *${bowlFirst}*\n\n`;
+
+    if (m.mode === 'solo') {
+      // Auto setup solo
+      let inn = await getInnings(m.id);
+      inn = await soloAutoSetup(m, inn);
+      const striker = await getPlayer(inn.striker_player_id);
+      const bowler = await getPlayer(inn.current_bowler_id);
+      msg +=
+        `⚡ *Solo auto-setup*\n` +
+        `🏏 Batsman: ${name(striker)}\n` +
+        `🎳 Bowler: ${name(bowler)}\n\n` +
+        `👉 ${name(striker)} group mein *1–6* type karo!`;
+    } else {
+      msg += `Batting captain: /bat 1 then /bat 2\nBowling captain: /bowl 1`;
+    }
+
+    await ctx.editMessageText(msg, { parse_mode: 'Markdown' });
     await ctx.answerCbQuery();
+
+    if (m.mode === 'solo') {
+      await ctx.telegram.sendMessage(Number(m.group_chat_id), await scoreboard(m.id), {
+        parse_mode: 'Markdown',
+      });
+    }
   } catch (e) {
+    console.error(e);
     await ctx.answerCbQuery(e.message, { show_alert: true });
   }
 });
 
-// ─── /bat /bowl ──────────────────────────────────────────
+// ─── /bat /bowl (team mainly; solo auto) ─────────────────
 bot.command('bat', async (ctx) => {
   if (!isGroup(ctx)) return;
   const pos = parseInt((ctx.message.text.split(/\s+/)[1] || ''), 10);
   if (!pos) return ctx.reply('Usage: /bat 1');
   try {
     const m = await getActiveMatch(ctx.chat.id);
-    if (!m || !['innings1', 'innings2'].includes(m.status)) return ctx.reply('Match not in progress');
-    const inn = await getInnings(m.id);
-    if (!inn || !['idle', 'waiting_bat'].includes(inn.ball_state)) return ctx.reply('Wait for current ball');
-    const team = await getTeam(m.id, inn.batting_team);
-    if (Number(team?.captain_id) !== ctx.from.id) return ctx.reply('Only batting captain');
-    const p = await getPlayerByPos(m.id, inn.batting_team, pos);
-    if (!p) return ctx.reply('Invalid position');
-    const { rows: st } = await q(`SELECT * FROM batting_stats WHERE innings_id=$1 AND player_id=$2`, [inn.id, p.id]);
-    if (st[0]?.is_out) return ctx.reply('Already out');
-    if (p.id === inn.striker_player_id || p.id === inn.non_striker_player_id) return ctx.reply('Already batting');
+    if (!m || !['innings1', 'innings2'].includes(m.status))
+      return ctx.reply('❌ Match in progress nahi');
+    if (m.mode === 'solo') return ctx.reply('ℹ️ Solo mein auto hai — seedha 1-6 type karo');
 
-    await q(
-      `INSERT INTO batting_stats (innings_id, player_id) VALUES ($1,$2) ON CONFLICT (innings_id, player_id) DO NOTHING`,
+    let inn = await getInnings(m.id);
+    if (!inn || !['idle', 'waiting_bat'].includes(inn.ball_state))
+      return ctx.reply('⏳ Ball pending');
+    const team = await getTeam(m.id, inn.batting_team);
+    if (Number(team?.captain_id) !== ctx.from.id) return ctx.reply('❌ Only batting captain');
+
+    const p = await getPlayerByPos(m.id, inn.batting_team, pos);
+    if (!p) return ctx.reply('❌ Invalid position');
+    const { rows: st } = await q(
+      `SELECT * FROM batting_stats WHERE innings_id=$1 AND player_id=$2`,
       [inn.id, p.id]
     );
+    if (st[0]?.is_out) return ctx.reply('❌ Already out');
+    if (p.id === inn.striker_player_id || p.id === inn.non_striker_player_id)
+      return ctx.reply('❌ Already batting');
+
+    await q(
+      `INSERT INTO batting_stats (innings_id, player_id) VALUES ($1,$2)
+       ON CONFLICT (innings_id, player_id) DO NOTHING`,
+      [inn.id, p.id]
+    );
+
     let role;
     if (!inn.striker_player_id) {
       await q(`UPDATE innings SET striker_player_id=$2 WHERE id=$1`, [inn.id, p.id]);
@@ -484,14 +890,15 @@ bot.command('bat', async (ctx) => {
       await q(`UPDATE innings SET striker_player_id=$2 WHERE id=$1`, [inn.id, p.id]);
       role = 'striker';
     }
-    await ctx.reply(`🏏 ${name(p)} → ${role}`);
-    const inn2 = await getInnings(m.id);
-    if (inn2.striker_player_id && inn2.non_striker_player_id && !inn2.current_bowler_id) {
+
+    await ctx.reply(`🏏 ${name(p)} → *${role}*`, { parse_mode: 'Markdown' });
+    inn = await getInnings(m.id);
+    if (inn.striker_player_id && inn.non_striker_player_id && !inn.current_bowler_id) {
       await ctx.reply('Bowling captain: /bowl <n>');
     }
-    await ctx.reply(await scoreboard(m.id));
+    await ctx.reply(await scoreboard(m.id), { parse_mode: 'Markdown' });
   } catch (e) {
-    await ctx.reply(e.message);
+    await ctx.reply('❌ ' + e.message);
   }
 });
 
@@ -501,72 +908,120 @@ bot.command('bowl', async (ctx) => {
   if (!pos) return ctx.reply('Usage: /bowl 1');
   try {
     const m = await getActiveMatch(ctx.chat.id);
-    if (!m || !['innings1', 'innings2'].includes(m.status)) return ctx.reply('Match not in progress');
+    if (!m || !['innings1', 'innings2'].includes(m.status))
+      return ctx.reply('❌ Match in progress nahi');
+    if (m.mode === 'solo') return ctx.reply('ℹ️ Solo mein auto bowler hai');
+
     const inn = await getInnings(m.id);
-    if (!inn || inn.ball_state !== 'idle') return ctx.reply('Wait');
-    if (!inn.striker_player_id || !inn.non_striker_player_id) return ctx.reply('Select 2 batsmen first');
+    if (!inn || inn.ball_state !== 'idle') return ctx.reply('⏳ Wait');
+    if (!inn.striker_player_id || !inn.non_striker_player_id)
+      return ctx.reply('❌ Pehle 2 batsmen /bat se select karo');
+
     const team = await getTeam(m.id, inn.bowling_team);
-    if (Number(team?.captain_id) !== ctx.from.id) return ctx.reply('Only bowling captain');
+    if (Number(team?.captain_id) !== ctx.from.id) return ctx.reply('❌ Only bowling captain');
+
     const p = await getPlayerByPos(m.id, inn.bowling_team, pos);
-    if (!p) return ctx.reply('Invalid position');
-    const { rows: st } = await q(`SELECT * FROM bowling_stats WHERE innings_id=$1 AND player_id=$2`, [inn.id, p.id]);
+    if (!p) return ctx.reply('❌ Invalid position');
+    const { rows: st } = await q(
+      `SELECT * FROM bowling_stats WHERE innings_id=$1 AND player_id=$2`,
+      [inn.id, p.id]
+    );
     const bb = st[0]?.balls_bowled || 0;
-    if (bb / 6 >= (m.max_overs_per_bowler || MAX_BOWLER_OVERS)) return ctx.reply('Overs complete');
-    if (inn.last_bowler_id === p.id && inn.balls_bowled % 6 === 0 && bb > 0) return ctx.reply('No consecutive overs');
+    if (bb / 6 >= (m.max_overs_per_bowler || MAX_BOWLER_OVERS))
+      return ctx.reply('❌ Overs complete');
+    if (inn.last_bowler_id === p.id && inn.balls_bowled % 6 === 0 && bb > 0)
+      return ctx.reply('❌ Consecutive over nahi');
 
     await q(
-      `INSERT INTO bowling_stats (innings_id, player_id) VALUES ($1,$2) ON CONFLICT (innings_id, player_id) DO NOTHING`,
+      `INSERT INTO bowling_stats (innings_id, player_id) VALUES ($1,$2)
+       ON CONFLICT (innings_id, player_id) DO NOTHING`,
       [inn.id, p.id]
     );
     await q(`UPDATE innings SET current_bowler_id=$2 WHERE id=$1`, [inn.id, p.id]);
-    await ctx.reply(`🎳 ${name(p)} bowling\nStriker: type 1-6 in group`);
-    await ctx.reply(await scoreboard(m.id));
+
+    await ctx.reply(
+      `🎳 ${name(p)} bowling\n👉 Striker: group mein *1–6* type karo`,
+      { parse_mode: 'Markdown' }
+    );
+    await ctx.reply(await scoreboard(m.id), { parse_mode: 'Markdown' });
   } catch (e) {
-    await ctx.reply(e.message);
+    await ctx.reply('❌ ' + e.message);
   }
 });
 
 bot.command('score', async (ctx) => {
   if (!isGroup(ctx)) return;
   const m = await getActiveMatch(ctx.chat.id);
-  if (!m) return ctx.reply('No match');
-  await ctx.reply(await scoreboard(m.id));
+  if (!m) return ctx.reply('❌ No match');
+  await ctx.reply(await scoreboard(m.id), { parse_mode: 'Markdown' });
 });
 
-// ─── Bat number 1-6 ──────────────────────────────────────
+// ─── Batsman types 1-6 ───────────────────────────────────
 bot.hears(/^[1-6]$/, async (ctx) => {
   if (!isGroup(ctx)) return;
   const num = parseInt(ctx.message.text, 10);
   try {
     const m = await getActiveMatch(ctx.chat.id);
     if (!m || !['innings1', 'innings2'].includes(m.status)) return;
-    const inn = await getInnings(m.id);
-    if (!inn || inn.ball_state !== 'idle' || !inn.current_bowler_id || !inn.striker_player_id) return;
+
+    let inn = await getInnings(m.id);
+    if (!inn) return;
+
+    // Solo: ensure auto setup every ball
+    if (m.mode === 'solo') {
+      inn = await soloAutoSetup(m, inn);
+    }
+
+    if (inn.ball_state !== 'idle' || !inn.current_bowler_id || !inn.striker_player_id) return;
+
     const striker = await getPlayer(inn.striker_player_id);
     if (!striker || Number(striker.telegram_id) !== ctx.from.id) return;
 
+    // Solo: no non-striker required
+    if (m.mode !== 'solo' && !inn.non_striker_player_id) return;
+
     const overNum = Math.floor(inn.balls_bowled / 6);
     const ballNum = (inn.balls_bowled % 6) + 1;
-    await q(`UPDATE innings SET pending_bat_number=$2, ball_state='waiting_bowl' WHERE id=$1`, [inn.id, num]);
+
+    await q(
+      `UPDATE innings SET pending_bat_number=$2, ball_state='waiting_bowl' WHERE id=$1`,
+      [inn.id, num]
+    );
 
     const token = crypto.randomBytes(12).toString('base64url');
     const bowler = await getPlayer(inn.current_bowler_id);
+
     await q(
       `INSERT INTO pending_balls (match_id, innings_id, bowler_telegram_id, callback_token, bat_number, over_number, ball_number)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [m.id, inn.id, bowler.telegram_id, token, num, overNum, ballNum]
     );
 
-    await ctx.reply(`🔒 ${name(striker)} played!\nWaiting for ${name(bowler)}…`);
+    await ctx.reply(
+      `🔒 *${name(striker)}* ne shot khel liya!\n` +
+        `⏳ Bowler *${name(bowler)}* se number aa raha hai…`,
+      { parse_mode: 'Markdown' }
+    );
+
     try {
       await ctx.telegram.sendMessage(
         Number(bowler.telegram_id),
-        `🎳 Deliver the ball!\nGroup: ${m.group_title || 'Group'}\nStriker: ${name(striker)}\nOver: ${overNum}.${ballNum}\nChoose:`,
-        bowlKb(token)
+        `🎳 *YOUR TURN TO BOWL*\n` +
+          `${line()}\n` +
+          `📍 ${m.group_title || 'Group'}\n` +
+          `🏏 Striker: ${name(striker)}\n` +
+          `⏱ Over: ${overNum}.${ballNum}\n\n` +
+          `Number choose karo:`,
+        { parse_mode: 'Markdown', ...bowlKb(token) }
       );
     } catch {
-      await ctx.reply(`⚠️ ${name(bowler)} ne bot /start nahi kiya privately.`);
-      await q(`UPDATE innings SET pending_bat_number=NULL, ball_state='idle' WHERE id=$1`, [inn.id]);
+      await ctx.reply(
+        `⚠️ ${name(bowler)} ne bot privately /start nahi kiya.\n` +
+          `Bot open karke /start dabao, phir dubara try.`
+      );
+      await q(`UPDATE innings SET pending_bat_number=NULL, ball_state='idle' WHERE id=$1`, [
+        inn.id,
+      ]);
       await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE callback_token=$1`, [token]);
     }
   } catch (e) {
@@ -574,7 +1029,7 @@ bot.hears(/^[1-6]$/, async (ctx) => {
   }
 });
 
-// ─── Bowl callback ───────────────────────────────────────
+// ─── Bowl resolve ────────────────────────────────────────
 bot.action(/^bowl:(.+):([1-6])$/, async (ctx) => {
   const token = ctx.match[1];
   const bowlNum = parseInt(ctx.match[2], 10);
@@ -584,26 +1039,30 @@ bot.action(/^bowl:(.+):([1-6])$/, async (ctx) => {
       [token]
     );
     const pend = pendRows[0];
-    if (!pend) return ctx.answerCbQuery('Expired / already used', { show_alert: true });
-    if (Number(pend.bowler_telegram_id) !== ctx.from.id) return ctx.answerCbQuery('Not your ball', { show_alert: true });
+    if (!pend) return ctx.answerCbQuery('Expired / used', { show_alert: true });
+    if (Number(pend.bowler_telegram_id) !== ctx.from.id)
+      return ctx.answerCbQuery('Not your ball', { show_alert: true });
 
     const upd = await q(
       `UPDATE pending_balls SET is_resolved=TRUE WHERE callback_token=$1 AND is_resolved=FALSE`,
       [token]
     );
-    if (upd.rowCount === 0) return ctx.answerCbQuery('Already resolved', { show_alert: true });
+    if (upd.rowCount === 0)
+      return ctx.answerCbQuery('Already resolved', { show_alert: true });
 
     const { rows: innRows } = await q(`SELECT * FROM innings WHERE id=$1`, [pend.innings_id]);
     const inn = innRows[0];
-    if (!inn || inn.ball_state !== 'waiting_bowl') return ctx.answerCbQuery('Invalid state', { show_alert: true });
-    const m = await getMatch(pend.match_id);
+    if (!inn || inn.ball_state !== 'waiting_bowl')
+      return ctx.answerCbQuery('Invalid state', { show_alert: true });
 
+    const m = await getMatch(pend.match_id);
     const batNum = pend.bat_number;
     const isWicket = batNum === bowlNum;
     const runs = isWicket ? 0 : batNum;
     const strikerId = inn.striker_player_id;
     const nonId = inn.non_striker_player_id;
     const bowlerId = inn.current_bowler_id;
+    const isSolo = m.mode === 'solo';
 
     const client = await pool.connect();
     try {
@@ -611,41 +1070,76 @@ bot.action(/^bowl:(.+):([1-6])$/, async (ctx) => {
       await client.query(
         `INSERT INTO deliveries (innings_id, over_number, ball_number, batsman_id, bowler_id, bat_number, bowl_number, runs_scored, is_wicket)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [inn.id, pend.over_number, pend.ball_number, strikerId, bowlerId, batNum, bowlNum, runs, isWicket]
+        [
+          inn.id,
+          pend.over_number,
+          pend.ball_number,
+          strikerId,
+          bowlerId,
+          batNum,
+          bowlNum,
+          runs,
+          isWicket,
+        ]
       );
+
       if (isWicket) {
         await client.query(
-          `UPDATE batting_stats SET balls_faced=balls_faced+1, is_out=TRUE, dismissal_type='bowled' WHERE innings_id=$1 AND player_id=$2`,
+          `UPDATE batting_stats SET balls_faced=balls_faced+1, is_out=TRUE, dismissal_type='bowled'
+           WHERE innings_id=$1 AND player_id=$2`,
           [inn.id, strikerId]
         );
       } else {
         await client.query(
-          `UPDATE batting_stats SET runs=runs+$3, balls_faced=balls_faced+1, fours=fours+$4, sixes=sixes+$5 WHERE innings_id=$1 AND player_id=$2`,
+          `UPDATE batting_stats SET runs=runs+$3, balls_faced=balls_faced+1,
+           fours=fours+$4, sixes=sixes+$5
+           WHERE innings_id=$1 AND player_id=$2`,
           [inn.id, strikerId, runs, runs === 4 ? 1 : 0, runs === 6 ? 1 : 0]
         );
       }
+
       await client.query(
-        `UPDATE bowling_stats SET balls_bowled=balls_bowled+1, runs_conceded=runs_conceded+$3, wickets=wickets+$4, overs_bowled=(balls_bowled+1)/6.0 WHERE innings_id=$1 AND player_id=$2`,
+        `UPDATE bowling_stats SET balls_bowled=balls_bowled+1, runs_conceded=runs_conceded+$3,
+         wickets=wickets+$4, overs_bowled=(balls_bowled+1)/6.0
+         WHERE innings_id=$1 AND player_id=$2`,
         [inn.id, bowlerId, runs, isWicket ? 1 : 0]
       );
 
       let newStriker = strikerId;
       let newNon = nonId;
-      if (isWicket) newStriker = null;
-      else if (runs % 2 === 1) {
-        newStriker = nonId;
-        newNon = strikerId;
+
+      if (isSolo) {
+        // Solo: stay on same striker unless out (then innings may end)
+        if (isWicket) newStriker = null;
+      } else {
+        if (isWicket) newStriker = null;
+        else if (runs % 2 === 1) {
+          newStriker = nonId;
+          newNon = strikerId;
+        }
       }
+
       const newBalls = inn.balls_bowled + 1;
       const endOver = newBalls % 6 === 0;
-      if (endOver && !isWicket) {
+
+      if (!isSolo && endOver && !isWicket) {
         const tmp = newStriker;
         newStriker = newNon;
         newNon = tmp;
       }
+
+      // Solo: keep same bowler always; team: clear on over end
+      let currentBowler = bowlerId;
+      let lastBowler = inn.last_bowler_id || bowlerId;
+      if (!isSolo) {
+        currentBowler = endOver ? null : bowlerId;
+        lastBowler = endOver ? bowlerId : lastBowler;
+      }
+
       await client.query(
         `UPDATE innings SET total_runs=$2, total_wickets=$3, balls_bowled=$4,
-         striker_player_id=$5, non_striker_player_id=$6, current_bowler_id=$7, last_bowler_id=$8,
+         striker_player_id=$5, non_striker_player_id=$6,
+         current_bowler_id=$7, last_bowler_id=$8,
          pending_bat_number=NULL, ball_state='idle' WHERE id=$1`,
         [
           inn.id,
@@ -653,9 +1147,9 @@ bot.action(/^bowl:(.+):([1-6])$/, async (ctx) => {
           inn.total_wickets + (isWicket ? 1 : 0),
           newBalls,
           newStriker,
-          newNon,
-          endOver ? null : bowlerId,
-          endOver ? bowlerId : inn.last_bowler_id || bowlerId,
+          isSolo ? null : newNon,
+          currentBowler,
+          lastBowler,
         ]
       );
       await client.query('COMMIT');
@@ -666,70 +1160,131 @@ bot.action(/^bowl:(.+):([1-6])$/, async (ctx) => {
       client.release();
     }
 
-    await ctx.answerCbQuery('Done!');
+    await ctx.answerCbQuery('✅ Delivered!');
     try {
-      await ctx.editMessageText(`✅ You bowled ${bowlNum}`);
+      await ctx.editMessageText(`✅ You bowled *${bowlNum}*`, { parse_mode: 'Markdown' });
     } catch {}
 
     const inn2 = (await q(`SELECT * FROM innings WHERE id=$1`, [inn.id])).rows[0];
     const groupId = Number(m.group_chat_id);
-    let msg = isWicket
-      ? `💥 WICKET!\nBat: ${batNum} · Bowl: ${bowlNum}\nTeam ${inn2.batting_team}: ${inn2.total_runs}/${inn2.total_wickets}`
-      : `🏏 ${runs} run(s)!\nBat: ${batNum} · Bowl: ${bowlNum}\nTeam ${inn2.batting_team}: ${inn2.total_runs}/${inn2.total_wickets}`;
-    msg += `\nOvers: ${oversStr(inn2.balls_bowled)}`;
-    await ctx.telegram.sendMessage(groupId, msg);
 
-    // Innings / match end check
-    const teamSize = m.team_size || 5;
+    let ballMsg;
+    if (isWicket) {
+      ballMsg =
+        `💥 *WICKET!*\n` +
+        `${line()}\n` +
+        `Bat: *${batNum}*  ·  Bowl: *${bowlNum}*\n` +
+        `Team ${inn2.batting_team}: *${inn2.total_runs}/${inn2.total_wickets}*\n` +
+        `Overs: ${oversStr(inn2.balls_bowled)}`;
+    } else {
+      const emoji = runs === 6 ? '🚀' : runs === 4 ? '🔥' : '🏏';
+      ballMsg =
+        `${emoji} *${runs} RUN${runs !== 1 ? 'S' : ''}!*\n` +
+        `${line()}\n` +
+        `Bat: *${batNum}*  ·  Bowl: *${bowlNum}*\n` +
+        `Team ${inn2.batting_team}: *${inn2.total_runs}/${inn2.total_wickets}*\n` +
+        `Overs: ${oversStr(inn2.balls_bowled)}`;
+    }
+    await ctx.telegram.sendMessage(groupId, ballMsg, { parse_mode: 'Markdown' });
+
+    // Innings end?
+    const teamSize = isSolo ? 1 : m.team_size || 5;
     const maxBalls = (m.total_overs || 5) * 6;
-    let ended = inn2.total_wickets >= teamSize || inn2.balls_bowled >= maxBalls;
+    let ended =
+      inn2.total_wickets >= teamSize || inn2.balls_bowled >= maxBalls;
     if (inn2.innings_number === 2 && m.target && inn2.total_runs >= m.target) ended = true;
 
     if (ended) {
       await q(`UPDATE innings SET is_completed=TRUE WHERE id=$1`, [inn2.id]);
+
       if (inn2.innings_number === 1) {
         const target = inn2.total_runs + 1;
         const bat2 = inn2.bowling_team;
         const bowl2 = inn2.batting_team;
         await q(
-          `UPDATE matches SET status='innings2', current_innings=2, current_batting_team=$2, current_bowling_team=$3, target=$4 WHERE id=$1`,
+          `UPDATE matches SET status='innings2', current_innings=2,
+           current_batting_team=$2, current_bowling_team=$3, target=$4 WHERE id=$1`,
           [m.id, bat2, bowl2, target]
         );
         await q(
-          `INSERT INTO innings (match_id, innings_number, batting_team, bowling_team, ball_state) VALUES ($1,2,$2,$3,'idle')`,
+          `INSERT INTO innings (match_id, innings_number, batting_team, bowling_team, ball_state)
+           VALUES ($1,2,$2,$3,'idle')`,
           [m.id, bat2, bowl2]
         );
-        await ctx.telegram.sendMessage(
-          groupId,
-          `🏁 Innings 1 over\nTeam ${inn2.batting_team}: ${inn2.total_runs}/${inn2.total_wickets}\nTarget: ${target}\n\n/bat 1 · /bat 2 · /bowl 1`
-        );
-      } else {
-        let winner, text;
-        if (inn2.total_runs >= m.target) {
-          winner = inn2.batting_team;
-          text = `🏆 Team ${winner} wins!`;
-        } else if (inn2.total_runs === m.target - 1) {
-          winner = 'tie';
-          text = '🤝 Tied!';
+
+        let mid =
+          `🏁 *END OF INNINGS 1*\n` +
+          `${line()}\n` +
+          `Team ${inn2.batting_team}: *${inn2.total_runs}/${inn2.total_wickets}*\n` +
+          `🎯 Target for Team ${bat2}: *${target}*\n\n`;
+
+        if (isSolo) {
+          const m2 = await getMatch(m.id);
+          let innNew = await getInnings(m.id);
+          innNew = await soloAutoSetup(m2, innNew);
+          const st = await getPlayer(innNew.striker_player_id);
+          const bw = await getPlayer(innNew.current_bowler_id);
+          mid +=
+            `⚡ Solo auto-setup\n` +
+            `🏏 ${name(st)} batting\n` +
+            `🎳 ${name(bw)} bowling\n\n` +
+            `👉 ${name(st)} type *1–6*!`;
         } else {
-          winner = inn2.bowling_team;
-          text = `🏆 Team ${winner} wins by ${m.target - 1 - inn2.total_runs} runs!`;
+          mid += `Batting captain: /bat 1 · /bat 2\nBowling captain: /bowl 1`;
         }
-        await q(`UPDATE matches SET status='completed', winner_team=$2, completed_at=NOW() WHERE id=$1`, [
-          m.id,
-          winner === 'tie' ? 'tie' : winner,
-        ]);
-        await ctx.telegram.sendMessage(groupId, text);
+
+        await ctx.telegram.sendMessage(groupId, mid, { parse_mode: 'Markdown' });
+      } else {
+        let text;
+        if (inn2.total_runs >= m.target) {
+          text = `🏆 *Team ${inn2.batting_team} WINS!*`;
+          await q(
+            `UPDATE matches SET status='completed', winner_team=$2, completed_at=NOW() WHERE id=$1`,
+            [m.id, inn2.batting_team]
+          );
+        } else if (inn2.total_runs === m.target - 1) {
+          text = `🤝 *MATCH TIED!*`;
+          await q(
+            `UPDATE matches SET status='completed', winner_team='tie', completed_at=NOW() WHERE id=$1`,
+            [m.id]
+          );
+        } else {
+          const margin = m.target - 1 - inn2.total_runs;
+          text = `🏆 *Team ${inn2.bowling_team} WINS by ${margin} runs!*`;
+          await q(
+            `UPDATE matches SET status='completed', winner_team=$2, completed_at=NOW() WHERE id=$1`,
+            [m.id, inn2.bowling_team]
+          );
+        }
+        await ctx.telegram.sendMessage(groupId, text, { parse_mode: 'Markdown' });
       }
     } else {
-      if (isWicket && !inn2.striker_player_id) {
-        await ctx.telegram.sendMessage(groupId, `👑 Team ${inn2.batting_team} captain: /bat <n>`);
-      }
-      if (inn2.balls_bowled > 0 && inn2.balls_bowled % 6 === 0 && !isWicket) {
-        await ctx.telegram.sendMessage(groupId, `Over done!\n👑 Team ${inn2.bowling_team}: /bowl <n>`);
+      // Continue play prompts
+      if (isSolo && isWicket) {
+        // Solo all-out already handled by ended; if not ended shouldn't happen with team_size=1
+      } else if (!isSolo && isWicket && !inn2.striker_player_id) {
+        await ctx.telegram.sendMessage(
+          groupId,
+          `👑 Team ${inn2.batting_team} captain: next batsman → /bat <n>`
+        );
+      } else if (!isSolo && inn2.balls_bowled > 0 && inn2.balls_bowled % 6 === 0) {
+        await ctx.telegram.sendMessage(
+          groupId,
+          `🔔 Over complete!\n👑 Team ${inn2.bowling_team}: /bowl <n>`
+        );
+      } else if (isSolo && !isWicket) {
+        const st = await getPlayer(inn2.striker_player_id);
+        await ctx.telegram.sendMessage(
+          groupId,
+          `👉 ${name(st)} next ball: type *1–6*`,
+          { parse_mode: 'Markdown' }
+        );
       }
     }
-    await ctx.telegram.sendMessage(groupId, await scoreboard(m.id));
+
+    await ctx.telegram.sendMessage(groupId, await scoreboard(m.id), {
+      parse_mode: 'Markdown',
+    });
   } catch (e) {
     console.error(e);
     await ctx.answerCbQuery('Error', { show_alert: true });
@@ -747,20 +1302,8 @@ async function main() {
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));
 }
+
 main().catch((e) => {
   console.error(e);
   process.exit(1);
 });
-
-/*
-========== SUPABASE: SQL Editor mein EK BAAR run karo ==========
-
-Paste the full schema from database/schema.sql of the full project,
-OR minimal tables below if you prefer:
-
--- (Use the complete schema.sql from the zip for production)
-
-Same schema as Python/full JS version — users, matches, match_teams,
-match_players, innings, batting_stats, bowling_stats, deliveries,
-pending_balls, match_events.
-*/
