@@ -121,6 +121,10 @@ async function upsertUser(u) {
   );
 }
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');
+}
+
 function name(p) {
   if (!p) return '—';
   if (p.username) return `@${p.username}`;
@@ -261,7 +265,9 @@ async function scoreboard(matchId) {
 
   t += `📊 *INNINGS ${inn.innings_number}*\n`;
   t += `${line()}\n`;
-  t += `🅰️ Team ${bat}  »  *${inn.total_runs}/${inn.total_wickets}*\n`;
+  t += isSolo
+    ? `🏏 Score: *${inn.total_runs}/${inn.total_wickets}*\n`
+    : `🅰️ Team ${bat}  »  *${inn.total_runs}/${inn.total_wickets}*\n`;
   t += `⏱ Overs: *${oversStr(inn.balls_bowled)} / ${totalOvers}*\n`;
   t += `📈 RR: *${crr}*\n`;
 
@@ -280,7 +286,7 @@ async function scoreboard(matchId) {
   if (bowler) t += `🎳 Bowler    ${name(bowler)}\n`;
 
   // Batting card
-  t += `\n┌─ BATTING Team ${bat} ─┐\n`;
+  t += isSolo ? `\n┌─ BATSMAN ─┐\n` : `\n┌─ BATTING Team ${bat} ─┐\n`;
   const bats = await getPlayers(matchId, bat);
   for (const p of bats) {
     const { rows: st } = await q(
@@ -300,7 +306,7 @@ async function scoreboard(matchId) {
   t += `└${'─'.repeat(20)}┘\n`;
 
   // Bowling card
-  t += `\n┌─ BOWLING Team ${bowl} ─┐\n`;
+  t += isSolo ? `\n┌─ BOWLER ─┐\n` : `\n┌─ BOWLING Team ${bowl} ─┐\n`;
   const bowls = await getPlayers(matchId, bowl);
   const maxOv = match.max_overs_per_bowler || MAX_BOWLER_OVERS;
   for (const p of bowls) {
@@ -322,7 +328,7 @@ async function scoreboard(matchId) {
   t += `└${'─'.repeat(20)}┘\n`;
 
   if (isSolo) {
-    t += `\n💡 Solo: batsman group mein *1-6* type kare`;
+    t += `\n💡 Batsman group mein *1–6* type kare`; 
   }
 
   return t;
@@ -343,83 +349,69 @@ bot.start(async (ctx) => {
   );
 });
 
-// ─── Permanent result GIFs: reply to a GIF with /pgif 1, /pgif 2 ... /pgif out ───
+// ─── Permanent result GIFs ────────────────────────────────────────────────
+// Reply to a GIF with /pgif 1|2|3|4|5|6|out. Saved in PostgreSQL permanently.
 const PGIF_KEYS = new Set(['1', '2', '3', '4', '5', '6', 'out']);
+
+async function canConfigurePgif(ctx) {
+  const ids = [process.env.BOT_OWNER_ID, ...(process.env.ADMIN_IDS || '').split(',')]
+    .map((v) => Number(String(v || '').trim())).filter((n) => Number.isSafeInteger(n) && n > 0);
+  if (ctx.from && ids.includes(ctx.from.id)) return true;
+  if (ctx.chat && ctx.chat.type !== 'private') {
+    try {
+      const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+      return ['creator', 'administrator'].includes(member.status);
+    } catch (e) { console.error('pgif admin check failed:', e.message); }
+  }
+  return false;
+}
 
 bot.command('pgif', async (ctx) => {
   try {
     const parts = String(ctx.message?.text || '').trim().split(/\s+/);
     const key = String(parts[1] || '').toLowerCase();
-    if (!PGIF_KEYS.has(key)) {
-      return ctx.reply('Usage: GIF ke message par reply karke /pgif 1 (2, 3, 4, 5, 6, out) bhejo.');
-    }
+    if (!PGIF_KEYS.has(key)) return ctx.reply('GIF ke message par reply karke /pgif 1 (ya 2, 3, 4, 5, 6, out) use karo.');
+    if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Sirf group admin ya BOT_OWNER_ID / ADMIN_IDS mein configured owner GIF set kar sakta hai.');
 
-    const replied = ctx.message.reply_to_message;
-    if (!replied) {
-      return ctx.reply(`❌ Pehle GIF/animation wale message par REPLY karo, phir /pgif ${key} bhejo.`);
-    }
-
-    // Allow configured owner or Telegram group admins.
-    const ownerId = String(process.env.BOT_OWNER_ID || '');
-    let allowed = ownerId && String(ctx.from.id) === ownerId;
-    if (!allowed && ctx.chat.type !== 'private') {
-      try {
-        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-        allowed = member.status === 'creator' || member.status === 'administrator';
-      } catch (err) {
-        console.error('pgif admin check failed:', err.message);
+    const replied = ctx.message?.reply_to_message;
+    if (!replied) return ctx.reply('❌ GIF wale message par reply karke /pgif ' + key + ' bhejo.');
+    let fileId = replied.animation?.file_id || null;
+    let mediaType = 'animation';
+    if (!fileId && replied.document) {
+      const mime = String(replied.document.mime_type || '').toLowerCase();
+      if (mime === 'image/gif' || mime.startsWith('video/')) {
+        fileId = replied.document.file_id;
+        mediaType = 'document';
       }
     }
-    if (!allowed) {
-      return ctx.reply('❌ GIF set karne ke liye group admin bano ya Railway Variables mein BOT_OWNER_ID = apni Telegram numeric ID set karo.');
-    }
+    if (!fileId && replied.video) { fileId = replied.video.file_id; mediaType = 'video'; }
+    if (!fileId) return ctx.reply('❌ Reply kiye message mein GIF/animation nahi mili. GIF ko directly Telegram group mein bhejo, phir usi message par reply karo.');
 
-    let fileId = null;
-    let mediaType = 'animation';
-    if (replied.animation?.file_id) {
-      fileId = replied.animation.file_id;
-      mediaType = 'animation';
-    } else if (replied.document?.file_id && (replied.document.mime_type === 'image/gif' || String(replied.document.file_name || '').toLowerCase().endsWith('.gif'))) {
-      fileId = replied.document.file_id;
-      mediaType = 'document';
-    } else if (replied.video?.file_id) {
-      fileId = replied.video.file_id;
-      mediaType = 'video';
-    }
-
-    if (!fileId) {
-      return ctx.reply('❌ Reply wala message GIF nahi lag raha. Telegram GIF ko group mein bhejo, usi GIF par reply karke /pgif ' + key + ' bhejo.');
-    }
-
-    await q(`
-      INSERT INTO public.pgif_settings (result_key, file_id, media_type, updated_by, updated_at)
-      VALUES ($1, $2, $3, $4, NOW())
-      ON CONFLICT (result_key) DO UPDATE SET
-        file_id = EXCLUDED.file_id,
-        media_type = EXCLUDED.media_type,
-        updated_by = EXCLUDED.updated_by,
-        updated_at = NOW()
-    `, [key, fileId, mediaType, String(ctx.from.id)]);
-
-    await ctx.reply(`✅ Permanent GIF SAVED for ${key === 'out' ? 'WICKET' : key + ' RUN' + (key === '1' ? '' : 'S')}!\nAb match mein ${key === 'out' ? 'wicket' : key + ' run'} hote hi GIF result message ke reply mein aayegi.`);
+    await q(`INSERT INTO public.pgif_settings (result_key, file_id, media_type, updated_by, updated_at)
+      VALUES ($1,$2,$3,$4,NOW())
+      ON CONFLICT (result_key) DO UPDATE SET file_id=EXCLUDED.file_id, media_type=EXCLUDED.media_type,
+      updated_by=EXCLUDED.updated_by, updated_at=NOW()`, [key, fileId, mediaType, String(ctx.from.id)]);
+    return ctx.reply(`✅ Permanent GIF saved for ${key === 'out' ? 'WICKET' : key + ' RUN' + (key === '1' ? '' : 'S')}!\nAb matching result par har match mein automatically aayegi.`);
   } catch (e) {
     console.error('pgif setup error:', e);
-    await ctx.reply('❌ GIF save nahi hui. Error: ' + String(e.message || e).slice(0, 250));
+    try { return await ctx.reply('❌ GIF save nahi hui: ' + String(e.message || e).slice(0, 250)); } catch {}
   }
 });
 
-async function sendResultGif(telegram, chatId, key, replyToMessageId) {
+async function sendResultGif(telegram, chatId, key, replyToMessageId, caption = '') {
   try {
-    const { rows } = await q('SELECT file_id, media_type FROM pgif_settings WHERE result_key=$1', [String(key)]);
+    const { rows } = await q('SELECT file_id, media_type FROM public.pgif_settings WHERE result_key=$1', [String(key)]);
     const gif = rows[0];
     if (!gif) return;
-    const opts = { reply_to_message_id: replyToMessageId, allow_sending_without_reply: true };
+    const opts = {
+      reply_to_message_id: replyToMessageId,
+      allow_sending_without_reply: true,
+      ...(caption ? { caption, parse_mode: 'HTML' } : {}),
+    };
     if (gif.media_type === 'document') await telegram.sendDocument(chatId, gif.file_id, opts);
     else if (gif.media_type === 'video') await telegram.sendVideo(chatId, gif.file_id, opts);
     else await telegram.sendAnimation(chatId, gif.file_id, opts);
-  } catch (e) {
-    console.error(`Could not send pgif ${key}:`, e.message);
-  }
+  } catch (e) { console.error(`Could not send pgif ${key}:`, e.message); }
 }
 
 bot.command('help', async (ctx) => {
@@ -1132,15 +1124,18 @@ bot.hears(/^[1-6]$/, async (ctx) => {
     const bowler = await getPlayer(inn.current_bowler_id);
 
     await q(
-      `INSERT INTO pending_balls (match_id, innings_id, bowler_telegram_id, callback_token, bat_number, over_number, ball_number)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [m.id, inn.id, bowler.telegram_id, token, num, overNum, ballNum]
+      `INSERT INTO pending_balls (match_id, innings_id, bowler_telegram_id, callback_token, bat_number, over_number, ball_number, batting_message_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [m.id, inn.id, bowler.telegram_id, token, num, overNum, ballNum, ctx.message.message_id]
     );
 
+    const bowlerTag = `<a href="tg://user?id=${Number(bowler.telegram_id)}">${escapeHtml(name(bowler))}</a>`;
     await ctx.reply(
-      `🔒 *${name(striker)}* ne shot khel liya!\n` +
-        `⏳ Bowler *${name(bowler)}* se number aa raha hai…`,
-      { parse_mode: 'Markdown' }
+      `🔒 ${escapeHtml(name(striker))} ne shot khel liya!\n⏳ Bowler ${bowlerTag} DM mein number bhejega…`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[Markup.button.url(`🎳 DM Bowler: ${name(bowler).slice(0, 35)}`, `tg://user?id=${Number(bowler.telegram_id)}`)]]),
+      }
     );
 
     try {
@@ -1314,7 +1309,7 @@ bot.action(/^bowl:(.+):([1-6])$/, async (ctx) => {
         `💥 *WICKET!*\n` +
         `${line()}\n` +
         `Bat: *${batNum}*  ·  Bowl: *${bowlNum}*\n` +
-        `Team ${inn2.batting_team}: *${inn2.total_runs}/${inn2.total_wickets}*\n` +
+        (isSolo ? `Score: *${inn2.total_runs}/${inn2.total_wickets}*\n` : `Team ${inn2.batting_team}: *${inn2.total_runs}/${inn2.total_wickets}*\n`) +
         `Overs: ${oversStr(inn2.balls_bowled)}`;
     } else {
       const emoji = runs === 6 ? '🚀' : runs === 4 ? '🔥' : '🏏';
@@ -1322,13 +1317,16 @@ bot.action(/^bowl:(.+):([1-6])$/, async (ctx) => {
         `${emoji} *${runs} RUN${runs !== 1 ? 'S' : ''}!*\n` +
         `${line()}\n` +
         `Bat: *${batNum}*  ·  Bowl: *${bowlNum}*\n` +
-        `Team ${inn2.batting_team}: *${inn2.total_runs}/${inn2.total_wickets}*\n` +
+        (isSolo ? `Score: *${inn2.total_runs}/${inn2.total_wickets}*\n` : `Team ${inn2.batting_team}: *${inn2.total_runs}/${inn2.total_wickets}*\n`) +
         `Overs: ${oversStr(inn2.balls_bowled)}`;
     }
     const resultMessage = await ctx.telegram.sendMessage(groupId, ballMsg, { parse_mode: 'Markdown' });
-    // Permanently configured GIF is sent as a reply to the delivery result.
-    if (isWicket) await sendResultGif(ctx.telegram, groupId, 'out', resultMessage.message_id);
-    else if (runs > 0) await sendResultGif(ctx.telegram, groupId, String(runs), resultMessage.message_id);
+    // Permanent GIF replies directly to the batsman's original 1-6 message, with result + short commentary caption.
+    const gifReplyTo = Number(pend.batting_message_id) || resultMessage.message_id;
+    const commentary = isWicket ? '💥 Bowler wins this battle!' : ({1:'👏 Smart single!',2:'⚡ Quick two!',3:'🏃 Great running!',4:'🔥 Beautiful boundary!',5:'💨 Excellent running!',6:'🚀 What a hit!'}[runs] || '🏏 Nice shot!');
+    const gifCaption = isWicket ? '💥 <b>WICKET!</b>\n🎙️ Bowler wins this battle!' : `${runs === 6 ? '🚀' : runs === 4 ? '🔥' : '🏏'} <b>${runs} RUN${runs === 1 ? '' : 'S'}!</b>\n🎙️ ${commentary}`;
+    if (isWicket) await sendResultGif(ctx.telegram, groupId, 'out', gifReplyTo, gifCaption);
+    else if (runs > 0) await sendResultGif(ctx.telegram, groupId, String(runs), gifReplyTo, gifCaption);
 
     // Innings end?
     const batSide = await getPlayers(m.id, inn2.batting_team);
@@ -1361,7 +1359,7 @@ bot.action(/^bowl:(.+):([1-6])$/, async (ctx) => {
         let mid =
           `🏁 *END OF INNINGS 1*\n` +
           `${line()}\n` +
-          `Team ${inn2.batting_team}: *${inn2.total_runs}/${inn2.total_wickets}*\n` +
+          (isSolo ? `Score: *${inn2.total_runs}/${inn2.total_wickets}*\n` : `Team ${inn2.batting_team}: *${inn2.total_runs}/${inn2.total_wickets}*\n`) +
           `🎯 Target for Team ${bat2}: *${target}*\n\n`;
 
         if (isSolo) {
@@ -1450,6 +1448,7 @@ bot.action(/^bowl:(.+):([1-6])$/, async (ctx) => {
 // ─── Launch ──────────────────────────────────────────────
 async function main() {
   await q('SELECT 1');
+  await q('ALTER TABLE pending_balls ADD COLUMN IF NOT EXISTS batting_message_id BIGINT');
   await q(`CREATE TABLE IF NOT EXISTS pgif_settings (
     result_key TEXT PRIMARY KEY,
     file_id TEXT NOT NULL,
