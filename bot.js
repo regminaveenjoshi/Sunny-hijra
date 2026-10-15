@@ -343,52 +343,68 @@ bot.start(async (ctx) => {
   );
 });
 
-// ─── Permanent result GIFs: reply to a GIF with /pgif 1, /pgif 4, /pgif 6 or /pgif out ───
+// ─── Permanent result GIFs: reply to a GIF with /pgif 1, /pgif 2 ... /pgif out ───
 const PGIF_KEYS = new Set(['1', '2', '3', '4', '5', '6', 'out']);
 
 bot.command('pgif', async (ctx) => {
   try {
-    const key = String(ctx.message.text || '').trim().split(/\s+/)[1]?.toLowerCase();
-    if (!key || !PGIF_KEYS.has(key)) {
-      return ctx.reply('Usage: reply to a GIF with /pgif 1 (or 2, 3, 4, 5, 6, out).');
+    const parts = String(ctx.message?.text || '').trim().split(/\s+/);
+    const key = String(parts[1] || '').toLowerCase();
+    if (!PGIF_KEYS.has(key)) {
+      return ctx.reply('Usage: GIF ke message par reply karke /pgif 1 (2, 3, 4, 5, 6, out) bhejo.');
     }
-    const replied = ctx.message.reply_to_message;
-    if (!replied) return ctx.reply('❌ GIF message par reply karke /pgif ' + key + ' bhejo.');
 
-    // Only the bot owner (BOT_OWNER_ID) or a group administrator may configure GIFs.
-    const ownerId = process.env.BOT_OWNER_ID ? Number(process.env.BOT_OWNER_ID) : null;
-    let isAdmin = ownerId && ctx.from.id === ownerId;
-    if (!isAdmin && ctx.chat.type !== 'private') {
+    const replied = ctx.message.reply_to_message;
+    if (!replied) {
+      return ctx.reply(`❌ Pehle GIF/animation wale message par REPLY karo, phir /pgif ${key} bhejo.`);
+    }
+
+    // Allow configured owner or Telegram group admins.
+    const ownerId = String(process.env.BOT_OWNER_ID || '');
+    let allowed = ownerId && String(ctx.from.id) === ownerId;
+    if (!allowed && ctx.chat.type !== 'private') {
       try {
         const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-        isAdmin = ['creator', 'administrator'].includes(member.status);
-      } catch {}
+        allowed = member.status === 'creator' || member.status === 'administrator';
+      } catch (err) {
+        console.error('pgif admin check failed:', err.message);
+      }
     }
-    if (!isAdmin) return ctx.reply('❌ Sirf bot owner ya group admin GIF set kar sakta hai. BOT_OWNER_ID env set kar sakte ho.');
+    if (!allowed) {
+      return ctx.reply('❌ GIF set karne ke liye group admin bano ya Railway Variables mein BOT_OWNER_ID = apni Telegram numeric ID set karo.');
+    }
 
-    let fileId = replied.animation?.file_id;
+    let fileId = null;
     let mediaType = 'animation';
-    if (!fileId && replied.document?.mime_type === 'image/gif') {
+    if (replied.animation?.file_id) {
+      fileId = replied.animation.file_id;
+      mediaType = 'animation';
+    } else if (replied.document?.file_id && (replied.document.mime_type === 'image/gif' || String(replied.document.file_name || '').toLowerCase().endsWith('.gif'))) {
       fileId = replied.document.file_id;
       mediaType = 'document';
-    }
-    if (!fileId && replied.video) {
+    } else if (replied.video?.file_id) {
       fileId = replied.video.file_id;
       mediaType = 'video';
     }
-    if (!fileId) return ctx.reply('❌ Reply kiya hua message GIF/animation hona chahiye.');
 
-    await q(
-      `INSERT INTO pgif_settings (result_key, file_id, media_type, updated_by, updated_at)
-       VALUES ($1,$2,$3,$4,NOW())
-       ON CONFLICT (result_key) DO UPDATE SET file_id=EXCLUDED.file_id,
-       media_type=EXCLUDED.media_type, updated_by=EXCLUDED.updated_by, updated_at=NOW()`,
-      [key, fileId, mediaType, String(ctx.from.id)]
-    );
-    await ctx.reply(`✅ Permanent GIF saved for *${key === 'out' ? 'WICKET' : key + ' RUN' + (key === '1' ? '' : 'S')}*!\nAb har match mein automatically aayegi.`, { parse_mode: 'Markdown' });
+    if (!fileId) {
+      return ctx.reply('❌ Reply wala message GIF nahi lag raha. Telegram GIF ko group mein bhejo, usi GIF par reply karke /pgif ' + key + ' bhejo.');
+    }
+
+    await q(`
+      INSERT INTO public.pgif_settings (result_key, file_id, media_type, updated_by, updated_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (result_key) DO UPDATE SET
+        file_id = EXCLUDED.file_id,
+        media_type = EXCLUDED.media_type,
+        updated_by = EXCLUDED.updated_by,
+        updated_at = NOW()
+    `, [key, fileId, mediaType, String(ctx.from.id)]);
+
+    await ctx.reply(`✅ Permanent GIF SAVED for ${key === 'out' ? 'WICKET' : key + ' RUN' + (key === '1' ? '' : 'S')}!\nAb match mein ${key === 'out' ? 'wicket' : key + ' run'} hote hi GIF result message ke reply mein aayegi.`);
   } catch (e) {
     console.error('pgif setup error:', e);
-    await ctx.reply('❌ GIF save nahi hui: ' + e.message);
+    await ctx.reply('❌ GIF save nahi hui. Error: ' + String(e.message || e).slice(0, 250));
   }
 });
 
