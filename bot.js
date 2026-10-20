@@ -28,6 +28,7 @@ const pool = new Pool({
   max: 8,
 });
 
+const BOT_VERSION = 'r7-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -522,19 +523,10 @@ async function renderHostCardGenerated({ dp, username, firstName }) {
     </defs>
     <rect width="${W}" height="${H}" fill="url(#c)"/><rect width="${W}" height="${H}" filter="url(#n)" opacity="0.22"/>
   </svg>`);
-  let header = await sharp(path.join(ASSET_DIR, TEAM_LAYOUT.file))
-    .extract({ left: 0, top: 0, width: 1024, height: 300 })
-    .resize(W, headerH)
-    .ensureAlpha()
-    .png()
-    .toBuffer();
-  const fade = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${headerH}"><defs>
-    <linearGradient id="f" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="1"/><stop offset="0.7" stop-color="#fff" stop-opacity="1"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>
-    <rect width="${W}" height="${headerH}" fill="url(#f)"/></svg>`);
-  header = await sharp(header).composite([{ input: fade, blend: 'dest-in' }]).png().toBuffer();
+  const header = await loadHeader(W, headerH);
 
   const c = { cx: 960, cy: 545, r: 150 };
-  const layers = [{ input: header, left: 0, top: 0 }];
+  const layers = header ? [{ input: header, left: 0, top: 0 }] : [];
   layers.push(await dpLayer(dp, { ...c, r: c.r - 6 }));
   const overlay = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">
     <defs><filter id="glow" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="9"/></filter></defs>
@@ -617,6 +609,25 @@ async function renderSoloFinalCard({ bat, bowl }) {
   return sharp(path.join(ASSET_DIR, L.file)).composite(layers).jpeg({ quality: 90 }).toBuffer();
 }
 
+// Logo strip from the poster; returns null when the poster file is missing / broken (banners then work without it)
+async function loadHeader(W, headerH) {
+  try {
+    let header = await sharp(path.join(ASSET_DIR, TEAM_LAYOUT.file))
+      .extract({ left: 0, top: 0, width: 1024, height: 300 })
+      .resize(W, headerH)
+      .ensureAlpha()
+      .png()
+      .toBuffer();
+    const fade = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${headerH}"><defs>
+      <linearGradient id="f" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="1"/><stop offset="0.7" stop-color="#fff" stop-opacity="1"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>
+      <rect width="${W}" height="${headerH}" fill="url(#f)"/></svg>`);
+    return await sharp(header).composite([{ input: fade, blend: 'dest-in' }]).png().toBuffer();
+  } catch (e) {
+    console.error('banner header image unavailable:', e.message);
+    return null;
+  }
+}
+
 // ═══ MATCH BANNER (host + Team A captain + Team B captain) ═══
 const BANNER_W = 1280;
 const BANNER_H = 940;
@@ -651,22 +662,13 @@ async function renderMatchBanner({ hostDp, hostName, capA, capB }) {
 
   // header (logo strip from the poster) with a soft fade at the bottom
   const headerH = Math.round((300 * W) / 1024);
-  let header = await sharp(path.join(ASSET_DIR, TEAM_LAYOUT.file))
-    .extract({ left: 0, top: 0, width: 1024, height: 300 })
-    .resize(W, headerH)
-    .ensureAlpha()
-    .png()
-    .toBuffer();
-  const fade = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${headerH}"><defs>
-    <linearGradient id="f" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="1"/><stop offset="0.7" stop-color="#fff" stop-opacity="1"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>
-    <rect width="${W}" height="${headerH}" fill="url(#f)"/></svg>`);
-  header = await sharp(header).composite([{ input: fade, blend: 'dest-in' }]).png().toBuffer();
+  const header = await loadHeader(W, headerH);
 
   const hostC = { cx: 640, cy: 455, r: 82 };
   const aC = { cx: 290, cy: 600, r: 150 };
   const bC = { cx: 990, cy: 600, r: 150 };
 
-  const layers = [{ input: header, left: 0, top: 0 }];
+  const layers = header ? [{ input: header, left: 0, top: 0 }] : [];
   layers.push(await dpLayer(hostDp, { ...hostC, r: hostC.r - 6 }));
   layers.push(await dpLayer(capA && capA.dp, { ...aC, r: aC.r - 6 }));
   layers.push(await dpLayer(capB && capB.dp, { ...bC, r: bC.r - 6 }));
@@ -715,16 +717,7 @@ async function renderPlayersBanner() {
     <rect width="${W}" height="${H}" filter="url(#n)" opacity="0.22"/>
     <rect x="170" y="585" width="360" height="5" fill="url(#l)"/><rect x="750" y="585" width="360" height="5" fill="url(#r)"/>
   </svg>`);
-  let header = await sharp(path.join(ASSET_DIR, TEAM_LAYOUT.file))
-    .extract({ left: 0, top: 0, width: 1024, height: 300 })
-    .resize(W, headerH)
-    .ensureAlpha()
-    .png()
-    .toBuffer();
-  const fade = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${headerH}"><defs>
-    <linearGradient id="f" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="1"/><stop offset="0.7" stop-color="#fff" stop-opacity="1"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>
-    <rect width="${W}" height="${headerH}" fill="url(#f)"/></svg>`);
-  header = await sharp(header).composite([{ input: fade, blend: 'dest-in' }]).png().toBuffer();
+  const header = await loadHeader(W, headerH);
 
   const t1 = await renderText('PLAYERS', 118, '#ffffff');
   const t2 = await renderText('LIST', 118, '#ff2a2a');
@@ -734,13 +727,40 @@ async function renderPlayersBanner() {
   const y = 395;
   const sub = await renderText("Let's Begin", 46, '#ff5a5a');
   const layers = [
-    { input: header, left: 0, top: 0 },
+    ...(header ? [{ input: header, left: 0, top: 0 }] : []),
     { input: t1.data, left: x0, top: y },
     { input: t2.data, left: x0 + t1.info.width + gap, top: y },
     { input: sub.data, left: Math.round((W - sub.info.width) / 2), top: 540 },
   ];
   playersBannerCache = await sharp(bg).composite(layers).jpeg({ quality: 90 }).toBuffer();
   return playersBannerCache;
+}
+
+// Which asset files can really be decoded? Used by /testcard and at startup.
+async function assetReport() {
+  const fs = require('fs');
+  const out = [];
+  for (const f of ['host.png', 'team_final.png', 'solo_final.png', 'default_dp.png']) {
+    const file = path.join(ASSET_DIR, f);
+    if (!fs.existsSync(file)) {
+      out.push(`${f} — MISSING${f === 'default_dp.png' ? ' (a built-in avatar is used)' : ''}`);
+      continue;
+    }
+    try {
+      const meta = await sharp(file).metadata();
+      await sharp(file).resize(8, 8, { fit: 'fill' }).raw().toBuffer(); // forces a real decode
+      out.push(`${f} — OK ${meta.width}x${meta.height}`);
+    } catch (e) {
+      out.push(`${f} — INVALID (${e.message}) — re-upload the original file`);
+    }
+  }
+  try {
+    await renderText('Aa', 20);
+    out.push('font — OK');
+  } catch (e) {
+    out.push(`font — PROBLEM (${e.message})`);
+  }
+  return out;
 }
 
 // ═══ Telegram profile photo download ═══
@@ -1551,9 +1571,16 @@ async function sendHostBanner(ctx, caption, extra = {}) {
   return ctx.telegram.sendMessage(ctx.chat.id, caption, { parse_mode: 'Markdown', ...extra });
 }
 
-// /testcard (admin) — shows the real error if the host banner cannot be made
+// /testcard (admin) — bot version, which asset files are valid, and the real error if the host banner fails
 bot.command('testcard', async (ctx) => {
   if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Admin only.');
+  let report = [];
+  try {
+    report = await assetReport();
+  } catch (e) {
+    report = ['asset check failed: ' + e.message];
+  }
+  await ctx.reply(`🔧 Bot version: ${BOT_VERSION}\n` + report.join('\n'));
   try {
     const dp = await getUserDp(ctx.telegram, ctx.from.id);
     const img = await renderHostCard({ dp, username: ctx.from.username, firstName: ctx.from.first_name });
@@ -3983,7 +4010,17 @@ async function main() {
   BOT_USERNAME = me.username;
   console.log(`Bot @${me.username}`);
   await bot.launch();
-  console.log('Running…');
+  console.log(`Running… (version ${BOT_VERSION})`);
+  try {
+    const rep = await assetReport();
+    console.log('Assets:\n' + rep.join('\n'));
+    if (rep.some((r) => /INVALID|PROBLEM/.test(r))) {
+      const owner = Number(String(process.env.BOT_OWNER_ID || (process.env.ADMIN_IDS || '').split(',')[0] || '').trim());
+      if (owner) await bot.telegram.sendMessage(owner, `⚠️ Asset problem (version ${BOT_VERSION}):\n` + rep.join('\n'));
+    }
+  } catch (e) {
+    console.error('asset check failed:', e.message);
+  }
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));
 }
