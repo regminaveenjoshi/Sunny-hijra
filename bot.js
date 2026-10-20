@@ -28,11 +28,30 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r7-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r8-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
 // Bold "fancy" font for headings (Unicode sans-serif bold): fancy('MATCH OVER') -> 𝗠𝗔𝗧𝗖𝗛 𝗢𝗩𝗘𝗥
+
+// Premium custom emoji (Telegram HTML <tg-emoji>). Falls back to unicode if client ignores it.
+const PE = {
+  bat:   (fb='🏏') => `<tg-emoji emoji-id="5346089086325130313">${fb}</tg-emoji>`,
+  run:   (fb='🏃') => `<tg-emoji emoji-id="6030703634902161922">${fb}</tg-emoji>`,
+  bowl:  (fb='🎳') => `<tg-emoji emoji-id="6030872955397872051">${fb}</tg-emoji>`,
+  ball:  (fb='🔴') => `<tg-emoji emoji-id="6021757930989164684">${fb}</tg-emoji>`,
+  ok:    (fb='✅') => `<tg-emoji emoji-id="6311872470638925629">${fb}</tg-emoji>`,
+  no:    (fb='❌') => `<tg-emoji emoji-id="5462998469784393745">${fb}</tg-emoji>`,
+  warn:  (fb='⚠️') => `<tg-emoji emoji-id="6021757930989164684">${fb}</tg-emoji>`,
+  star:  (fb='⭐') => `<tg-emoji emoji-id="5370784581341422520">${fb}</tg-emoji>`,
+  coin:  (fb='🪙') => `<tg-emoji emoji-id="5426856766665154421">${fb}</tg-emoji>`,
+  zap:   (fb='⚡') => `<tg-emoji emoji-id="5809898661840169148">${fb}</tg-emoji>`,
+  hand:  (fb='🤝') => `<tg-emoji emoji-id="6107130683853903534">${fb}</tg-emoji>`,
+  six:   (fb='🚀') => `<tg-emoji emoji-id="6174505612487954828">${fb}</tg-emoji>`,
+  duck:  (fb='🦆') => `<tg-emoji emoji-id="6030703634902161922">${fb}</tg-emoji>`,
+  crown: (fb='👑') => `<tg-emoji emoji-id="6260439339621159849">${fb}</tg-emoji>`,
+};
+
 function fancy(str) {
   return [...String(str)]
     .map((ch) => {
@@ -262,24 +281,24 @@ function line(char = '─', n = 22) {
 // ─── Keyboards ───────────────────────────────────────────
 const mainKb = () =>
   Markup.inlineKeyboard([
-    [Markup.button.callback('🎮 SOLO', 'm:solo'), Markup.button.callback('👥 TEAM', 'm:team')],
-    [Markup.button.callback('👤 PROFILE', 'm:profile'), Markup.button.callback('🏆 BOARD', 'm:lb')],
-    [Markup.button.callback('📖 HELP', 'm:help')],
+    [Markup.button.callback('🎮 𝗦𝗢𝗟𝗢', 'm:solo'), Markup.button.callback('👥 𝗧𝗘𝗔𝗠', 'm:team')],
+    [Markup.button.callback('👤 𝗣𝗥𝗢𝗙𝗜𝗟𝗘', 'm:profile'), Markup.button.callback('🏆 𝗕𝗢𝗔𝗥𝗗', 'm:lb')],
+    [Markup.button.callback('📖 𝗛𝗘𝗟𝗣', 'm:help')],
   ]);
 
 const tossKb = (id) =>
   Markup.inlineKeyboard([
     [
-      Markup.button.callback('🏏 BAT', `toss:${id}:bat`),
-      Markup.button.callback('🎳 BALL', `toss:${id}:bowl`),
+      Markup.button.callback('🏏 𝗕𝗔𝗧', `toss:${id}:bat`),
+      Markup.button.callback('🎳 𝗕𝗔𝗟𝗟', `toss:${id}:bowl`),
     ],
   ]);
 
 const tossCallKb = (id) =>
   Markup.inlineKeyboard([
     [
-      Markup.button.callback('🪙 HEADS', `tc:${id}:H`),
-      Markup.button.callback('🪙 TAILS', `tc:${id}:T`),
+      Markup.button.callback('🪙 𝗛𝗘𝗔𝗗𝗦', `tc:${id}:H`),
+      Markup.button.callback('🪙 𝗧𝗔𝗜𝗟𝗦', `tc:${id}:T`),
     ],
   ]);
 
@@ -300,8 +319,8 @@ const bowlKb = (token) =>
 // captain buttons: only for teams that still have no captain
 const captainKb = (id, needA, needB) => {
   const row = [];
-  if (needA) row.push(Markup.button.callback('👑 Captain — Team A', `cap:${id}:A`));
-  if (needB) row.push(Markup.button.callback('👑 Captain — Team B', `cap:${id}:B`));
+  if (needA) row.push(Markup.button.callback('👑 𝗖𝗮𝗽𝘁𝗮𝗶𝗻 — 𝗧𝗲𝗮𝗺 𝗔', `cap:${id}:A`));
+  if (needB) row.push(Markup.button.callback('👑 𝗖𝗮𝗽𝘁𝗮𝗶𝗻 — 𝗧𝗲𝗮𝗺 𝗕', `cap:${id}:B`));
   return Markup.inlineKeyboard([row]);
 };
 
@@ -860,7 +879,7 @@ async function scoreboard(matchId) {
   const inn = await getInnings(matchId);
   const isSolo = match.mode === 'solo';
 
-  let t = `🏏 *${fancy('HAND CRICKET')}*\n`;
+  let t = `🏏 *${fancy('CRIC MONSTER')}*\n`;
 
   if (['completed', 'cancelled'].includes(match.status)) {
     t += `Status: *${match.status.toUpperCase()}*\n`;
@@ -890,9 +909,14 @@ async function scoreboard(matchId) {
     ? `🏏 Score: *${inn.total_runs}/${inn.total_wickets}*\n`
     : `🅰️ Team ${bat}  »  *${inn.total_runs}/${inn.total_wickets}*\n`;
   t += isSolo
-    ? `⏱ Overs: *${oversStr(inn.balls_bowled)}*  (unlimited)\n`
+    ? `⏱ Overs: *${oversStr(inn.balls_bowled)}*\n`
     : `⏱ Overs: *${oversStr(inn.balls_bowled)} / ${totalOvers}*\n`;
   t += `📈 RR: *${crr}*\n`;
+  if (match.penalty_log) {
+    for (const pl of String(match.penalty_log).split('\n').filter(Boolean)) {
+      t += `⚖️ *${mdEsc(pl)}*\n`;
+    }
+  }
 
   if (match.target && inn.innings_number === 2) {
     const need = Math.max(0, match.target - inn.total_runs);
@@ -1001,6 +1025,9 @@ async function teamScoreboard(match, inn) {
     const need = Math.max(0, match.target - inn.total_runs);
     const left = Math.max(0, totalOvers * 6 - inn.balls_bowled);
     top += `\n\n🎯 Target: *${match.target}* — need *${need}* from *${left}* balls`;
+  }
+  if (match.penalty_log) {
+    top += '\n\n' + String(match.penalty_log).split('\n').filter(Boolean).map((l) => '⚖️ ' + l).join('\n');
   }
   t += quote(top) + '\n';
 
@@ -1230,11 +1257,11 @@ bot.start(async (ctx) => {
   }
   await ctx.reply(
     `╔══════════════════════╗\n` +
-      `║  🏏 HAND CRICKET     ║\n` +
+      `║  🏏 CRIC MONSTER     ║\n` +
       `╚══════════════════════╝\n\n` +
       `Create a match in a group.\n` +
       `Press /start here first (needed for bowling in DM).\n\n` +
-      `*Solo* → unlimited overs, just type 0-6\n` +
+      `*Solo* → everyone bats until OUT, just type 0-6\n` +
       `*Team* → /team → /startgame → captains, toss, /setovers`,
     { parse_mode: 'Markdown', ...mainKb() }
   );
@@ -1242,11 +1269,12 @@ bot.start(async (ctx) => {
 
 // ─── Permanent result GIFs ────────────────────────────────────────────────
 // Reply to a GIF with /pgif <event>. Saved in PostgreSQL permanently.
-//  0-6        → runs scored (0 = dot ball)            out       → wicket            dugout → batsman walks back after OUT
+//  0-6        → runs scored (0 = dot ball)            out       → wicket            dugout → duck out (out for 0)
 //  stance     → batsman takes stance   runup     → bowler runs in    batentry → new batsman walks in
 //  starter    → match started (fielding GIF)   opener → openers are ready
 //  bowlentry  → new bowler comes       (old names newbatsman / newbowler / runnerup still work)
 const PGIF_ALIASES = {
+  dot: '0',
   newbowler: 'bowlentry',
   bowlerentry: 'bowlentry',
   newbatsman: 'batentry',
@@ -1258,23 +1286,34 @@ const PGIF_ALIASES = {
   fifty: '50',
   century: '100',
   hundred: '100',
+  '150': '150',
+  '200': '200',
+  doublecentury: '200',
   threew: '3w',
   '3wickets': '3w',
   fifer: '5fer',
   fivefer: '5fer',
   '5w': '5fer',
+  fivew: '5fer',
+  '5wickets': '5fer',
   hattrick: 'hatrick',
+  duckout: 'dugout',
+  'duck-out': 'dugout',
+  'duck_out': 'dugout',
 };
 const PGIF_KEYS = new Set([
   '0', '1', '2', '3', '4', '5', '6', 'out', 'duck', 'dugout', 'stance', 'runup', 'batentry', 'bowlentry',
-  'starter', 'opener', 'toss', '50', '100', '3w', '5fer', 'hatrick',
+  'starter', 'opener', 'toss', '50', '100', '150', '200', '3w', '5fer', 'hatrick',
 ]);
 const PGIF_LEGACY = { batentry: 'newbatsman', bowlentry: 'newbowler' }; // keys saved by an older version
 const PGIF_LABELS = {
   0: 'DOT BALL',
+  dot: 'DOT BALL',
   duck: 'DUCK (out for 0)',
   50: 'FIFTY',
   100: 'CENTURY',
+  150: '150 RUNS',
+  200: 'DOUBLE CENTURY',
   '3w': '3 WICKETS',
   '5fer': 'FIVE-WICKET HAUL',
   hatrick: 'HAT-TRICK',
@@ -1282,7 +1321,7 @@ const PGIF_LABELS = {
   starter: 'MATCH STARTER (fielding)',
   opener: 'OPENERS READY',
   out: 'WICKET',
-  dugout: 'DUGOUT',
+  dugout: 'DUCK OUT',
   stance: 'BATSMAN STANCE',
   runup: 'BOWLER RUN-UP',
   batentry: 'BATSMAN ENTRY',
@@ -1309,7 +1348,7 @@ bot.command('pgif', async (ctx) => {
     const key = PGIF_ALIASES[rawKey] || rawKey;
     if (!PGIF_KEYS.has(key))
       return ctx.reply(
-        'Reply to a GIF with:\n/pgif 0 … /pgif 6 · /pgif out · /pgif duck · /pgif dugout\n/pgif stance · /pgif runup · /pgif batentry · /pgif bowlentry\n/pgif starter (or fielding) · /pgif opener · /pgif toss\n/pgif 50 · /pgif 100 · /pgif 3w · /pgif 5fer · /pgif hatrick'
+        'Reply to a GIF with:\n/pgif 0 (or /pgif dot) … /pgif 6 · /pgif out · /pgif duck · /pgif dugout (duck out)\n/pgif stance · /pgif runup · /pgif batentry · /pgif bowlentry\n/pgif starter (or fielding) · /pgif opener · /pgif toss\n/pgif 50 · /pgif 100 · /pgif 150 · /pgif 200 · /pgif 3w · /pgif 5w (or 5fer) · /pgif hatrick'
       );
     if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only a group admin or the owner configured in BOT_OWNER_ID / ADMIN_IDS can set GIFs.');
 
@@ -1434,7 +1473,7 @@ async function bowlerSpamBlocked(m, inn, n) {
 bot.command('help', async (ctx) => {
   await ctx.reply(
     `📖 *HOW TO PLAY*\n\n` +
-      `*SOLO* (unlimited overs, everyone bats until out)\n` +
+      `*SOLO* (everyone bats until out)\n` +
       `/startsolo — open lobby (60s)\n` +
       `/join\\_solo — join (#1 bats, #2 bowls…)\n` +
       `/leavesolo — leave\n` +
@@ -1452,6 +1491,7 @@ bot.command('help', async (ctx) => {
       `*Other*\n` +
       `/members (or /team) — overview + player list · /score · /scorecard · /endmatch\n` +
       `/spam — host switches Spam-free / Spam mode\n` +
+      `/penalty team a -5 reason — host deducts/adds team runs\n` +
       `/changehost — vote to change the host (3 votes per team)\n\n` +
       `*Rules*\n` +
       `⏱ Batsman and bowler must respond within ${TURN_SECONDS}s, otherwise *-${TURN_PENALTY} runs* (team: from the team score, solo: from the player's runs).\n` +
@@ -1459,7 +1499,7 @@ bot.command('help', async (ctx) => {
       `A batsman who misses ${BAT_RETIRE_LIMIT} turns is retired OUT.\n` +
       `If a lobby does nothing, the host gets warnings and the game ends after ${IDLE_WARN_LIMIT}.\n\n` +
       `*GIF setup (reply to a GIF):*\n` +
-      `/pgif 0 … /pgif 6 · /pgif out · /pgif dugout\n/pgif duck · /pgif stance (batsman batting) · /pgif runup (bowler bowling)\n/pgif batentry · /pgif bowlentry · /pgif starter (fielding) · /pgif opener · /pgif toss\n/pgif 50 · /pgif 100 · /pgif 3w · /pgif 5fer · /pgif hatrick`,
+      `/pgif 0 … /pgif 6 · /pgif out · /pgif dugout (duck out)\n/pgif duck · /pgif stance (batsman batting) · /pgif runup (bowler bowling)\n/pgif batentry · /pgif bowlentry · /pgif starter (fielding) · /pgif opener · /pgif toss\n/pgif 50 · /pgif 100 · /pgif 150 · /pgif 200 · /pgif 3w · /pgif 5w (or 5fer) · /pgif hatrick`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -1904,7 +1944,6 @@ async function createSoloLobby(ctx) {
         `> 👑 Host: *${mn(ctx.from)}*\n` +
         `> 👥 Players: *1*  ·  max ${MAX_SOLO_PLAYERS}\n` +
         `> ⏱ Lobby: *${LOBBY_SECONDS}s*\n` +
-        `> ♾ Unlimited overs — everyone bats until OUT\n` +
         `> 🎯 Same number = OUT  ·  numbers 0–6\n` +
         `> ⚡ Mode: *Spam* (host: /spam to switch)\n\n` +
         `📢 /join\\_solo — join (#1 bats, #2 bowls…)\n` +
@@ -2746,7 +2785,7 @@ bot.command('setovers', async (ctx) => {
     const m = await getActiveMatch(ctx.chat.id);
     if (!m) return ctx.reply('❌ No active match');
     if (Number(m.host_telegram_id) !== ctx.from.id) return ctx.reply('❌ Only the host can set the overs');
-    if (m.mode === 'solo') return ctx.reply('♾ Solo matches have unlimited overs');
+    if (m.mode === 'solo') return ctx.reply('♾ Solo matches do not use fixed overs');
     if (!(m.status === 'toss' && m.setup_phase === 'overs'))
       return ctx.reply('⚠️ You can set the overs right after the toss choice (bat / bowl)');
     await ctx.reply(`⏱ *Choose the total overs* (1–${MAX_OVERS}):`, {
@@ -2936,6 +2975,95 @@ bot.command(['ball', 'bowling'], async (ctx) => {
   }
 });
 
+
+// Host: /penalty team a -5 abusing   OR  /penalty A -5 reason text
+bot.command('penalty', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  try {
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m) return ctx.reply('❌ No active match');
+    if (Number(ctx.from.id) !== Number(m.host_telegram_id) && !isAdmin(ctx.from.id))
+      return ctx.reply('❌ Only the host can give penalties');
+    if (m.mode === 'solo')
+      return ctx.reply('❌ /penalty is for team matches. Use time-miss penalties for solo.');
+    if (!['innings1', 'innings2', 'toss', 'captains', 'waiting'].includes(m.status) && m.status === 'completed')
+      return ctx.reply('❌ Match already finished');
+
+    const parts = String(ctx.message?.text || '').trim().split(/\s+/);
+    // /penalty team a -5 reason...  OR /penalty A -5 reason
+    let team = null;
+    let amount = null;
+    let reasonStart = 1;
+    if (parts[1] && /^team$/i.test(parts[1]) && parts[2]) {
+      team = String(parts[2]).toUpperCase().replace(/[^AB]/g, '');
+      amount = Number(parts[3]);
+      reasonStart = 4;
+    } else if (parts[1]) {
+      team = String(parts[1]).toUpperCase().replace(/[^AB]/g, '');
+      amount = Number(parts[2]);
+      reasonStart = 3;
+    }
+    if (team !== 'A' && team !== 'B')
+      return ctx.reply('Usage: `/penalty team a -5 abusing`\nOr: `/penalty A -5 reason`', { parse_mode: 'Markdown' });
+    if (!Number.isFinite(amount) || amount === 0)
+      return ctx.reply('❌ Amount must be a non-zero number (e.g. -5 or 5). Negative = deduct runs.');
+    // host said -5 → deduct 5; host said 5 → also treat as deduct 5 if positive? User said -5 so keep sign.
+    // If positive, add runs (bonus); if negative, deduct.
+    const delta = amount; // can be negative
+    const reason = parts.slice(reasonStart).join(' ').trim() || 'host penalty';
+
+    const inn = await getInnings(m.id);
+    const trow = await getTeam(m.id, team);
+    if (!trow) return ctx.reply('❌ Team not found');
+
+    // Apply to current innings if this team is batting, else to penalty_runs (starts innings below 0)
+    let applied = '';
+    if (inn && inn.batting_team === team) {
+      await q(`UPDATE innings SET total_runs = total_runs + $2 WHERE id=$1`, [inn.id, delta]);
+      applied = `innings score ${delta >= 0 ? '+' : ''}${delta}`;
+    } else {
+      // store cumulative host penalty on team (penalty_runs is already used for time penalties as negative)
+      await q(
+        `UPDATE match_teams SET penalty_runs = COALESCE(penalty_runs,0) + $3 WHERE match_id=$1 AND team_label=$2`,
+        [m.id, team, delta]
+      );
+      // If they already batted in a completed innings, adjust that too
+      const { rows: past } = await q(
+        `SELECT id FROM innings WHERE match_id=$1 AND batting_team=$2 AND is_completed=TRUE ORDER BY innings_number DESC LIMIT 1`,
+        [m.id, team]
+      );
+      if (past[0]) {
+        await q(`UPDATE innings SET total_runs = total_runs + $2 WHERE id=$1`, [past[0].id, delta]);
+        applied = `completed innings ${delta >= 0 ? '+' : ''}${delta}`;
+      } else {
+        applied = `pre-innings penalty ${delta >= 0 ? '+' : ''}${delta} (starts from this)`;
+      }
+    }
+
+    // Log note on match for scoreboard
+    await q(`ALTER TABLE matches ADD COLUMN IF NOT EXISTS penalty_log TEXT`);
+    const line = `Team ${team} ${delta >= 0 ? '+' : ''}${delta} (${reason})`;
+    await q(
+      `UPDATE matches SET penalty_log = CASE
+         WHEN penalty_log IS NULL OR penalty_log = '' THEN $2
+         ELSE penalty_log || E'\\n' || $2
+       END WHERE id=$1`,
+      [m.id, line]
+    );
+
+    await ctx.reply(
+      `⚖️ *PENALTY APPLIED*\n` +
+        `> Team *${team}*: *${delta >= 0 ? '+' : ''}${delta}* runs\n` +
+        `> Reason: *${mdEsc(reason)}*\n` +
+        `> (${mdEsc(applied)})`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (e) {
+    console.error('penalty', e);
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
 bot.command('score', async (ctx) => {
   if (!isGroup(ctx)) return;
   const m = await getActiveMatch(ctx.chat.id);
@@ -2970,12 +3098,12 @@ function clearWarns(matchId) {
 // Markdown mention that pings the player
 const mtag = (p) => `[${mdEsc(name(p))}](tg://user?id=${Number(p.telegram_id ?? p.id)})`;
 
-// GIF captions for the extra GIF events (/pgif batentry | bowlentry | dugout | stance | runup)
+// GIF captions for the extra GIF events (/pgif batentry | bowlentry | dugout=duck out | stance | runup)
 const newBowlerCaption = (p) => `🎳 <b>NEW BOWLER</b>\n🎙️ ${escapeHtml(name(p))} takes the ball!`;
 const newBatsmanCaption = (p) => `🏏 <b>NEW BATSMAN</b>\n🎙️ ${escapeHtml(name(p))} walks in to bat!`;
 const stanceCaption = (p) => `🏏 <b>STANCE</b>\n🎙️ ${escapeHtml(name(p))} takes the stance.`;
 const runupCaption = (p) => `🎳 <b>RUN-UP</b>\n🎙️ ${escapeHtml(name(p))} runs in to bowl…`;
-const dugoutCaption = (p) => `🚶 <b>DUGOUT</b>\n🎙️ ${escapeHtml(name(p))} walks back to the pavilion.`;
+const dugoutCaption = (p) => `${PE.duck('🦆')} <b>DUCK OUT</b>\n🎙️ ${escapeHtml(name(p))} out for 0 — walks back to the pavilion.`;
 
 // ─── Penalties ───────────────────────────────────────────
 // Team penalty: -6 from the team's score (works before the team has batted too)
@@ -3212,7 +3340,11 @@ async function batTimeout({ m, inn, pend }) {
     `UPDATE innings SET total_wickets=total_wickets+1, striker_player_id=NULL, ball_state='idle' WHERE id=$1`,
     [inn.id]
   );
-  await sendResultGif(tg, groupId, 'dugout', undefined, dugoutCaption(striker));
+  // dugout only if duck (0 runs)
+  const { rows: rs } = await q(`SELECT runs FROM batting_stats WHERE innings_id=$1 AND player_id=$2`, [inn.id, striker.id]);
+  if (Number(rs[0]?.runs || 0) === 0) {
+    await sendResultGif(tg, groupId, 'dugout', undefined, dugoutCaption(striker));
+  }
   const inn2 = (await q(`SELECT * FROM innings WHERE id=$1`, [inn.id])).rows[0];
   await progressAfterBall(tg, m, inn2, true);
 }
@@ -3645,6 +3777,48 @@ async function finishTeam(telegram, groupId, m, inn2) {
   await sendLong(telegram, groupId, await fullScorecard(m.id));
 }
 
+
+// English over summary (last 6 balls)
+async function overSummary(matchId, inn) {
+  try {
+    const overNo = Math.floor((inn.balls_bowled - 1) / 6) + 1; // just finished over
+    const { rows } = await q(
+      `SELECT d.bat_number, d.bowl_number, d.runs_scored, d.is_wicket,
+              b.username AS bu, b.first_name AS bf, o.username AS ou, o.first_name AS ofn
+         FROM deliveries d
+         LEFT JOIN match_players b ON b.id = d.batsman_id
+         LEFT JOIN match_players o ON o.id = d.bowler_id
+        WHERE d.innings_id=$1 AND d.over_number=$2
+        ORDER BY d.ball_number`,
+      [inn.id, overNo]
+    );
+    if (!rows.length) return `> Over ${overNo}: no balls logged`;
+    const bowler = rows[0];
+    const bName = bowler.ou ? '@' + bowler.ou : (bowler.ofn || 'Bowler');
+    let runs = 0, wk = 0;
+    const balls = [];
+    for (const r of rows) {
+      if (r.is_wicket === true || r.is_wicket === 1 || r.is_wicket === 't') {
+        balls.push('W');
+        wk += 1;
+      } else {
+        balls.push(String(r.runs_scored));
+        runs += Number(r.runs_scored) || 0;
+      }
+    }
+    const seq = balls.join(' · ');
+    return (
+      `> 📊 *Over ${overNo} summary*\n` +
+      `> 🎳 Bowler: *${mdEsc(bName)}*\n` +
+      `> 🏏 Balls: \`${seq}\`\n` +
+      `> 📈 Runs this over: *${runs}*${wk ? ` · Wickets: *${wk}*` : ''}`
+    );
+  } catch (e) {
+    console.error('overSummary', e.message);
+    return '> Over summary unavailable';
+  }
+}
+
 // ─── After every ball (or retire): innings end? next prompts, scoreboard, clocks ───
 //  solo : unlimited overs, ends when every player is out
 //  team : all out (last batter has no partner => players-1 wickets), overs finished or target chased
@@ -3724,10 +3898,15 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
         `👑 Team ${inn2.batting_team} captain: next batsman → /bat <no.>`
       );
     } else if (!isSolo && inn2.balls_bowled > 0 && inn2.balls_bowled % 6 === 0) {
+      const ovSum = await overSummary(m.id, inn2);
       await telegram.sendMessage(
         groupId,
-        `🔔 Over complete!\n👑 Team ${inn2.bowling_team}: /ball <no.>`
+        `🔔 *Over complete!*\n${ovSum}\n👑 Team ${inn2.bowling_team}: /ball <no.>`,
+        { parse_mode: 'Markdown' }
       );
+    } else if (isSolo && inn2.balls_bowled > 0 && inn2.balls_bowled % 6 === 0) {
+      const ovSum = await overSummary(m.id, inn2);
+      await telegram.sendMessage(groupId, `🔔 *Over complete!*\n${ovSum}`, { parse_mode: 'Markdown' });
     }
   }
 
@@ -3743,14 +3922,422 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
 }
 
 const COMMENT = {
-  '0': ['Dot ball! The pressure builds.', 'Solid defence, no run.', 'Nothing doing there, dot ball.', 'Tight bowling, nothing to score.'],
-  '1': ['Quick single, keeps the scoreboard ticking.', 'Nudged into the gap for one.', 'Smart cricket, a single.', 'Soft hands, easy single.'],
-  '2': ['Placed in the gap, they come back for two.', 'Good running, two runs.', 'Driven wide of the fielder, easy couple.', 'Two more on the board.'],
-  '3': ['Three! Superb running between the wickets.', 'Pushed hard into the deep, three runs.', 'Great hustle, three runs.', 'They scamper three!'],
-  '4': ['FOUR! Races away to the fence.', 'Cracked through the covers, nobody is catching that.', 'Boundary! Timed to perfection.', 'That one pierces the field, FOUR!'],
-  '5': ['Five runs! Overthrow chaos.', 'Five! Brilliant running and a misfield.', 'Unusual five, the fielders are all over the place.', 'Five runs, scrambled brilliantly.'],
-  '6': ['SIX! Gone into the crowd!', 'Absolutely smoked, that is out of the ground!', 'Maximum! The bowler can only watch.', 'Huge hit, that lands in the stands, SIX!'],
-  out: ['Same number, gone! The bowler has the last laugh.', 'OUT! The bowler read the batsman perfectly.', 'Bowled him! Numbers matched, time to walk back.', 'Wicket! Mind games won by the bowler.'],
+  '0': [
+    'डॉट बॉल! बैटर सोच में पड़ गया — \'क्या खेलूँ?\'',
+    'कुछ नहीं हुआ भाई, डॉट। बॉलर मुस्कुराया।',
+    'टाइट लाइन! रन जीरो, प्रेशर हीरो।',
+    'डिफेंस मास्टरक्लास — स्कोर बोर्ड सो रहा है।',
+    'ये बॉल तो दीवार बन गई, पास नहीं।',
+    'डॉट! कमेंटेटर भी ऊब गए।',
+    'बैट से सिर्फ़ हवा चली, बॉल नहीं।',
+    'रन? कहाँ? डॉट बॉल पार्टी।',
+    'बॉलर बोला — \'आज तो बंद कर दूँगा।\'',
+    'सॉलिड ब्लॉक, ज़ीरो रन, फुल ड्रामा।',
+    'डॉट बॉल — जैसे WiFi कट गया हो।',
+    'बैटर ने सोचा चौका, मिला डॉट।',
+    'प्रेशर कुकर चालू, रन अभी भी 0।',
+    'ये शॉट तो मम्मी को भी नहीं दिखेगा।',
+    'डॉट! अंपायर भी बोर हो रहा है।',
+    'लाइन एंड लेंथ परमी, रन नॉट अलाउड।',
+    'बैट-पैड के बीच अटक गई कहानी।',
+    'डॉट बॉल = फ्री एडवाइस, नो रन्स।',
+    'बॉलर की जीत, बैटर की सोच।',
+    'कोई रन नहीं, सिर्फ़ सस्पेंस।',
+    'डॉट! कैमरामैन ने भी जम्हाई ली।',
+    'ये गेंद तो GPS लॉक हो गई स्टंप पर।',
+    'बैटर: \'अगली बार...\' बॉलर: \'कोई अगली नहीं।\'',
+    'ज़ीरो रन, हंड्रेड प्रेशर।',
+    'डॉट बॉल ने मूड खराब कर दिया।',
+    'जैसे एग्जाम में खाली पेज छोड़ दिया।',
+    'बॉलर बोला थैंक्स, डॉट गिफ्ट।',
+    'डिफेंस इतना टाइट, चींटी भी न निकले।',
+    'रन रेट गिर रहा है, डॉट की बारिश।',
+    'ये तो नेट प्रैक्टिस लग रही है।',
+    'डॉट! कमेंट्री भी चुप।',
+    'बैटर ने शॉट चुना गलत चैनल से।',
+    'बॉलर की प्लानिंग फुल ऑन।',
+    'स्कोरबोर्ड: लोडिंग… 0 रन।',
+    'डॉट बॉल — साइलेंट किलर।',
+    'कोई बाउंड्री नहीं, सिर्फ़ बाउंड्री लाइन का इंतज़ार।',
+    'ये गेंद तो पासपोर्ट चेक कर रही थी।',
+    'बैटर का कॉन्फिडेंस: 404 नॉट फाउंड।',
+    'डॉट! अंपायर ने घड़ी देखी।',
+    'रन बनाने का मूड अभी ऑफिस में है।',
+    'बॉलर ने कहा — \'और ऐसे ही।\'',
+    'डॉट बॉल ने टीम मीटिंग बुला ली।',
+    'शॉट इतना सॉफ्ट, तकिया लग रहा था।',
+    'ज़ीरो। फुल स्टॉप। एंड ऑफ़ स्टोरी।',
+    'डॉट! कप्तान सिर पकड़ रहा है।',
+    'ये तो नेटफ्लिक्स पॉज़ बटन है।',
+    'बैटर सोच रहा — \'मेरा बैट ख़राब है क्या?\'',
+    'बॉलर का चेहरा: मिशन सफल।',
+    'डॉट बॉल डिलीवरी स्पेशल।',
+    'रन नहीं, सिर्फ़ टेंशन डिलीवर हुई।',
+  ],
+  '1': [
+    'एक रन! चोर की तरह चुपके से।',
+    'सिंगल ले लिया, स्मार्ट क्रिकेट।',
+    'जल्दी दौड़े, एक रन पका।',
+    'नज में घुसाया, आसान सिंगल।',
+    'एक रन — स्कोरबोर्ड हिला।',
+    'सॉफ्ट हैंड्स, ईज़ी वन।',
+    'दौड़ इतनी तेज़, जूते छूट गए।',
+    'एक रन मिला, पार्टी अभी बाकी।',
+    'गैप में डाला, सिंगल कंफर्म।',
+    'बैटर बोला — \'बस एक चाहिए था।\'',
+    'क्विक सिंगल, फील्डर लेट।',
+    'एक रन से मूड बना।',
+    'चलो भाई, अकाउंट खुला।',
+    'सिंगल! जैसे ऑटो में सवारी।',
+    'हल्का पुश, पूरा रन।',
+    'एक रन — कैलकुलेटर चालू करो।',
+    'दौड़कर लिया, साँस फूल गई।',
+    'सिंगल मास्टर, नो रिस्क।',
+    'एक रन मिला तो लग रहा सेंचुरी नज़दीक।',
+    'फील्डर ने सोचा बाउंड्री, निकला सिंगल।',
+    'स्मार्ट प्ले, एक रन पॉकेट।',
+    'सिंगल लेके स्ट्राइक बदली।',
+    'एक रन — चाय वाली खुशी।',
+    'नज से खेल के निकाला।',
+    'सिंगल! कमेंट्री भी खुश।',
+    'एक रन से इनिंग जिंदा।',
+    'जल्दी-जल्दी, एक कंफर्म।',
+    'बैटर-नॉनस्ट्राइकर की केमिस्ट्री।',
+    'सिंगल = सेफ प्ले अवॉर्ड।',
+    'एक रन, ज़ीरो ड्रामा।',
+    'घुमा के एक निकाल लिया।',
+    'सिंगल पार्टी शुरू।',
+    'एक रन — बजट में क्रिकेट।',
+    'फील्ड में गैप था, भर लिया।',
+    'सिंगल! अंपायर ने भी नोड किया।',
+    'एक रन से प्रेशर कम।',
+    'चुपके से स्कोर बढ़ाया।',
+    'सिंगल लेना भी आर्ट है।',
+    'एक रन मिला, सेल्फी टाइम।',
+    'दौड़ इतनी, फिटनेस चेक पास।',
+    'सिंगल! बॉलर थोड़ा नाराज़।',
+    'एक रन — छोटा लेकिन मीठा।',
+    'गैप में टच, रन पक्का।',
+    'सिंगल से स्ट्राइक रोटेशन।',
+    'एक रन, टीम खुश।',
+    'हल्की क्लिप, पूरा सिंगल।',
+    'सिंगल! जैसे बस का टिकट।',
+    'एक रन निकाल के मुस्कुराए।',
+    'स्मार्ट क्रिकेट 101।',
+    'सिंगल लेके आगे बढ़े।',
+  ],
+  '2': [
+    'दो रन! सुपर रनिंग बिटवीन विकेट्स।',
+    'कपल पूरा, दो रन अकाउंट में।',
+    'फील्डर देर से पहुँचा, दो मिल गए।',
+    'अच्छी प्लेसमेंट, आसान दो।',
+    'दो रन — स्कोर बढ़ने लगा।',
+    'दौड़-दौड़ के दो कमाए।',
+    'गैप में डाला, टू रन्स।',
+    'दो! जैसे ऑफर में बॉय वन गेट वन।',
+    'रनिंग इतनी तेज़, स्टॉपवॉच हैरान।',
+    'दो रन पक्के, कोई रिस्क नहीं।',
+    'पुश किया डीप में, दो पूरे।',
+    'दो रन — मिड-ऑन परेशान।',
+    'कपल स्कैम्पर, एक्साइटिंग।',
+    'दो रन मिले तो लग रहा मैच जिता देंगे।',
+    'फील्डिंग स्लो, रनिंग फास्ट।',
+    'दो! स्कोरबोर्ड खुश।',
+    'अच्छी कॉलिंग, दो कंफर्म।',
+    'दो रन — छोटी सी खुशी।',
+    'प्लेसमेंट मास्टर, दो रन।',
+    'दौड़ के दो, साँस एक।',
+    'दो रन निकाल के थumbs अप।',
+    'गैप फाइंडर मोड ऑन।',
+    'दो रन! बॉलर सिर हिला रहा।',
+    'कपल पूरा किया जैसे प्रो।',
+    'दो रन से रन रेट सुधार।',
+    'स्मार्ट दो, नो हीरो शॉट।',
+    'दो! फील्डर की किस्मत खराब।',
+    'रनिंग बिटवीन — फुल मार्क्स।',
+    'दो रन, टीम क्लैप।',
+    'डीप स्क्वायर से दो।',
+    'दो रन — कैलकुलेशन सही।',
+    'जल्दी वापस आए, दो पक्के।',
+    'दो! जैसे डबल डोज खुशी।',
+    'प्लेसमेंट + रनिंग = दो।',
+    'दो रन मिला तो मूड बना।',
+    'फील्ड में छेद था, दो भर दिए।',
+    'दो रन — सेफ और स्टाइलिश।',
+    'कपल लेके स्ट्राइक बदली।',
+    'दो! कमेंट्री जोर से।',
+    'अच्छी हसल, दो रन।',
+    'दो रन से प्रेशर कम हुआ।',
+    'रन आउट का खतरा नहीं, दो पूरे।',
+    'दो! बैटर खुश, बॉलर सोच में।',
+    'गैप में टाइम्ड, दो आसान।',
+    'दो रन — छोटा बाउंड्री फील।',
+    'स्कैम्पर टू, फुल ड्रामा।',
+    'दो रन निकाल के मुस्कुराहट।',
+    'प्लेसमेंट क्लास, दो रन।',
+    'दो! ओवर का मिजाज बदला।',
+    'रनिंग गेम ऑन पॉइंट।',
+  ],
+  '3': [
+    'तीन रन! सुपरब रनिंग, कमाल।',
+    'थ्री रन्स — फील्डर हैरान।',
+    'कड़ी मेहनत, तीन पूरे।',
+    'डीप में धकेला, तीन मिल गए।',
+    'तीन! हसल लेवल मैक्स।',
+    'रनिंग इतनी, मैराथन लग रही।',
+    'तीन रन — दुर्लभ और कीमती।',
+    'फील्डर थका, तीन कमाए।',
+    'थ्री! स्कोरबोर्ड नाच रहा।',
+    'जबरदस्त कॉलिंग, तीन पक्के।',
+    'तीन रन निकाल के हीरो बने।',
+    'गैप + स्पीड = तीन।',
+    'तीन! बॉलर का प्लान फेल।',
+    'हसल मास्टरक्लास।',
+    'तीन रन — टीम खड़ी हो गई।',
+    'दौड़-दौड़ के तीन, साँस फूल।',
+    'थ्री रन्स, फुल एड्रेनालिन।',
+    'फील्डिंग मिस्टेक, तीन गिफ्ट।',
+    'तीन! जैसे जैकपॉट।',
+    'रनिंग बिटवीन विकेट्स अवॉर्ड।',
+    'तीन रन से ओवर महँगा।',
+    'सुपरब जजमेंट, तीन।',
+    'तीन! कप्तान ताली बजा रहा।',
+    'डीप कवर से तीन।',
+    'थ्री रन्स — मोमेंट ऑफ मैच।',
+    'मेहनत का फल, तीन रन।',
+    'तीन! फील्डर ने हाथ खड़े किए।',
+    'हसल + प्लेसमेंट = तीन।',
+    'तीन रन, स्कोर में जान।',
+    'जल्दी-जल्दी तीन पूरे।',
+    'थ्री! कमेंट्री पागल।',
+    'रन आउट रिस्क लिया, तीन मिले।',
+    'तीन रन — ब्रेव कॉल।',
+    'फील्डर की थकान, बैटर की जीत।',
+    'तीन! जैसे फ्री हिट।',
+    'सुपरब रनिंग, तीन कंफर्म।',
+    'तीन रन से रन रेट बूस्ट।',
+    'हसल किंग, तीन रन।',
+    'थ्री! स्टेडियम (ग्रुप) खुश।',
+    'गैप में धकेला, तीन आसान।',
+    'तीन रन निकाल के सेलिब्रेशन।',
+    'रनिंग गेम ने कमाल कर दिया।',
+    'तीन! बॉलर हैरान।',
+    'मेहनती तीन, स्टाइलिश नहीं लेकिन काम का।',
+    'थ्री रन्स — कैलकुलेटर खुश।',
+    'तीन रन, ओवर का ट्विस्ट।',
+    'हसल लेवल 100, तीन रन।',
+    'तीन! टीम को एनर्जी।',
+    'सुपरब कॉल, तीन पूरे।',
+    'तीन रन — आज का स्पेशल।',
+  ],
+  '4': [
+    'चौका! बाउंड्री पार, फोर।',
+    'FOUR! कवर ड्राइव कमाल।',
+    'क्रैक! गेंद रेसिंग टू द फेन्स।',
+    'चौका लगा, ग्रुप में शोर।',
+    'टाइम्ड टू परफेक्शन, फोर।',
+    'बाउंड्री! फील्डर सिर्फ़ देखता रहा।',
+    'चौका — जैसे बर्थडे गिफ्ट।',
+    'शॉट इतना मीठा, मिठाई लग रही।',
+    'FOUR! बॉलर का चेहरा लाल।',
+    'गेंद को कहा — \'जा, बाउंड्री मिल।\'',
+    'चौका लगा के बैटर मुस्कुराया।',
+    'क्लासी ड्राइव, फोर रन्स।',
+    'बाउंड्री रोप छू के बाहर।',
+    'FOUR! स्कोरबोर्ड जंप।',
+    'पॉवर + टाइमिंग = चौका।',
+    'चौका! कमेंट्री जोश में।',
+    'फील्ड तोड़ी, फोर पक्का।',
+    'शॉट ऑफ द डे, फोर।',
+    'चौका लगा, पार्टी शुरू।',
+    'गेंद ने कहा बाई, बाउंड्री।',
+    'FOUR! टीम खुशी से उछली।',
+    'कवर में गैप, चौका नक्का।',
+    'टाइम्ड ब्यूटीफुली, फोर।',
+    'चौका — बॉलर की नींद उड़ी।',
+    'क्रैकिंग शॉट, बाउंड्री।',
+    'FOUR! जैसे फ्री टिकट।',
+    'पक्का चौका, कोई शंका नहीं।',
+    'बैट से संगीत, फोर रन।',
+    'चौका लगा के पोज दिया।',
+    'बाउंड्री लाइन ने सलाम किया।',
+    'FOUR! रन रेट ऊपर।',
+    'क्लीन हिट, फोर।',
+    'चौका! अंपायर ने सिग्नल दिया।',
+    'शॉट इतना साफ, आईना।',
+    'FOUR — कैमरा फोकस बैटर पर।',
+    'गेंद उड़ी, बाउंड्री मिली।',
+    'चौका लगा, बॉलर सोच में।',
+    'क्लास apart, फोर रन्स।',
+    'बाउंड्री! ग्रुप चैट में फायर।',
+    'FOUR! मूड ऑन।',
+    'टाइमिंग मास्टर, चौका।',
+    'चौका — आज का हाईलाइट।',
+    'पॉवर शॉट, फोर।',
+    'FOUR! स्कोर में चार की छलांग।',
+    'फील्डर दौड़ा, गेंद पहले पहुँची।',
+    'चौका लगा के हीरो फील।',
+    'ब्यूटीफुल स्ट्रोक, फोर।',
+    'FOUR! बॉलर को चाय पानी।',
+    'बाउंड्री पार्टी।',
+    'चौका! कमाल का शॉट।',
+  ],
+  '5': [
+    'पाँच रन! ओवरथ्रो का कमाल।',
+    'FIVE! मिसफील्ड + रनिंग।',
+    'पाँच रन — अजीब लेकिन मज़ेदार।',
+    'फील्डर ने गलती की, पाँच मिल गए।',
+    'FIVE रन्स, कैओस मोड।',
+    'ओवरथ्रो ड्रामा, पाँच पूरे।',
+    'पाँच! जैसे बोनस लेवल।',
+    'रनिंग + थ्रो मिस = पाँच।',
+    'FIVE — दुर्लभ स्कोर।',
+    'पाँच रन निकाल के सब हैरान।',
+    'मिसफील्ड पार्टी, पाँच।',
+    'पाँच रन — लकी डे।',
+    'थ्रो वाइल्ड, पाँच कमाए।',
+    'FIVE! स्कोरबोर्ड कन्फ्यूज।',
+    'पाँच रन, फुल ड्रामा।',
+    'फील्डिंग एरर, बैटर खुश।',
+    'पाँच! जैसे जैकपॉट प्लस।',
+    'ओवरथ्रो ने गेम बदल दिया।',
+    'पाँच रन — अनअपेक्षित गिफ्ट।',
+    'FIVE रन्स, टीम हँसी।',
+    'कैओस में पाँच निकल आए।',
+    'पाँच! बॉलर हाथ खड़े।',
+    'मिसफील्ड की सजा, पाँच रन।',
+    'पाँच रन — स्टोरी ऑफ द बॉल।',
+    'थ्रो इतना बुरा, पाँच पक्के।',
+    'FIVE! कमेंट्री भी हैरान।',
+    'पाँच रन मिला तो लग रहा सिक्स।',
+    'रनिंग ब्रिलियंट, फील्डिंग नहीं।',
+    'पाँच! ओवर महँगा हुआ।',
+    'अजीबोगरीब पाँच, मज़ेदार।',
+    'FIVE रन्स — याद रहेगा।',
+    'पाँच रन, फील्डर शर्मिंदा।',
+    'ओवरथ्रो स्पेशल।',
+    'पाँच! स्कोर में पंच।',
+    'मिस + हसल = पाँच।',
+    'पाँच रन निकाल के सेलिब्रेट।',
+    'FIVE — बोनस रन्स।',
+    'पाँच! ग्रुप में हँसी।',
+    'फील्डिंग कॉमेडी, पाँच रन।',
+    'पाँच रन — अनोखा मोमेंट।',
+    'थ्रो मिस्ड, रन मैक्सिड।',
+    'FIVE! कैलकुलेटर चेक करो।',
+    'पाँच रन, मूड बना।',
+    'कैओस क्रिकेट, पाँच।',
+    'पाँच! बॉलर की किस्मत खराब।',
+    'मिसफील्ड अवॉर्ड, पाँच रन।',
+    'पाँच रन — ट्विस्ट एंड टर्न।',
+    'FIVE रन्स, फुल मस्ती।',
+    'पाँच! आज का अनोखा।',
+    'ओवरथ्रो ने पाँच दे दिए।',
+  ],
+  '6': [
+    'छक्का! भीड़ में गेंद।',
+    'SIX! आउट ऑफ द ग्राउंड।',
+    'मैक्सिमम! बॉलर सिर्फ़ देखता रहा।',
+    'छक्का लगा, रॉकेट शॉट।',
+    'ह्यूज हिट, स्टैंड्स में।',
+    'SIX! जैसे मिसाइल।',
+    'गेंद को कहा — \'जा, चाँद मिल।\'',
+    'छक्का — पार्टी टाइम।',
+    'पॉवर हिट, सिक्स रन्स।',
+    'SIX! स्कोरबोर्ड उछला।',
+    'बॉलर की गेंद को विदाई।',
+    'छक्का लगा के पोज़।',
+    'मैक्सिमम! कमेंट्री पागल।',
+    'SIX — टीम नाच रही।',
+    'हिट इतना बड़ा, GPS खो गया।',
+    'छक्का! बॉलर का सपना टूटा।',
+    'आउट ऑफ द पार्क, सिक्स।',
+    'SIX! कैमरा खोज रहा गेंद।',
+    'रॉकेट शॉट, मैक्सिमम।',
+    'छक्का लगा, ग्रुप में आग।',
+    'पॉवर प्ले, सिक्स।',
+    'SIX! जैसे फ्री डिनर।',
+    'गेंद उड़ी आसमान, सिक्स।',
+    'छक्का — मोमेंट ऑफ मैच।',
+    'ह्यूज! स्टैंड्स में लैंड।',
+    'SIX! बॉलर पानी माँग रहा।',
+    'मैक्सिमम हिट, फुल जॉय।',
+    'छक्का लगा के हीरो।',
+    'SIX — रन रेट बूस्ट।',
+    'पक्का छक्का, कोई डाउट नहीं।',
+    'गेंद ने बाउंड्री पार की छलांग।',
+    'SIX! कप्तान ताली।',
+    'रॉकेट, सिक्स रन्स।',
+    'छक्का! आज का हाईलाइट।',
+    'आउट ऑफ द ग्राउंड स्पेशल।',
+    'SIX! फील्डर ने हाथ छोड़ दिए।',
+    'पॉवर + एलिवेशन = सिक्स।',
+    'छक्का लगा, सेलिब्रेशन।',
+    'मैक्सिमम! मूड ऑन।',
+    'SIX — स्कोर में धमाका।',
+    'हिट द स्टैंड्स, सिक्स।',
+    'छक्का! बॉलर की प्लानिंग ध्वस्त।',
+    'रॉकेट लॉन्च, सिक्स।',
+    'SIX! ग्रुप चैट में 🔥',
+    'गेंद गायब, सिक्स रन।',
+    'छक्का — फ्रीडम शॉट।',
+    'मैक्सिमम पार्टी।',
+    'SIX! कमाल का हिट।',
+    'पॉवर शॉट ऑफ द डे।',
+    'छक्का लगा के मुस्कुराहट।',
+  ],
+  'out': [
+    'आउट! नंबर मैच, बैटर गया।',
+    'विकेट! बॉलर ने पढ़ लिया।',
+    'सेम नंबर, गोन! वॉक बैक।',
+    'आउट! माइंड गेम्स जीते बॉलर ने।',
+    'नंबर एक जैसे, विकेट गिर गया।',
+    'बोल्ड हिम! टाइम टू गो।',
+    'आउट — बैटर शॉक में।',
+    'विकेट! ग्रुप में शोर।',
+    'सेम नंबर = OUT, सिंपल मैथ।',
+    'बॉलर मुस्कुराया, बैटर चला।',
+    'आउट! डक आउट या बिग स्कोर, फर्क नहीं।',
+    'नंबर मैच, सपना खत्म।',
+    'विकेट गिरा, बॉलर सेलिब्रेट।',
+    'आउट! कमेंट्री सीरियस।',
+    'सेम अंक, गोन फॉर अ डक/स्कोर।',
+    'बॉलर ने प्लान सफल किया।',
+    'आउट — पैवेलियन का रास्ता।',
+    'विकेट! टीम शांत।',
+    'नंबर गेम हारा बैटर।',
+    'आउट! अगला बैटर तैयार रहे।',
+    'सेम नंबर, लास्ट लाफ बॉलर का।',
+    'विकेट गिरते ही माहौल बदला।',
+    'आउट! स्मार्ट बॉलिंग।',
+    'नंबर मैच = गेम ओवर फॉर बैटर।',
+    'बॉलर किंग, बैटर आउट।',
+    'आउट! ड्रामा खत्म इस बैटर का।',
+    'विकेट! कप्तान सोच में।',
+    'सेम नंबर ने धोखा दिया।',
+    'आउट — वॉक ऑफ शेम या प्राइड।',
+    'बॉलर ने पढ़ा, विकेट लिया।',
+    'आउट! स्कोरकार्ड में W।',
+    'नंबर एक, सपने अनेक, आउट एक।',
+    'विकेट! बॉलर का दिन।',
+    'आउट — ग्रुप में \'ooo\'।',
+    'सेम नंबर, सिंपल OUT।',
+    'बॉलर चैंपियन, बैटर रिटायर्ड।',
+    'आउट! अगली एंट्री प्लीज।',
+    'विकेट गिरा के सेलिब्रेशन।',
+    'नंबर मैच ने मैच पलट दिया।',
+    'आउट! माइंड रीडिंग बॉलर।',
+    'सेम अंक, फुल स्टॉप।',
+    'विकेट! प्रेशर काम आया।',
+    'आउट — बैटर की गलती।',
+    'बॉलर ने सही अंदाज़ा लगाया।',
+    'आउट! टीम को झटका।',
+    'नंबर गेम, विकेट फ्रेम।',
+    'विकेट गिर, मूड गिर।',
+    'आउट! पैवेलियन बुला रहा।',
+    'सेम नंबर = एंड ऑफ स्टोरी।',
+    'बॉलर विजेता, बैटर आउट।',
+  ],
 };
 const pick = (a) => a[Math.floor(Math.random() * a.length)];
 
@@ -3868,14 +4455,15 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
 
   // result: reply to the batsman's message, with the saved GIF (or plain text) + commentary
   const head = isWicket
-    ? '💥 <b>WICKET!</b>'
+    ? `${PE.no('💥')} <b>WICKET!</b>`
     : runs === 0
-    ? '⚪ <b>DOT BALL</b>'
-    : `${runs === 6 ? '🚀' : runs === 4 ? '🔥' : '🏏'} <b>${runs} RUN${runs === 1 ? '' : 'S'}!</b>`;
+    ? `${PE.ball('⚪')} <b>DOT BALL</b>`
+    : `${runs === 6 ? PE.six('🚀') : runs === 4 ? '🔥' : PE.bat('🏏')} <b>${runs} RUN${runs === 1 ? '' : 'S'}!</b>`;
   const cmt = pick(COMMENT[isWicket ? 'out' : String(runs)]);
 
   // milestones (each has its own /pgif GIF; the normal result GIF is the fallback)
   const strikerP = await getPlayer(strikerId);
+  const nonP = nonId ? await getPlayer(nonId) : null;
   const { rows: bsr } = await q(`SELECT runs FROM batting_stats WHERE innings_id=$1 AND player_id=$2`, [inn.id, strikerId]);
   const afterRuns = Number(bsr[0]?.runs ?? 0);
   const beforeRuns = afterRuns - runs;
@@ -3884,6 +4472,20 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
   const bowlerP = await getPlayer(bowlerId);
   const gifKeys = [];
   const notes = [];
+  const disp = (p) => (p ? htag(p) : '—');
+
+  // personal batting milestones: 50 / 100 / 150 / 200
+  const batMilestones = [200, 150, 100, 50];
+  let hitBatMs = null;
+  if (!isWicket) {
+    for (const ms of batMilestones) {
+      if (beforeRuns < ms && afterRuns >= ms) {
+        hitBatMs = ms;
+        break;
+      }
+    }
+  }
+
   if (isWicket) {
     const { rows: last3 } = await q(
       `SELECT bowler_id, is_wicket FROM deliveries WHERE innings_id=$1 ORDER BY over_number DESC, ball_number DESC LIMIT 3`,
@@ -3894,29 +4496,92 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
       last3.every((r) => r.bowler_id === bowlerId && (r.is_wicket === true || r.is_wicket === 1 || r.is_wicket === 't'));
     if (hat) {
       gifKeys.push('hatrick');
-      notes.push(`🎩 <b>${fancy('HAT-TRICK')}!</b> ${htag(bowlerP)} — three wickets in three balls!`);
+      notes.push(
+        `🎩 <b>${fancy('HAT-TRICK')}!</b>\n` +
+          `🎊 Congratulations ${disp(bowlerP)} — <b>three wickets in three balls!</b>`
+      );
     }
     if (bowlWk === 5) {
       gifKeys.push('5fer');
-      notes.push(`🖐 <b>${fancy('FIVE-FOR')}!</b> ${htag(bowlerP)} takes 5 wickets!`);
+      notes.push(
+        `🖐 <b>${fancy('FIVE-FOR')}!</b>\n` +
+          `🎊 Congratulations ${disp(bowlerP)} — <b>5 wickets!</b> Absolute domination.`
+      );
     } else if (bowlWk === 3) {
       gifKeys.push('3w');
-      notes.push(`🔥 <b>3 WICKETS!</b> ${htag(bowlerP)} is on fire!`);
+      notes.push(
+        `🔥 <b>${fancy('3 WICKETS')}!</b>\n` +
+          `🎊 Congratulations ${disp(bowlerP)} — <b>3 wickets</b> and still hungry!`
+      );
     }
     if (afterRuns === 0) {
       gifKeys.push('duck');
-      notes.push(`🦆 <b>DUCK!</b> ${htag(strikerP)} is out for 0.`);
+      notes.push(`🦆 <b>DUCK!</b> ${disp(strikerP)} is out for 0.`);
     }
     gifKeys.push('out');
   } else {
-    if (beforeRuns < 100 && afterRuns >= 100) {
+    if (hitBatMs === 200) {
+      gifKeys.push('200');
+      notes.push(
+        `🏆 <b>${fancy('DOUBLE CENTURY')}!</b>\n` +
+          `🎊🎊 Congratulations ${disp(strikerP)} — hit the <b>200!</b>`
+      );
+    } else if (hitBatMs === 150) {
+      gifKeys.push('150');
+      notes.push(
+        `💎 <b>${fancy('150 RUNS')}!</b>\n` +
+          `🎊 Congratulations ${disp(strikerP)} — hit the <b>150!</b>`
+      );
+    } else if (hitBatMs === 100) {
       gifKeys.push('100');
-      notes.push(`💯 <b>${fancy('CENTURY')}!</b> ${htag(strikerP)} reaches 100!`);
-    } else if (beforeRuns < 50 && afterRuns >= 50) {
+      notes.push(
+        `💯 <b>${fancy('CENTURY')}!</b>\n` +
+          `🎊 Congratulations ${disp(strikerP)} — hit the <b>100!</b>`
+      );
+    } else if (hitBatMs === 50) {
       gifKeys.push('50');
-      notes.push(`🌟 <b>${fancy('FIFTY')}!</b> ${htag(strikerP)} reaches 50!`);
+      notes.push(
+        `🌟 <b>${fancy('FIFTY')}!</b>\n` +
+          `🎊 Congratulations ${disp(strikerP)} — hit the <b>50!</b>`
+      );
     }
     gifKeys.push(String(runs));
+  }
+
+  // Partnership milestones (team mode only): runs since last wicket
+  if (!isSolo && !isWicket && nonP) {
+    try {
+      const { rows: pr } = await q(
+        `SELECT COALESCE(SUM(runs_scored),0)::int AS pruns
+           FROM deliveries
+          WHERE innings_id=$1
+            AND id > COALESCE(
+              (SELECT id FROM deliveries WHERE innings_id=$1 AND is_wicket=TRUE
+                ORDER BY over_number DESC, ball_number DESC LIMIT 1),
+              0
+            )`,
+        [inn.id]
+      );
+      const partAfter = Number(pr[0]?.pruns || 0);
+      const partBefore = partAfter - runs;
+      const partMs = [200, 150, 100, 50];
+      for (const ms of partMs) {
+        if (partBefore < ms && partAfter >= ms) {
+          notes.push(
+            `🎊🎊🎊🎊 <b>${fancy(ms + '-RUN PARTNERSHIP')}!</b>\n` +
+              `${disp(strikerP)} &amp; ${disp(nonP)} — <b>${ms} runs</b> together!`
+          );
+          // reuse personal milestone GIF if no better key; optional partnership uses 50/100 gif
+          if (ms === 200) gifKeys.unshift('200');
+          else if (ms === 150) gifKeys.unshift('150');
+          else if (ms === 100) gifKeys.unshift('100');
+          else gifKeys.unshift('50');
+          break;
+        }
+      }
+    } catch (e) {
+      console.error('partnership check', e.message);
+    }
   }
   const html =
     `${head}  ·  <b>${batNum}/${bowlNum}</b>\n` +
@@ -3926,8 +4591,8 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
     reply_to_message_id: Number(batMsgId) || undefined,
   });
 
-  if (isWicket) {
-    // the batsman walks back to the dugout
+  if (isWicket && afterRuns === 0) {
+    // dugout GIF only on duck (out for 0)
     const outP = await getPlayer(strikerId);
     if (outP) await sendResultGif(telegram, groupId, 'dugout', undefined, dugoutCaption(outP));
   }
@@ -3995,6 +4660,7 @@ async function main() {
   await q('ALTER TABLE match_teams ADD COLUMN IF NOT EXISTS penalty_runs INTEGER NOT NULL DEFAULT 0');
   await q('ALTER TABLE pending_balls ADD COLUMN IF NOT EXISTS bowl_number INTEGER');
   await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS spam_free BOOLEAN');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS penalty_log TEXT');
   await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS toss_caller TEXT');
   await q(`CREATE TABLE IF NOT EXISTS pgif_settings (
     result_key TEXT PRIMARY KEY,
