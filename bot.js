@@ -28,7 +28,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r21-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r22-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -219,6 +219,8 @@ const DEFAULT_TEAM_SIZE = 100; // max players per team (effectively unlimited)
 const MIN_TEAM_PLAYERS = 2; // striker + non-striker
 const MAX_BOWLER_OVERS = 4;
 const LOBBY_SECONDS = 60; // solo lobby timer
+const TEAM_JOIN_SECONDS = 45; // team lobby join window
+const TEAM_JOIN_WARN_LAST = 10; // warn when this many seconds left
 const MAX_SOLO_PLAYERS = 100; // effectively unlimited
 
 // ── Discipline rules ──
@@ -260,6 +262,7 @@ const del = (chat, id) => (id ? bot.telegram.deleteMessage(chat, id).catch(() =>
 
 // matchId -> { timer, endsAt, chatId, hostId }
 const lobbies = new Map();
+const teamJoinTimers = new Map(); // matchId -> { timer, warnTimer, endsAt, chatId };
 
 function clearLobby(matchId) {
   const L = lobbies.get(matchId);
@@ -2337,6 +2340,91 @@ bot.command('extend30', async (ctx) => {
 
 // ─── TEAM ────────────────────────────────────────────────
 // /team (no match running) or /startteam [maxTeamSize] → team lobby with host banner
+
+// ─── Team join phase (45s + last-10s warning) ────────────
+function clearTeamJoinTimer(matchId) {
+  const t = teamJoinTimers.get(mkey(matchId));
+  if (!t) return;
+  if (t.timer) clearTimeout(t.timer);
+  if (t.warnTimer) clearTimeout(t.warnTimer);
+  teamJoinTimers.delete(mkey(matchId));
+}
+
+async function startTeamJoinPhase(telegram, matchId, chatId) {
+  clearTeamJoinTimer(matchId);
+  const endsAt = Date.now() + TEAM_JOIN_SECONDS * 1000;
+  const warnAt = Math.max(0, (TEAM_JOIN_SECONDS - TEAM_JOIN_WARN_LAST) * 1000);
+
+  await telegram.sendMessage(
+    chatId,
+    `📌 *JOIN TEAMS* — *${TEAM_JOIN_SECONDS}s*\n` +
+      `${line()}\n` +
+      `> Tap /team\\_a to join *Team A*\n` +
+      `> Tap /team\\_b to join *Team B*\n\n` +
+      `⏱ Timer: *${TEAM_JOIN_SECONDS} seconds*\n` +
+      `⚠️ Warning in the last *${TEAM_JOIN_WARN_LAST}s*\n\n` +
+      `Host can still /add\\_a /add\\_b · /startgame when ready`,
+    { parse_mode: 'Markdown' }
+  );
+
+  const warnTimer = setTimeout(async () => {
+    try {
+      const m = await getMatch(matchId);
+      if (!m || m.status !== 'waiting') return;
+      const a = await getPlayers(matchId, 'A');
+      const b = await getPlayers(matchId, 'B');
+      await telegram.sendMessage(
+        chatId,
+        `⚠️ *${TEAM_JOIN_WARN_LAST}s LEFT TO JOIN!*\n` +
+          `> Team A: *${a.length}* · Team B: *${b.length}*\n` +
+          `> Quick: /team\\_a or /team\\_b`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      console.error('team join warn:', e.message);
+    }
+  }, warnAt);
+
+  const timer = setTimeout(() => {
+    endTeamJoinPhase(telegram, matchId, chatId).catch((e) => console.error('endTeamJoinPhase:', e.message));
+  }, TEAM_JOIN_SECONDS * 1000);
+
+  teamJoinTimers.set(mkey(matchId), { timer, warnTimer, endsAt, chatId });
+}
+
+async function endTeamJoinPhase(telegram, matchId, chatId) {
+  clearTeamJoinTimer(matchId);
+  const m = await getMatch(matchId);
+  if (!m || m.status !== 'waiting' || m.mode === 'solo') return;
+
+  const a = await getPlayers(matchId, 'A');
+  const b = await getPlayers(matchId, 'B');
+  let list =
+    `📋 *TEAM LIST* (join window closed)\n${line()}\n` +
+    `🅰 *Team A* (${a.length})\n`;
+  for (const p of a) list += `  ${p.roster_position}. ${mn(p)}\n`;
+  if (!a.length) list += `  _(empty)_\n`;
+  list += `\n🅱 *Team B* (${b.length})\n`;
+  for (const p of b) list += `  ${p.roster_position}. ${mn(p)}\n`;
+  if (!b.length) list += `  _(empty)_\n`;
+  list +=
+    `\n> You can still join with /team\\_a /team\\_b until the host starts.\n` +
+    `> Host/captains: /add\\_a /add\\_b\n\n` +
+    `👑 Next: host runs /startgame → choose captains → toss`;
+
+  await telegram.sendMessage(chatId, list, { parse_mode: 'Markdown' });
+
+  // Soft nudge: if both teams have enough players, remind host
+  if (a.length >= MIN_TEAM_PLAYERS && b.length >= MIN_TEAM_PLAYERS) {
+    await telegram.sendMessage(
+      chatId,
+      `✅ Both teams ready.\n👑 Host: /startgame to pick captains & start the toss.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+}
+
+
 async function createTeamMatch(ctx) {
   if (!isGroup(ctx)) return ctx.reply('❌ Use this command in a group');
   try {
@@ -2373,7 +2461,7 @@ async function createTeamMatch(ctx) {
         `> ${pe('crown','👑')} Host: *${mn(ctx.from)}*\n` +
         `> ${pe('people','👤')} Players: *unlimited* per team\n` +
         `> ${pe('ok','🛡')} Mode: *Spam Free* (host: /spam to switch)\n` +
-        `> ${pe('clock','⏱')} Overs: the host picks them later with /setovers\n\n` +
+        `> ${pe('clock','⏱')} Join window: *${TEAM_JOIN_SECONDS}s* · Overs after toss (auto)\n\n` +
         `${pe('mega','📌')} *Join*\n` +
         `> /team\\_a — Team A\n` +
         `> /team\\_b — Team B\n\n` +
@@ -2385,6 +2473,9 @@ async function createTeamMatch(ctx) {
         `> /members — see the teams\n` +
         `> /endmatch — cancel`
     );
+    // 45s join window + last-10s warning, then auto team list
+    await startTeamJoinPhase(ctx.telegram, m.id, ctx.chat.id);
+    touchMatch(m.id);
   } catch (e) {
     console.error(e);
     await ctx.reply('❌ ' + e.message);
@@ -2674,6 +2765,7 @@ bot.command('team', async (ctx) => {
 // Cancelling needs the host's permission: Yes / No
 async function cancelMatchNow(m, telegram = null) {
   clearLobby(m.id);
+  clearTeamJoinTimer(m.id);
   stopIdleWatch(m.id);
   clearTurnClock(m.id);
   clearWarns(m.id);
@@ -2770,11 +2862,17 @@ async function startGame(ctx) {
         `❌ Each team needs at least ${MIN_TEAM_PLAYERS} players (Team A: ${a.length}, Team B: ${b.length})`
       );
 
+    clearTeamJoinTimer(m.id);
     const claim = await q(
       `UPDATE matches SET status='captains' WHERE id=$1 AND status='waiting' RETURNING id`,
       [m.id]
     );
     if (!claim.rowCount) return;
+
+    // Show current teams, then captain buttons
+    try {
+      await ctx.reply(await rosterText(m), { parse_mode: 'Markdown' });
+    } catch (_) {}
 
     const info = await captainPromptText(m);
     if (!info.needA && !info.needB) return tryBeginToss(ctx.telegram, m.id);
@@ -3029,10 +3127,17 @@ bot.action(/^toss:(.+):(bat|bowl)$/, async (ctx) => {
       ctx,
       `✅ Team ${m.toss_winner_team} chose to *${choice === 'bat' ? 'BAT' : 'BALL'}* first\n` +
         `> 🏏 Batting first: Team *${batFirst}*\n` +
-        `> 🎳 Bowling first: Team *${bowlFirst}*\n\n` +
-        `⏱ [Host](tg://user?id=${Number(m.host_telegram_id)}): send /setovers to choose the overs (1–${MAX_OVERS})`
+        `> 🎳 Bowling first: Team *${bowlFirst}*`
     );
     await ctx.answerCbQuery();
+    // Host gets overs buttons automatically — no /setovers needed
+    const groupId = Number(m.group_chat_id);
+    await ctx.telegram.sendMessage(
+      groupId,
+      `⏱ *HOST — SET OVERS*\n` +
+        `> [Host](tg://user?id=${Number(m.host_telegram_id)}), pick total overs (1–${MAX_OVERS}):`,
+      { parse_mode: 'Markdown', ...oversKb(m.id) }
+    );
   } catch (e) {
     console.error(e);
     await ctx.answerCbQuery(String(e.message).slice(0, 150), { show_alert: true }).catch(() => {});
