@@ -30,7 +30,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r28-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r31-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -238,6 +238,11 @@ const STUCK_CHECK_MS = 60 * 1000; // how often we scan for stuck games
 const matchActivity = new Map(); // matchId -> last activity ms
 function touchMatch(matchId) {
   matchActivity.set(mkey(matchId), Date.now());
+  // Any real progress resets host idle-warning counter
+  const w = idleWatch.get(mkey(matchId));
+  if (w) {
+    w.warnings = 0;
+  }
 }
 const VOTE_NEEDED = 3; // change-host vote: 3 votes from Team A and 3 from Team B (solo: 3 votes)
 const VOTE_EXPIRE_MS = 3 * 60 * 1000;
@@ -2371,7 +2376,7 @@ async function runTeamJoinWindow(telegram, matchId, chatId, label) {
       `${line()}\n` +
       `> Tap ${cmd} to join *Team ${label}*\n\n` +
       `⏱ Timer: *${TEAM_JOIN_SECONDS} seconds*\n` +
-      `Host: /add\\_${label.toLowerCase()} bhi use kar sakta hai`,
+      `Host can also use /add\\_${label.toLowerCase()}`,
     { parse_mode: 'Markdown' }
   );
 
@@ -2384,7 +2389,7 @@ async function runTeamJoinWindow(telegram, matchId, chatId, label) {
         chatId,
         `⚠️ *${TEAM_JOIN_WARN_LAST}s LEFT — Team ${label}!*\n` +
           `> Team ${label}: *${pl.length}* player${pl.length === 1 ? '' : 's'}\n` +
-          `> Jaldi: ${cmd}`,
+          `> Quick: ${cmd}`,
         { parse_mode: 'Markdown' }
       );
     } catch (e) {
@@ -2407,18 +2412,22 @@ async function onTeamJoinWindowEnd(telegram, matchId, chatId, label) {
   if (!m || m.status !== 'waiting' || m.mode === 'solo') return;
 
   const pl = await getPlayers(matchId, label);
-  let summary = `✅ *Team ${label} window closed*\n> Players: *${pl.length}*\n`;
+  let summary = `✅ *Team ${label} join window closed*\n> Players: *${pl.length}*\n`;
   for (const p of pl) summary += `  ${p.roster_position}. ${mn(p)}\n`;
   if (!pl.length) summary += `  _(empty)_\n`;
   await telegram.sendMessage(chatId, summary, { parse_mode: 'Markdown' });
 
   if (label === 'A') {
-    // Step 2/2: Team B
+    await telegram.sendMessage(
+      chatId,
+      `➡️ Next: *Team B* join opens now (*${TEAM_JOIN_SECONDS}s*).`,
+      { parse_mode: 'Markdown' }
+    );
     await runTeamJoinWindow(telegram, matchId, chatId, 'B');
     return;
   }
 
-  // Both windows done → full team list
+  // Team B timer done → list + tag host for /startgame immediately
   await endTeamJoinPhase(telegram, matchId, chatId);
 }
 
@@ -2447,8 +2456,9 @@ async function endTeamJoinPhase(telegram, matchId, chatId) {
   const hostId = Number(m.host_telegram_id);
   const hostTag = `[Host](tg://user?id=${hostId})`;
   let hostMsg =
-    `👑 ${hostTag} — join timer over.\n` +
-    `> Send /startgame to choose captains and start the toss.`;
+    `👑 ${hostTag}\n` +
+    `⏱ Both join timers are over.\n` +
+    `> Send */startgame* now to choose captains and start the toss.`;
   if (a.length < MIN_TEAM_PLAYERS || b.length < MIN_TEAM_PLAYERS) {
     hostMsg +=
       `\n\n⚠️ Need at least *${MIN_TEAM_PLAYERS}* per team ` +
@@ -2484,7 +2494,7 @@ async function createTeamMatch(ctx) {
       await q(`INSERT INTO match_teams (match_id, team_label) VALUES ($1,$2)`, [m.id, L]);
     }
     await upsertUser(ctx.from);
-    startIdleWatch(m.id);
+    // Idle host-warnings start only after /startgame (captains/toss), not during join timers
     await q(`UPDATE matches SET spam_free=$2 WHERE id=$1`, [m.id, true]); // team: spam-free by default
 
     await sendHostBanner(
@@ -2900,6 +2910,11 @@ async function startGame(ctx) {
       [m.id]
     );
     if (!claim.rowCount) return;
+
+    // Host idle-warnings begin only once the game has started (/startgame)
+    const pl0 = await getPlayers(m.id);
+    startIdleWatch(m.id, ['captains', '', pl0.length, 0].join('|'));
+    touchMatch(m.id);
 
     // Show current teams, then captain buttons
     try {
@@ -3842,7 +3857,8 @@ async function idleTick(matchId) {
   const w = idleWatch.get(mkey(matchId));
   if (!w) return;
   const m = await getMatch(matchId);
-  if (!m || !['waiting', 'captains', 'toss'].includes(m.status)) return stopIdleWatch(matchId);
+  // Only after /startgame — not during the join lobby (waiting)
+  if (!m || !['captains', 'toss'].includes(m.status)) return stopIdleWatch(matchId);
 
   const pl = await getPlayers(m.id);
   const { rows: caps } = await q(
@@ -3862,7 +3878,7 @@ async function idleTick(matchId) {
   if (w.warnings >= IDLE_WARN_LIMIT) {
     stopIdleWatch(m.id);
     clearLobby(m.id);
-    await q(`UPDATE matches SET status='cancelled' WHERE id=$1 AND status IN ('waiting','captains','toss')`, [
+    await q(`UPDATE matches SET status='cancelled' WHERE id=$1 AND status IN ('captains','toss')`, [
       m.id,
     ]);
     await bot.telegram.sendMessage(
