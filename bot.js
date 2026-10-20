@@ -28,7 +28,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r10-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r11-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -36,21 +36,39 @@ const bot = new Telegraf(BOT_TOKEN);
 
 // Premium custom emoji (Telegram HTML <tg-emoji>). Falls back to unicode if client ignores it.
 const PE = {
-  bat:   (fb='🏏') => `<tg-emoji emoji-id="5346089086325130313">${fb}</tg-emoji>`,
-  run:   (fb='🏃') => `<tg-emoji emoji-id="6030703634902161922">${fb}</tg-emoji>`,
-  bowl:  (fb='🎳') => `<tg-emoji emoji-id="6030872955397872051">${fb}</tg-emoji>`,
-  ball:  (fb='🔴') => `<tg-emoji emoji-id="6021757930989164684">${fb}</tg-emoji>`,
-  ok:    (fb='✅') => `<tg-emoji emoji-id="6311872470638925629">${fb}</tg-emoji>`,
-  no:    (fb='❌') => `<tg-emoji emoji-id="5462998469784393745">${fb}</tg-emoji>`,
-  warn:  (fb='⚠️') => `<tg-emoji emoji-id="6021757930989164684">${fb}</tg-emoji>`,
-  star:  (fb='⭐') => `<tg-emoji emoji-id="5370784581341422520">${fb}</tg-emoji>`,
-  coin:  (fb='🪙') => `<tg-emoji emoji-id="5426856766665154421">${fb}</tg-emoji>`,
-  zap:   (fb='⚡') => `<tg-emoji emoji-id="5809898661840169148">${fb}</tg-emoji>`,
-  hand:  (fb='🤝') => `<tg-emoji emoji-id="6107130683853903534">${fb}</tg-emoji>`,
-  six:   (fb='🚀') => `<tg-emoji emoji-id="6174505612487954828">${fb}</tg-emoji>`,
-  duck:  (fb='🦆') => `<tg-emoji emoji-id="6030703634902161922">${fb}</tg-emoji>`,
-  crown: (fb='👑') => `<tg-emoji emoji-id="6260439339621159849">${fb}</tg-emoji>`,
+  // Premium custom emoji IDs (from your pack). HTML: <tg-emoji>. Buttons: icon_custom_emoji_id.
+  bat:    { id: '5346089086325130313', fb: '🏏' }, // bat + ball
+  batsman:{ id: '6030703634902161922', fb: '🏃' }, // batsman running
+  bowler: { id: '6030872955397872051', fb: '🎳' }, // bowling action
+  ball:   { id: '6021757930989164684', fb: '🔴' }, // cricket ball
+  ok:     { id: '6311872470638925629', fb: '✅' }, // green check
+  no:     { id: '5462998469784393745', fb: '❌' }, // red cross
+  star:   { id: '5370784581341422520', fb: '⭐' }, // star
+  coin:   { id: '5426856766665154421', fb: '🪙' }, // coin
+  zap:    { id: '5809898661840169148', fb: '⚡' }, // lightning
+  hand:   { id: '6107130683853903534', fb: '🤝' }, // handshake
+  six:    { id: '6174505612487954828', fb: '🚀' }, // blast / six
+  crown:  { id: '6260439339621159849', fb: '👑' }, // crown / trophy-ish
+  trophy: { id: '6260439339621159849', fb: '🏆' },
+  fire:   { id: '5346089086325130313', fb: '🔥' },
+  plane:  { id: '6028346797368283073', fb: '✈️' },
+  stop:   { id: '6086741365998227951', fb: '🚫' },
+  point:  { id: '6086816966012573204', fb: '👉' },
+  infinite:{ id: '6152232006580181837', fb: '∞' },
+  heart:  { id: '6154635934135490300', fb: '💜' },
+  spark:  { id: '6105048883140760635', fb: '✨' },
+  gdot:   { id: '6107134841382246388', fb: '🟢' },
+  rdot:   { id: '6104873438021686768', fb: '🔴' },
+  // HTML helper
+  e: (key, fb) => {
+    const p = PE[key];
+    if (!p || typeof p !== 'object' || !p.id) return fb || '';
+    return `<tg-emoji emoji-id="${p.id}">${fb || p.fb}</tg-emoji>`;
+  },
 };
+// shorthand used in captions
+const pe = (key, fb) => PE.e(key, fb);
+
 
 function fancy(str) {
   return [...String(str)]
@@ -70,7 +88,13 @@ function fancy(str) {
 function md2html(src) {
   const ESC = { _: '\uE001', '*': '\uE002', '`': '\uE003', '[': '\uE004' };
   const BACK = { '\uE001': '_', '\uE002': '*', '\uE003': '`', '\uE004': '[' };
-  const s = String(src).replace(/\\([_*`\[])/g, (_, c) => ESC[c]);
+  // protect premium <tg-emoji> so HTML escape does not break them
+  const held = [];
+  let s = String(src).replace(/<tg-emoji\b[^>]*>[\s\S]*?<\/tg-emoji>/gi, (m) => {
+    held.push(m);
+    return `\uE010${held.length - 1}\uE011`;
+  });
+  s = s.replace(/\\([_*`\[])/g, (_, c) => ESC[c]);
   const out = [];
   let quote = [];
   const flush = () => {
@@ -96,7 +120,10 @@ function md2html(src) {
     }
   }
   flush();
-  return out.join('\n').replace(/[\uE001-\uE004]/g, (c) => BACK[c]);
+  return out
+    .join('\n')
+    .replace(/[\uE001-\uE004]/g, (c) => BACK[c])
+    .replace(/\uE010(\d+)\uE011/g, (_, i) => held[Number(i)] || '');
 }
 
 // every Markdown message sent through the Telegram API is converted to HTML automatically
@@ -278,49 +305,50 @@ function line(char = '─', n = 22) {
   return char.repeat(n);
 }
 
-// ─── Keyboards ───────────────────────────────────────────
+// ─── Keyboards (premium icon_custom_emoji_id + bold text) ───
+function btn(text, data, peKey) {
+  const b = Markup.button.callback(text, data);
+  const p = peKey && PE[peKey];
+  if (p && p.id) b.icon_custom_emoji_id = p.id;
+  return b;
+}
+
 const mainKb = () =>
   Markup.inlineKeyboard([
-    [Markup.button.callback('🎮 𝗦𝗢𝗟𝗢', 'm:solo'), Markup.button.callback('👥 𝗧𝗘𝗔𝗠', 'm:team')],
-    [Markup.button.callback('👤 𝗣𝗥𝗢𝗙𝗜𝗟𝗘', 'm:profile'), Markup.button.callback('🏆 𝗕𝗢𝗔𝗥𝗗', 'm:lb')],
-    [Markup.button.callback('📖 𝗛𝗘𝗟𝗣', 'm:help')],
+    [btn('𝗦𝗢𝗟𝗢', 'm:solo', 'bat'), btn('𝗧𝗘𝗔𝗠', 'm:team', 'hand')],
+    [btn('𝗣𝗥𝗢𝗙𝗜𝗟𝗘', 'm:profile', 'star'), btn('𝗕𝗢𝗔𝗥𝗗', 'm:lb', 'trophy')],
+    [btn('𝗛𝗘𝗟𝗣', 'm:help', 'spark')],
   ]);
 
 const tossKb = (id) =>
   Markup.inlineKeyboard([
-    [
-      Markup.button.callback('🏏 𝗕𝗔𝗧', `toss:${id}:bat`),
-      Markup.button.callback('🎳 𝗕𝗔𝗟𝗟', `toss:${id}:bowl`),
-    ],
+    [btn('𝗕𝗔𝗧', `toss:${id}:bat`, 'bat'), btn('𝗕𝗔𝗟𝗟', `toss:${id}:bowl`, 'bowler')],
   ]);
 
 const tossCallKb = (id) =>
   Markup.inlineKeyboard([
-    [
-      Markup.button.callback('🪙 𝗛𝗘𝗔𝗗𝗦', `tc:${id}:H`),
-      Markup.button.callback('🪙 𝗧𝗔𝗜𝗟𝗦', `tc:${id}:T`),
-    ],
+    [btn('𝗛𝗘𝗔𝗗𝗦', `tc:${id}:H`, 'coin'), btn('𝗧𝗔𝗜𝗟𝗦', `tc:${id}:T`, 'coin')],
   ]);
 
 const bowlKb = (token) =>
   Markup.inlineKeyboard([
     [
-      Markup.button.callback('1️⃣', `bowl:${token}:1`),
-      Markup.button.callback('2️⃣', `bowl:${token}:2`),
-      Markup.button.callback('3️⃣', `bowl:${token}:3`),
+      btn('𝟭', `bowl:${token}:1`, 'ball'),
+      btn('𝟮', `bowl:${token}:2`, 'ball'),
+      btn('𝟯', `bowl:${token}:3`, 'ball'),
     ],
     [
-      Markup.button.callback('4️⃣', `bowl:${token}:4`),
-      Markup.button.callback('5️⃣', `bowl:${token}:5`),
-      Markup.button.callback('6️⃣', `bowl:${token}:6`),
+      btn('𝟰', `bowl:${token}:4`, 'ball'),
+      btn('𝟱', `bowl:${token}:5`, 'ball'),
+      btn('𝟲', `bowl:${token}:6`, 'six'),
     ],
   ]);
 
 // captain buttons: only for teams that still have no captain
 const captainKb = (id, needA, needB) => {
   const row = [];
-  if (needA) row.push(Markup.button.callback('👑 𝗖𝗮𝗽𝘁𝗮𝗶𝗻 — 𝗧𝗲𝗮𝗺 𝗔', `cap:${id}:A`));
-  if (needB) row.push(Markup.button.callback('👑 𝗖𝗮𝗽𝘁𝗮𝗶𝗻 — 𝗧𝗲𝗮𝗺 𝗕', `cap:${id}:B`));
+  if (needA) row.push(btn('𝗖𝗮𝗽𝘁𝗮𝗶𝗻 — 𝗧𝗲𝗮𝗺 𝗔', `cap:${id}:A`, 'crown'));
+  if (needB) row.push(btn('𝗖𝗮𝗽𝘁𝗮𝗶𝗻 — 𝗧𝗲𝗮𝗺 𝗕', `cap:${id}:B`, 'crown'));
   return Markup.inlineKeyboard([row]);
 };
 
@@ -330,7 +358,7 @@ const oversKb = (id) => {
   for (let start = 1; start <= MAX_OVERS; start += 5) {
     const row = [];
     for (let n = start; n < start + 5 && n <= MAX_OVERS; n++) {
-      row.push(Markup.button.callback(String(n), `ov:${id}:${n}`));
+      row.push(btn(String(n), `ov:${id}:${n}`, 'ball'));
     }
     rows.push(row);
   }
@@ -879,7 +907,7 @@ async function scoreboard(matchId) {
   const inn = await getInnings(matchId);
   const isSolo = match.mode === 'solo';
 
-  let t = `🏏 *${fancy('CRIC MONSTER')}*\n`;
+  let t = `${pe('bat','🏏')} *${fancy('CRIC MONSTER')}*\n`;
 
   if (['completed', 'cancelled'].includes(match.status)) {
     t += `Status: *${match.status.toUpperCase()}*\n`;
@@ -928,9 +956,9 @@ async function scoreboard(matchId) {
   const bowler = await getPlayer(inn.current_bowler_id);
 
   t += `\n${line()}\n`;
-  if (striker) t += `🏏 Striker   ${mn(striker)}\n`;
-  if (!isSolo && non) t += `🧍🏻 Non-strike ${mn(non)}\n`;
-  if (bowler) t += `🎳 Bowler    ${mn(bowler)}\n`;
+  if (striker) t += `${pe('batsman','🏏')} Striker   ${mn(striker)}\n`;
+  if (!isSolo && non) t += `${pe('batsman','🧍')} Non-strike ${mn(non)}\n`;
+  if (bowler) t += `${pe('bowler','🎳')} Bowler    ${mn(bowler)}\n`;
 
   if (!isSolo) {
     // Batting card
@@ -1257,7 +1285,7 @@ bot.start(async (ctx) => {
   }
   await ctx.reply(
     `╔══════════════════════╗\n` +
-      `║  🏏 CRIC MONSTER     ║\n` +
+      `║  ${pe('bat','🏏')} CRIC MONSTER     ║\n` +
       `╚══════════════════════╝\n\n` +
       `Create a match in a group.\n` +
       `Press /start here first (needed for bowling in DM).\n\n` +
@@ -1464,8 +1492,8 @@ async function sendCaptionedGif(telegram, chatId, key, html, extra = {}) {
 async function sendMotmGif(telegram, chatId, motmPlayer) {
   if (!motmPlayer) return false;
   const html =
-    `🏅 <b>${fancy('MAN OF THE MATCH')}</b>\n` +
-    `🎊 Congratulations ${htag(motmPlayer)}!\n` +
+    `${pe('trophy','🏅')} <b>${fancy('MAN OF THE MATCH')}</b>\n` +
+    `${pe('ok','🎊')} Congratulations ${htag(motmPlayer)}!\n` +
     `<blockquote>${escapeHtml(String(motmPlayer.runs || 0))} run${Number(motmPlayer.runs) === 1 ? '' : 's'}` +
     (motmPlayer.wkts ? ` · ${motmPlayer.wkts} wicket${Number(motmPlayer.wkts) === 1 ? '' : 's'}` : '') +
     `</blockquote>`;
@@ -2074,7 +2102,7 @@ async function createSoloLobby(ctx) {
 
     await sendHostBanner(
       ctx,
-      `🎮 *${fancy('SOLO MODE')}*\n` +
+      `${pe('bat','🎮')} *${fancy('SOLO MODE')}*\n` +
         `> 👑 Host: *${mn(ctx.from)}*\n` +
         `> 👥 Players: *1*  ·  max ${MAX_SOLO_PLAYERS}\n` +
         `> ⏱ Lobby: *${LOBBY_SECONDS}s*\n` +
@@ -2252,7 +2280,7 @@ async function createTeamMatch(ctx) {
 
     await sendHostBanner(
       ctx,
-      `👥 *${fancy('TEAM MATCH')}*\n` +
+      `${pe('hand','👥')} *${fancy('TEAM MATCH')}*\n` +
         `> 👑 Host: *${mn(ctx.from)}*\n` +
         `> 👤 Players: *unlimited* per team\n` +
         `> 🛡 Mode: *Spam Free* (host: /spam to switch)\n` +
@@ -2424,8 +2452,8 @@ async function addPlayers(ctx, label, viaAdd = false) {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([
             [
-              Markup.button.callback(`✅ Yes, join${m.mode === 'solo' ? '' : ' Team ' + label}`, `inv:Y:${token}`),
-              Markup.button.callback('❌ No', `inv:N:${token}`),
+              btn(`𝗬𝗲𝘀, 𝗷𝗼𝗶𝗻${m.mode === 'solo' ? '' : ' Team ' + label}`, `inv:Y:${token}`, 'ok'),
+              btn('𝗡𝗼', `inv:N:${token}`, 'no'),
             ],
           ]),
         }
@@ -2573,8 +2601,8 @@ bot.command('endmatch', async (ctx) => {
     return ctx.reply('❌ Only players of this match can ask to cancel it');
   const kb = Markup.inlineKeyboard([
     [
-      Markup.button.callback('✅ Yes, cancel', `em:Y:${m.id}`),
-      Markup.button.callback('❌ No', `em:N:${m.id}`),
+      btn('𝗬𝗲𝘀, 𝗰𝗮𝗻𝗰𝗲𝗹', `em:Y:${m.id}`, 'ok'),
+      btn('𝗡𝗼', `em:N:${m.id}`, 'no'),
     ],
   ]);
   if (isHost) {
@@ -3237,7 +3265,7 @@ const newBowlerCaption = (p) => `🎳 <b>NEW BOWLER</b>\n🎙️ ${escapeHtml(na
 const newBatsmanCaption = (p) => `🏏 <b>NEW BATSMAN</b>\n🎙️ ${escapeHtml(name(p))} walks in to bat!`;
 const stanceCaption = (p) => `🏏 <b>STANCE</b>\n🎙️ ${escapeHtml(name(p))} takes the stance.`;
 const runupCaption = (p) => `🎳 <b>RUN-UP</b>\n🎙️ ${escapeHtml(name(p))} runs in to bowl…`;
-const dugoutCaption = (p) => `${PE.duck('🦆')} <b>DUCK OUT</b>\n🎙️ ${escapeHtml(name(p))} out for 0 — walks back to the pavilion.`;
+const dugoutCaption = (p) => `${pe('batsman','🦆')} <b>DUCK OUT</b>\n🎙️ ${escapeHtml(name(p))} out for 0 — walks back to the pavilion.`;
 
 // ─── Penalties ───────────────────────────────────────────
 // Team penalty: -6 from the team's score (works before the team has batted too)
@@ -3456,7 +3484,7 @@ async function batTimeout({ m, inn, pend }) {
   const retire = warn >= BAT_RETIRE_LIMIT;
   await tg.sendMessage(
     groupId,
-    `⏰ *${fancy('TIME UP')}*\n` +
+    `${pe('zap','⏰')} *${fancy('TIME UP')}*\n` +
       `> ${mtag(striker)} did not play within ${TURN_SECONDS}s.\n` +
       `> 💥 Penalty: *-${TURN_PENALTY} runs*${isSolo ? '' : ' for Team ' + inn.batting_team}  (warning ${warn}/${BAT_RETIRE_LIMIT})\n` +
       (retire
@@ -3507,7 +3535,7 @@ async function bowlTimeout({ m, inn, pend }) {
 
   await tg.sendMessage(
     groupId,
-    `⏰ *${fancy('TIME UP')}*\n` +
+    `${pe('zap','⏰')} *${fancy('TIME UP')}*\n` +
       `> ${mtag(bowler)} did not send a number within ${TURN_SECONDS}s.\n` +
       `> 💥 Penalty: *-${TURN_PENALTY} runs*${isSolo ? '' : ' for Team ' + inn.bowling_team}  (warning ${warn}/${limit})\n` +
       `> 🔁 This ball is cancelled.`,
@@ -4591,10 +4619,10 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
 
   // result: reply to the batsman's message, with the saved GIF (or plain text) + commentary
   const head = isWicket
-    ? `${PE.no('💥')} <b>WICKET!</b>`
+    ? `${pe('no','💥')} <b>WICKET!</b>`
     : runs === 0
-    ? `${PE.ball('⚪')} <b>DOT BALL</b>`
-    : `${runs === 6 ? PE.six('🚀') : runs === 4 ? '🔥' : PE.bat('🏏')} <b>${runs} RUN${runs === 1 ? '' : 'S'}!</b>`;
+    ? `${pe('ball','⚪')} <b>DOT BALL</b>`
+    : `${runs === 6 ? pe('six','🚀') : runs === 4 ? pe('fire','🔥') : pe('bat','🏏')} <b>${runs} RUN${runs === 1 ? '' : 'S'}!</b>`;
   const cmt = pick(COMMENT[isWicket ? 'out' : String(runs)]);
 
   // milestones (each has its own /pgif GIF; the normal result GIF is the fallback)
@@ -4633,52 +4661,52 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
     if (hat) {
       gifKeys.push('hatrick');
       notes.push(
-        `🎩 <b>${fancy('HAT-TRICK')}!</b>\n` +
-          `🎊 Congratulations ${disp(bowlerP)} — <b>three wickets in three balls!</b>`
+        `${pe('trophy','🎩')} <b>${fancy('HAT-TRICK')}!</b>\n` +
+          `${pe('ok','🎊')} Congratulations ${disp(bowlerP)} — <b>three wickets in three balls!</b>`
       );
     }
     if (bowlWk === 5) {
       gifKeys.push('5fer');
       notes.push(
-        `🖐 <b>${fancy('FIVE-FOR')}!</b>\n` +
-          `🎊 Congratulations ${disp(bowlerP)} — <b>5 wickets!</b> Absolute domination.`
+        `${pe('trophy','🖐')} <b>${fancy('FIVE-FOR')}!</b>\n` +
+          `${pe('ok','🎊')} Congratulations ${disp(bowlerP)} — <b>5 wickets!</b> Absolute domination.`
       );
     } else if (bowlWk === 3) {
       gifKeys.push('3w');
       notes.push(
-        `🔥 <b>${fancy('3 WICKETS')}!</b>\n` +
-          `🎊 Congratulations ${disp(bowlerP)} — <b>3 wickets</b> and still hungry!`
+        `${pe('fire','🔥')} <b>${fancy('3 WICKETS')}!</b>\n` +
+          `${pe('ok','🎊')} Congratulations ${disp(bowlerP)} — <b>3 wickets</b> and still hungry!`
       );
     }
     if (afterRuns === 0) {
       gifKeys.push('dugout');
-      notes.push(`🦆 <b>DUCK OUT!</b> ${disp(strikerP)} is out for 0.`);
+      notes.push(`${pe('batsman','🦆')} <b>DUCK OUT!</b> ${disp(strikerP)} is out for 0.`);
     }
     gifKeys.push('out');
   } else {
     if (hitBatMs === 200) {
       gifKeys.push('200');
       notes.push(
-        `🏆 <b>${fancy('DOUBLE CENTURY')}!</b>\n` +
-          `🎊🎊 Congratulations ${disp(strikerP)} — hit the <b>200!</b>`
+        `${pe('trophy','🏆')} <b>${fancy('DOUBLE CENTURY')}!</b>\n` +
+          `${pe('ok','🎊')} Congratulations ${disp(strikerP)} — hit the <b>200!</b>`
       );
     } else if (hitBatMs === 150) {
       gifKeys.push('150');
       notes.push(
-        `💎 <b>${fancy('150 RUNS')}!</b>\n` +
-          `🎊 Congratulations ${disp(strikerP)} — hit the <b>150!</b>`
+        `${pe('star','💎')} <b>${fancy('150 RUNS')}!</b>\n` +
+          `${pe('ok','🎊')} Congratulations ${disp(strikerP)} — hit the <b>150!</b>`
       );
     } else if (hitBatMs === 100) {
       gifKeys.push('100');
       notes.push(
-        `💯 <b>${fancy('CENTURY')}!</b>\n` +
-          `🎊 Congratulations ${disp(strikerP)} — hit the <b>100!</b>`
+        `${pe('star','💯')} <b>${fancy('CENTURY')}!</b>\n` +
+          `${pe('ok','🎊')} Congratulations ${disp(strikerP)} — hit the <b>100!</b>`
       );
     } else if (hitBatMs === 50) {
       gifKeys.push('50');
       notes.push(
-        `🌟 <b>${fancy('FIFTY')}!</b>\n` +
-          `🎊 Congratulations ${disp(strikerP)} — hit the <b>50!</b>`
+        `${pe('spark','🌟')} <b>${fancy('FIFTY')}!</b>\n` +
+          `${pe('ok','🎊')} Congratulations ${disp(strikerP)} — hit the <b>50!</b>`
       );
     }
     gifKeys.push(String(runs));
@@ -4704,7 +4732,7 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
       for (const ms of partMs) {
         if (partBefore < ms && partAfter >= ms) {
           notes.push(
-            `🎊🎊🎊🎊 <b>${fancy(ms + '-RUN PARTNERSHIP')}!</b>\n` +
+            `${pe('hand','🎊')}🎊🎊🎊 <b>${fancy(ms + '-RUN PARTNERSHIP')}!</b>\n` +
               `${disp(strikerP)} &amp; ${disp(nonP)} — <b>${ms} runs</b> together!`
           );
           // reuse personal milestone GIF if no better key; optional partnership uses 50/100 gif
