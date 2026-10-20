@@ -28,7 +28,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r14-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r18-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -78,13 +78,14 @@ const PE = {
   cart:     { id: '5431499171045581032', fb: '🛒' },
   eyes:     { id: '6021793768196282527', fb: '👀' },
   banned:   { id: '6021313238665271979', fb: '🚫' },
+  // Never emit <tg-emoji> HTML (shows as raw code for most bots). Unicode only.
   e: (key, fb) => {
     const p = PE[key];
-    if (!p || typeof p !== 'object' || !p.id) return fb || '';
-    return `<tg-emoji emoji-id="${p.id}">${fb || p.fb}</tg-emoji>`;
+    if (!p || typeof p !== 'object') return fb || '';
+    return fb || p.fb || '';
   },
 };
-// shorthand used in captions
+// Messages: always plain unicode emoji
 const pe = (key, fb) => PE.e(key, fb);
 
 // Strip premium tags → plain fallback text (when Telegram rejects custom emoji)
@@ -97,7 +98,7 @@ function stripPe(s) {
 // Convert our Markdown (+ pe tags) to HTML and send safely.
 // Tries HTML with premium emoji; on entity errors retries without custom emoji.
 async function sendHtmlMessage(telegram, chatId, mdOrHtml, extra = {}) {
-  const html = md2html(mdOrHtml);
+  const html = stripPe(md2html(mdOrHtml));
   const opts = { ...extra, parse_mode: 'HTML' };
   try {
     return await telegram.sendMessage(chatId, html, opts);
@@ -116,7 +117,7 @@ async function sendHtmlMessage(telegram, chatId, mdOrHtml, extra = {}) {
 }
 
 async function sendHtmlPhoto(telegram, chatId, photo, mdOrHtml, extra = {}) {
-  const html = md2html(mdOrHtml);
+  const html = stripPe(md2html(mdOrHtml));
   const opts = { ...extra, caption: html, parse_mode: 'HTML' };
   try {
     return await telegram.sendPhoto(chatId, photo, opts);
@@ -197,15 +198,17 @@ function md2html(src) {
 const _callApi = bot.telegram.callApi.bind(bot.telegram);
 bot.telegram.callApi = (method, payload = {}, extra) => {
   if (!payload) return _callApi(method, payload, extra);
-  // Always convert our Markdown dialect → HTML (supports <tg-emoji> via md2html protect)
-  if (payload.parse_mode === 'Markdown') {
-    const p = { ...payload, parse_mode: 'HTML' };
+  const p = { ...payload };
+  // Markdown dialect → HTML
+  if (p.parse_mode === 'Markdown') {
+    p.parse_mode = 'HTML';
     if (typeof p.text === 'string') p.text = md2html(p.text);
     if (typeof p.caption === 'string') p.caption = md2html(p.caption);
-    return _callApi(method, p, extra);
   }
-  // If HTML already but still contains unconverted markdown-style pe only — leave as is
-  return _callApi(method, payload, extra);
+  // Safety: never send raw <tg-emoji> tags (they render as visible code)
+  if (typeof p.text === 'string' && p.text.includes('tg-emoji')) p.text = stripPe(p.text);
+  if (typeof p.caption === 'string' && p.caption.includes('tg-emoji')) p.caption = stripPe(p.caption);
+  return _callApi(method, p, extra);
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -226,6 +229,12 @@ const TEAM_BOWLER_WARN_LIMIT = 2; // team: captain is tagged to choose the next 
 const BAT_RETIRE_LIMIT = 3; // batsman is retired OUT after this many missed turns
 const IDLE_WARN_SECONDS = 60; // host warning interval while the lobby / setup does not progress
 const IDLE_WARN_LIMIT = 10; // game is ended after this many host warnings
+const STUCK_MINUTES = 6; // active game with no response → auto-cancel so others can play
+const STUCK_CHECK_MS = 60 * 1000; // how often we scan for stuck games
+const matchActivity = new Map(); // matchId -> last activity ms
+function touchMatch(matchId) {
+  matchActivity.set(mkey(matchId), Date.now());
+}
 const VOTE_NEEDED = 3; // change-host vote: 3 votes from Team A and 3 from Team B (solo: 3 votes)
 const VOTE_EXPIRE_MS = 3 * 60 * 1000;
 
@@ -347,11 +356,14 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');
 }
 
-// plain name (buttons / HTML messages)
+// plain name: first + last name preferred, else @username, else telegram id
 function name(p) {
   if (!p) return '—';
+  const full = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
+  if (full) return full;
   if (p.username) return `@${p.username}`;
-  return p.first_name || `User${p.telegram_id || p.id || ''}`;
+  const id = p.telegram_id ?? p.id;
+  return id != null ? String(id) : '—';
 }
 
 // Telegram legacy-Markdown safe text (usernames contain "_" which would break parsing)
@@ -1073,7 +1085,7 @@ async function scoreboard(matchId) {
     }
     t += `└${'─'.repeat(20)}┘\n`;
   }
-  t += `\n💡 Bowler sends a number in the bot's DM first, then the batsman types *0–6* in the group`;
+  t += `\n💡 Bowler: *1–6* in bot DM · Batsman: *0–6* in group (0 = dot)`;
   t += `\n⏱ ${TURN_SECONDS}s to respond, otherwise -${TURN_PENALTY} runs`;
 
   return t;
@@ -1097,7 +1109,7 @@ bot.use(async (ctx, next) => {
 
 // ─── Team scoreboard (CricketMania style) ───────────────
 async function hostLabel(m) {
-  const { rows } = await q(`SELECT username, first_name FROM users WHERE telegram_id=$1`, [m.host_telegram_id]);
+  const { rows } = await q(`SELECT username, first_name, last_name FROM users WHERE telegram_id=$1`, [m.host_telegram_id]);
   return rows[0] ? mdEsc(name(rows[0])) : '—';
 }
 
@@ -1312,7 +1324,7 @@ async function sendMatchBanner(telegram, groupId, m, extraCaption = '') {
   const tB = await getTeam(m.id, 'B');
   const capA = tA?.captain_id ? await getPlayerByTg(m.id, tA.captain_id) : null;
   const capB = tB?.captain_id ? await getPlayerByTg(m.id, tB.captain_id) : null;
-  const { rows } = await q(`SELECT username, first_name FROM users WHERE telegram_id=$1`, [m.host_telegram_id]);
+  const { rows } = await q(`SELECT username, first_name, last_name FROM users WHERE telegram_id=$1`, [m.host_telegram_id]);
   const host = rows[0] || {};
   const caption =
     `⚙ Overs — *${m.total_overs}*  |  Innings — *${inningsWord(m.current_innings || 1)}*\n` +
@@ -1355,12 +1367,14 @@ bot.start(async (ctx) => {
   }
   await ctx.reply(
     `╔══════════════════════╗\n` +
-      `║  ${pe('bat','🏏')} CRIC MONSTER     ║\n` +
+      `║  🏏 CRIC MONSTER     ║\n` +
       `╚══════════════════════╝\n\n` +
       `Create a match in a group.\n` +
       `Press /start here first (needed for bowling in DM).\n\n` +
-      `*Solo* → everyone bats until OUT, just type 0-6\n` +
-      `*Team* → /team → /startgame → captains, toss, /setovers`,
+      `*Solo* → everyone bats until OUT, type *0–6* to bat\n` +
+      `*Team* → /team → /startgame → captains, toss, /setovers\n\n` +
+      `Bowling: send *1–6* in bot DM (0 not allowed)\n` +
+      `Batting: type *0–6* in group (0 = dot ball)`,
     { parse_mode: 'Markdown', ...mainKb() }
   );
 });
@@ -2135,7 +2149,7 @@ async function createSoloLobby(ctx) {
   if (!isGroup(ctx)) return ctx.reply('❌ Use this command in a group');
   try {
     if (await getActiveMatch(ctx.chat.id))
-      return ctx.reply(`${pe('warn','⚠️')} A match is already running here. ${pe('crown','👑')} Host: /endmatch to cancel it first.`);
+      return ctx.reply(`⚠️ *Only one game per group.*\nA match is already running here.\nHost: /endmatch to cancel it first.`);
 
     const { rows } = await q(
       `INSERT INTO matches (group_chat_id, group_title, mode, host_telegram_id, team_size, total_overs, max_overs_per_bowler, status)
@@ -2154,9 +2168,9 @@ async function createSoloLobby(ctx) {
       await q(`INSERT INTO match_teams (match_id, team_label) VALUES ($1,$2)`, [m.id, L]);
     }
     await q(
-      `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, is_captain)
-       VALUES ($1,$2,'A',1,$3,$4,TRUE)`,
-      [m.id, ctx.from.id, ctx.from.username || null, ctx.from.first_name || null]
+      `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name, is_captain)
+       VALUES ($1,$2,'A',1,$3,$4,$5,TRUE)`,
+      [m.id, ctx.from.id, ctx.from.username || null, ctx.from.first_name || null, ctx.from.last_name || null]
     );
     await q(`UPDATE match_teams SET captain_id=$2 WHERE match_id=$1 AND team_label='A'`, [
       m.id,
@@ -2164,6 +2178,7 @@ async function createSoloLobby(ctx) {
     ]);
     await upsertUser(ctx.from);
 
+    touchMatch(m.id);
     startLobbyTimer(m.id, ctx.chat.id, ctx.from.id, ctx.telegram, LOBBY_SECONDS);
     await q(`UPDATE matches SET spam_free=$2 WHERE id=$1`, [m.id, false]); // solo: spam allowed by default
 
@@ -2206,9 +2221,9 @@ async function joinSolo(ctx) {
     // Join order number = roster position on team A
     const pos = pl.length + 1;
     await q(
-      `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, is_captain)
-       VALUES ($1,$2,'A',$3,$4,$5,FALSE)`,
-      [m.id, ctx.from.id, pos, ctx.from.username || null, ctx.from.first_name || null]
+      `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name, is_captain)
+       VALUES ($1,$2,'A',$3,$4,$5,$6,FALSE)`,
+      [m.id, ctx.from.id, pos, ctx.from.username || null, ctx.from.first_name || null, ctx.from.last_name || null]
     );
 
     await upsertUser(ctx.from);
@@ -2319,7 +2334,7 @@ async function createTeamMatch(ctx) {
   if (!isGroup(ctx)) return ctx.reply('❌ Use this command in a group');
   try {
     if (await getActiveMatch(ctx.chat.id))
-      return ctx.reply(`${pe('warn','⚠️')} A match is already running here. ${pe('crown','👑')} Host: /endmatch to cancel it first.`);
+      return ctx.reply(`⚠️ *Only one game per group.*\nA match is already running here.\nHost: /endmatch to cancel it first.`);
     const parts = String(ctx.message?.text || '').split(/\s+/).slice(1);
     let size = parseInt(parts[0], 10);
     if (!size || size < MIN_TEAM_PLAYERS) size = DEFAULT_TEAM_SIZE;
@@ -2386,9 +2401,9 @@ async function joinTeam(ctx, label) {
       [m.id, label]
     );
     await q(
-      `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name)
-       VALUES ($1,$2,$3,$4,$5,$6)`,
-      [m.id, ctx.from.id, label, rows[0].n, ctx.from.username || null, ctx.from.first_name || null]
+      `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [m.id, ctx.from.id, label, rows[0].n, ctx.from.username || null, ctx.from.first_name || null, ctx.from.last_name || null]
     );
     await upsertUser(ctx.from);
 
@@ -2423,7 +2438,7 @@ function parseAddTargets(ctx) {
   };
   for (const e of msg.entities || []) {
     if (e.type === 'text_mention' && e.user && !e.user.is_bot)
-      push({ id: e.user.id, username: e.user.username, first_name: e.user.first_name });
+      push({ id: e.user.id, username: e.user.username, first_name: e.user.first_name, last_name: e.user.last_name });
   }
   for (const tok of text.split(/[\s,;]+/).filter(Boolean)) {
     if (/^@[A-Za-z0-9_]{3,32}$/.test(tok)) push({ username: tok.slice(1) });
@@ -2431,36 +2446,36 @@ function parseAddTargets(ctx) {
   }
   const rep = msg.reply_to_message;
   if (!targets.length && rep && rep.from && !rep.from.is_bot)
-    push({ id: rep.from.id, username: rep.from.username, first_name: rep.from.first_name });
+    push({ id: rep.from.id, username: rep.from.username, first_name: rep.from.first_name, last_name: rep.from.last_name });
   return targets;
 }
 
 async function resolveTarget(ctx, t) {
   if (t.id && (t.username || t.first_name))
-    return { id: t.id, username: t.username || null, first_name: t.first_name || null };
+    return { id: t.id, username: t.username || null, first_name: t.first_name || null, last_name: t.last_name || null };
   if (t.id) {
-    const { rows } = await q(`SELECT username, first_name FROM users WHERE telegram_id=$1`, [t.id]);
-    if (rows[0]) return { id: t.id, username: rows[0].username, first_name: rows[0].first_name };
+    const { rows } = await q(`SELECT username, first_name, last_name FROM users WHERE telegram_id=$1`, [t.id]);
+    if (rows[0]) return { id: t.id, username: rows[0].username, first_name: rows[0].first_name, last_name: rows[0].last_name };
     try {
       const c = await ctx.telegram.getChat(t.id);
-      return { id: t.id, username: c.username || null, first_name: c.first_name || c.title || null };
+      return { id: t.id, username: c.username || null, first_name: c.first_name || c.title || null, last_name: c.last_name || null };
     } catch (_) {}
     try {
       const cm = await ctx.telegram.getChatMember(ctx.chat.id, t.id);
-      return { id: t.id, username: cm.user.username || null, first_name: cm.user.first_name || null };
+      return { id: t.id, username: cm.user.username || null, first_name: cm.user.first_name || null, last_name: cm.user.last_name || null };
     } catch (_) {}
-    return { id: t.id, username: null, first_name: `User${t.id}` };
+    return { id: t.id, username: null, first_name: null, last_name: null };
   }
   const { rows } = await q(
-    `SELECT telegram_id, username, first_name FROM users WHERE lower(username)=lower($1)`,
+    `SELECT telegram_id, username, first_name, last_name FROM users WHERE lower(username)=lower($1)`,
     [t.username]
   );
   if (rows[0])
-    return { id: Number(rows[0].telegram_id), username: rows[0].username, first_name: rows[0].first_name };
+    return { id: Number(rows[0].telegram_id), username: rows[0].username, first_name: rows[0].first_name, last_name: rows[0].last_name };
   try {
     const c = await ctx.telegram.getChat('@' + t.username);
     if (c && c.type === 'private')
-      return { id: c.id, username: c.username || t.username, first_name: c.first_name || null };
+      return { id: c.id, username: c.username || t.username, first_name: c.first_name || null, last_name: c.last_name || null };
   } catch (_) {}
   return null;
 }
@@ -2574,9 +2589,9 @@ bot.action(/^inv:(Y|N):(.+)$/, async (ctx) => {
       [m.id, inv.label]
     );
     await q(
-      `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name)
-       VALUES ($1,$2,$3,$4,$5,$6)`,
-      [m.id, inv.user.id, inv.label, rows[0].n, inv.user.username || null, inv.user.first_name || null]
+      `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [m.id, inv.user.id, inv.label, rows[0].n, inv.user.username || null, inv.user.first_name || null, inv.user.last_name || null]
     );
     await upsertUser({ id: inv.user.id, username: inv.user.username, first_name: inv.user.first_name }).catch(() => {});
     await ctx.answerCbQuery('You joined!');
@@ -2807,7 +2822,7 @@ async function editCard(ctx, md) {
   const msg = ctx.callbackQuery && ctx.callbackQuery.message;
   const isMedia = msg && (msg.animation || msg.video || msg.document || msg.photo);
   try {
-    if (isMedia) await ctx.editMessageCaption(md2html(md), { parse_mode: 'HTML' });
+    if (isMedia) await ctx.editMessageCaption(stripPe(md2html(md)), { parse_mode: 'HTML' });
     else await ctx.editMessageText(md, { parse_mode: 'Markdown' });
   } catch (_) {}
 }
@@ -3429,7 +3444,7 @@ async function sendBowlerPrompt(telegram, pend) {
         `📍 ${mdEsc(m?.group_title || 'Group')}\n` +
         `🏏 Batsman: ${striker ? mn(striker) : '—'}\n` +
         `⏱ Over: ${pend.over_number}.${pend.ball_number}\n\n` +
-        `Send your number *0–6* as a message within *${TURN_SECONDS}s* (otherwise -${TURN_PENALTY} runs).` +
+        `Send your number *1–6* as a message within *${TURN_SECONDS}s* (0 not allowed for bowlers).\n⏱ ${TURN_SECONDS}s or -${TURN_PENALTY} runs.` +
         (spamFreeOn(m) ? `\n🛡 Spam-free: you can't send the same number 3 times in a row.` : ''),
       { parse_mode: 'Markdown' }
     );
@@ -3441,6 +3456,7 @@ async function sendBowlerPrompt(telegram, pend) {
 
 // Start the next ball when everybody is in place (no-op otherwise)
 async function startBall(matchId) {
+  touchMatch(matchId);
   const m = await getMatch(matchId);
   if (!m || !['innings1', 'innings2'].includes(m.status)) return false;
   const inn = await getInnings(matchId);
@@ -3478,8 +3494,8 @@ async function startBall(matchId) {
     `🎳 <b>${fancy('RUN-UP')}</b>  <i>(Over ${overNum}.${ballNum})</i>\n` +
     `<blockquote>${htag(bowler)} to ${escapeHtml(name(striker))}\n` +
     (dmOk
-      ? `📩 ${htag(bowler)}, send your bowling number <b>0–6</b> in the bot's DM (${TURN_SECONDS}s)`
-      : `⚠️ ${htag(bowler)}, open the bot's DM and press /start — then send your bowling number <b>0–6</b> (${TURN_SECONDS}s)`) +
+      ? `📩 ${htag(bowler)}, send your bowling number <b>1–6</b> in the bot's DM (${TURN_SECONDS}s)`
+      : `⚠️ ${htag(bowler)}, open the bot's DM and press /start — then send <b>1–6</b> (${TURN_SECONDS}s)`) +
     (hat ? `\n🎩 <b>HAT-TRICK BALL!</b>` : '') +
     (spamFreeOn(m) ? `\n🛡 ${pe('ok','🛡')} Spam-free mode: no number 3 times in a row` : '') +
     `</blockquote>`;
@@ -3538,6 +3554,7 @@ async function onTurnTimeout(matchId, key) {
 
 // Bowler locked his number but the batsman did not type 0-6 in time
 async function batTimeout({ m, inn, pend }) {
+  touchMatch(m.id);
   const tg = bot.telegram;
   const groupId = Number(m.group_chat_id);
   const isSolo = m.mode === 'solo';
@@ -3555,7 +3572,7 @@ async function batTimeout({ m, inn, pend }) {
       `> ${mtag(striker)} did not play within ${TURN_SECONDS}s.\n` +
       `> 💥 Penalty: *-${TURN_PENALTY} runs*${isSolo ? '' : ' for Team ' + inn.batting_team}  (warning ${warn}/${BAT_RETIRE_LIMIT})\n` +
       (retire
-        ? `> 🚪 ${mn(striker)} is retired OUT.`
+        ? `> 🚪 ${mtag(striker)} is *retired OUT* after ${BAT_RETIRE_LIMIT} warnings.`
         : `> 👉 Type *0–6* now (${TURN_SECONDS}s)`),
     { parse_mode: 'Markdown' }
   );
@@ -3569,6 +3586,14 @@ async function batTimeout({ m, inn, pend }) {
     `UPDATE innings SET total_wickets=total_wickets+1, striker_player_id=NULL, ball_state='idle' WHERE id=$1`,
     [inn.id]
   );
+  // OUT gif + tag the retired batsman
+  await sendResultGif(
+    tg,
+    groupId,
+    'out',
+    undefined,
+    `💥 <b>OUT!</b>\n${htag(striker)} is <b>retired OUT</b> after ${BAT_RETIRE_LIMIT} missed turns.`
+  );
   // dugout only if duck (0 runs)
   const { rows: rs } = await q(`SELECT runs FROM batting_stats WHERE innings_id=$1 AND player_id=$2`, [inn.id, striker.id]);
   if (Number(rs[0]?.runs || 0) === 0) {
@@ -3580,6 +3605,7 @@ async function batTimeout({ m, inn, pend }) {
 
 // Bowler did not send his number in time: ball is cancelled, bowler's side loses 6
 async function bowlTimeout({ m, inn, pend }) {
+  touchMatch(m.id);
   const tg = bot.telegram;
   const groupId = Number(m.group_chat_id);
   const isSolo = m.mode === 'solo';
@@ -3700,7 +3726,7 @@ async function idleTick(matchId) {
   else if (m.setup_phase === 'choice') hint = `The captain of the toss-winning team must choose BAT or BALL.`;
   else hint = `The captain picked for the toss must choose HEADS or TAILS (/toss shows the buttons again).`;
 
-  const { rows } = await q(`SELECT username, first_name FROM users WHERE telegram_id=$1`, [m.host_telegram_id]);
+  const { rows } = await q(`SELECT username, first_name, last_name FROM users WHERE telegram_id=$1`, [m.host_telegram_id]);
   const hostLabel = rows[0] ? mdEsc(name({ ...rows[0] })) : 'Host';
   await bot.telegram.sendMessage(
     groupId,
@@ -3717,7 +3743,7 @@ async function idleTick(matchId) {
 const hostVotes = new Map(); // matchId -> { need, votes, phase, timer, chatId, msgId }
 
 async function voteText(m, v) {
-  const { rows } = await q(`SELECT username, first_name FROM users WHERE telegram_id=$1`, [m.host_telegram_id]);
+  const { rows } = await q(`SELECT username, first_name, last_name FROM users WHERE telegram_id=$1`, [m.host_telegram_id]);
   const hostLabel = rows[0] ? mdEsc(name({ ...rows[0] })) : String(m.host_telegram_id);
   if (v.phase === 'claim') {
     return (
@@ -3905,6 +3931,20 @@ bot.hears(/^[0-6]$/, async (ctx) => {
 
 // Bowler sends his number in the bot's DM → it is linked to the game he is playing in
 async function bowlerLocksNumber(ctx, n) {
+  // Bowlers bowl 1–6 only. 0 is a batsman-only choice (dot ball).
+  if (n === 0) {
+    return ctx.reply(
+      `🚫 *Bowlers cannot send 0.*\nSend a number from *1–6* only.\n(0 = dot ball is for the batsman in the group.)`,
+      { parse_mode: 'Markdown', reply_to_message_id: ctx.message.message_id }
+    );
+  }
+  if (n < 1 || n > 6) {
+    return ctx.reply(`🚫 Send a number from *1–6*.`, {
+      parse_mode: 'Markdown',
+      reply_to_message_id: ctx.message.message_id,
+    });
+  }
+
   const { rows } = await q(
     `SELECT * FROM pending_balls WHERE bowler_telegram_id=$1 AND is_resolved=FALSE AND bowl_number IS NULL`,
     [ctx.from.id]
@@ -3918,7 +3958,7 @@ async function bowlerLocksNumber(ctx, n) {
 
   // spam-free mode: the same number 3 times in a row is not allowed
   if (await bowlerSpamBlocked(m, inn, n)) {
-    return ctx.reply(`🚫 ${pe('ok','🛡')} Spam-free mode: you can't send *${n}* three times in a row.\nChoose a different number (0–6).`, {
+    return ctx.reply(`🚫 Spam-free mode: you can't send *${n}* three times in a row.\nChoose a different number (*1–6*).`, {
       parse_mode: 'Markdown',
       reply_to_message_id: ctx.message.message_id,
     });
@@ -4154,426 +4194,427 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
 
 const COMMENT = {
   '0': [
-    'डॉट बॉल! बैटर सोच में पड़ गया — \'क्या खेलूँ?\'',
-    'कुछ नहीं हुआ भाई, डॉट। बॉलर मुस्कुराया।',
-    'टाइट लाइन! रन जीरो, प्रेशर हीरो।',
-    'डिफेंस मास्टरक्लास — स्कोर बोर्ड सो रहा है।',
-    'ये बॉल तो दीवार बन गई, पास नहीं।',
-    'डॉट! कमेंटेटर भी ऊब गए।',
-    'बैट से सिर्फ़ हवा चली, बॉल नहीं।',
-    'रन? कहाँ? डॉट बॉल पार्टी।',
-    'बॉलर बोला — \'आज तो बंद कर दूँगा।\'',
-    'सॉलिड ब्लॉक, ज़ीरो रन, फुल ड्रामा।',
-    'डॉट बॉल — जैसे WiFi कट गया हो।',
-    'बैटर ने सोचा चौका, मिला डॉट।',
-    'प्रेशर कुकर चालू, रन अभी भी 0।',
-    'ये शॉट तो मम्मी को भी नहीं दिखेगा।',
-    'डॉट! अंपायर भी बोर हो रहा है।',
-    'लाइन एंड लेंथ परमी, रन नॉट अलाउड।',
-    'बैट-पैड के बीच अटक गई कहानी।',
-    'डॉट बॉल = फ्री एडवाइस, नो रन्स।',
-    'बॉलर की जीत, बैटर की सोच।',
-    'कोई रन नहीं, सिर्फ़ सस्पेंस।',
-    'डॉट! कैमरामैन ने भी जम्हाई ली।',
-    'ये गेंद तो GPS लॉक हो गई स्टंप पर।',
-    'बैटर: \'अगली बार...\' बॉलर: \'कोई अगली नहीं।\'',
-    'ज़ीरो रन, हंड्रेड प्रेशर।',
-    'डॉट बॉल ने मूड खराब कर दिया।',
-    'जैसे एग्जाम में खाली पेज छोड़ दिया।',
-    'बॉलर बोला थैंक्स, डॉट गिफ्ट।',
-    'डिफेंस इतना टाइट, चींटी भी न निकले।',
-    'रन रेट गिर रहा है, डॉट की बारिश।',
-    'ये तो नेट प्रैक्टिस लग रही है।',
-    'डॉट! कमेंट्री भी चुप।',
-    'बैटर ने शॉट चुना गलत चैनल से।',
-    'बॉलर की प्लानिंग फुल ऑन।',
-    'स्कोरबोर्ड: लोडिंग… 0 रन।',
-    'डॉट बॉल — साइलेंट किलर।',
-    'कोई बाउंड्री नहीं, सिर्फ़ बाउंड्री लाइन का इंतज़ार।',
-    'ये गेंद तो पासपोर्ट चेक कर रही थी।',
-    'बैटर का कॉन्फिडेंस: 404 नॉट फाउंड।',
-    'डॉट! अंपायर ने घड़ी देखी।',
-    'रन बनाने का मूड अभी ऑफिस में है।',
-    'बॉलर ने कहा — \'और ऐसे ही।\'',
-    'डॉट बॉल ने टीम मीटिंग बुला ली।',
-    'शॉट इतना सॉफ्ट, तकिया लग रहा था।',
-    'ज़ीरो। फुल स्टॉप। एंड ऑफ़ स्टोरी।',
-    'डॉट! कप्तान सिर पकड़ रहा है।',
-    'ये तो नेटफ्लिक्स पॉज़ बटन है।',
-    'बैटर सोच रहा — \'मेरा बैट ख़राब है क्या?\'',
-    'बॉलर का चेहरा: मिशन सफल।',
-    'डॉट बॉल डिलीवरी स्पेशल।',
-    'रन नहीं, सिर्फ़ टेंशन डिलीवर हुई।',
+    'Dot ball! The pressure builds.',
+    'Solid defence, nothing doing.',
+    'Tight line — zero runs.',
+    'Blocked. Scoreboard stays put.',
+    'Dot! Bowler wins that duel.',
+    'No run — pure patience.',
+    'Dead bat, dead ball, dead silence.',
+    'Dot ball. The squeeze is on.',
+    'Left alone — smart cricket.',
+    'Pushed to the fielder, no single.',
+    'Dot! Camera crew almost fell asleep.',
+    'Textbook defence, zero reward.',
+    'Nothing off that delivery.',
+    'Dot ball keeps the rate honest.',
+    'Beaten outside off — still a dot.',
+    'Maiden pressure continues.',
+    'Soft hands, hard reality: no run.',
+    'Dot! Bowler pumps the fist.',
+    'Played back carefully — zero.',
+    'That one had no room to score.',
+    'Dot ball. Chess, not checkers.',
+    'Prodding and poking — still zero.',
+    'No width, no run.',
+    'Dot! Crowd wants boundary, gets nothing.',
+    'Solid as a wall.',
+    'Back foot block — score stays same.',
+    'Dot ball. Next one loads up.',
+    'Can\'t get it away.',
+    'Dot! Fielders clap the effort.',
+    'Respect the good ball.',
+    'Zero on the board from that.',
+    'Dot ball builds the over.',
+    'Played down the line — nothing.',
+    'Tight stuff from the bowler.',
+    'Dot! Batsman resets the stance.',
+    'No pace off the bat.',
+    'Defended under the eyes.',
+    'Dot ball — plan working.',
+    'Squeezed out, no single available.',
+    'Dot! Over still young.',
+    'Left on length — zero.',
+    'Stonewall defence.',
+    'Dot ball. Pressure index rising.',
+    'Nowhere to go with that.',
+    'Blocked to cover, no run.',
+    'Dot! Pure concentration.',
+    'Good ball, better defence, still zero.',
+    'Dot ball keeps them guessing.',
+    'No freebies here.',
+    'Dot! Next ball is the big one.',
   ],
   '1': [
-    'एक रन! चोर की तरह चुपके से।',
-    'सिंगल ले लिया, स्मार्ट क्रिकेट।',
-    'जल्दी दौड़े, एक रन पका।',
-    'नज में घुसाया, आसान सिंगल।',
-    'एक रन — स्कोरबोर्ड हिला।',
-    'सॉफ्ट हैंड्स, ईज़ी वन।',
-    'दौड़ इतनी तेज़, जूते छूट गए।',
-    'एक रन मिला, पार्टी अभी बाकी।',
-    'गैप में डाला, सिंगल कंफर्म।',
-    'बैटर बोला — \'बस एक चाहिए था।\'',
-    'क्विक सिंगल, फील्डर लेट।',
-    'एक रन से मूड बना।',
-    'चलो भाई, अकाउंट खुला।',
-    'सिंगल! जैसे ऑटो में सवारी।',
-    'हल्का पुश, पूरा रन।',
-    'एक रन — कैलकुलेटर चालू करो।',
-    'दौड़कर लिया, साँस फूल गई।',
-    'सिंगल मास्टर, नो रिस्क।',
-    'एक रन मिला तो लग रहा सेंचुरी नज़दीक।',
-    'फील्डर ने सोचा बाउंड्री, निकला सिंगल।',
-    'स्मार्ट प्ले, एक रन पॉकेट।',
-    'सिंगल लेके स्ट्राइक बदली।',
-    'एक रन — चाय वाली खुशी।',
-    'नज से खेल के निकाला।',
-    'सिंगल! कमेंट्री भी खुश।',
-    'एक रन से इनिंग जिंदा।',
-    'जल्दी-जल्दी, एक कंफर्म।',
-    'बैटर-नॉनस्ट्राइकर की केमिस्ट्री।',
-    'सिंगल = सेफ प्ले अवॉर्ड।',
-    'एक रन, ज़ीरो ड्रामा।',
-    'घुमा के एक निकाल लिया।',
-    'सिंगल पार्टी शुरू।',
-    'एक रन — बजट में क्रिकेट।',
-    'फील्ड में गैप था, भर लिया।',
-    'सिंगल! अंपायर ने भी नोड किया।',
-    'एक रन से प्रेशर कम।',
-    'चुपके से स्कोर बढ़ाया।',
-    'सिंगल लेना भी आर्ट है।',
-    'एक रन मिला, सेल्फी टाइम।',
-    'दौड़ इतनी, फिटनेस चेक पास।',
-    'सिंगल! बॉलर थोड़ा नाराज़।',
-    'एक रन — छोटा लेकिन मीठा।',
-    'गैप में टच, रन पक्का।',
-    'सिंगल से स्ट्राइक रोटेशन।',
-    'एक रन, टीम खुश।',
-    'हल्की क्लिप, पूरा सिंगल।',
-    'सिंगल! जैसे बस का टिकट।',
-    'एक रन निकाल के मुस्कुराए।',
-    'स्मार्ट क्रिकेट 101।',
-    'सिंगल लेके आगे बढ़े।',
+    'Quick single, scoreboard ticks.',
+    'Nudged into the gap for one.',
+    'Smart cricket — easy single.',
+    'Soft hands, taken one.',
+    'One run, strike rotated.',
+    'Pushed wide of mid-on for a single.',
+    'They scamper one.',
+    'Quick call, safe single.',
+    'Tucked to leg for one.',
+    'Single keeps the board moving.',
+    'Drop and run — well judged.',
+    'One to the total.',
+    'Glanced fine for a single.',
+    'Worked into the gap.',
+    'Easy single on offer, taken.',
+    'One run, no drama.',
+    'Rotated the strike neatly.',
+    'Pushed off the pads for one.',
+    'Single! Good running.',
+    'Opened the face for one.',
+    'Soft push, hard run — one.',
+    'Taken a sharp single.',
+    'One more on the board.',
+    'Nudged and gone.',
+    'Single to long-on.',
+    'Quick feet, one run.',
+    'Steered to third for one.',
+    'One! Keeps the bowler thinking.',
+    'Placed, not powered — single.',
+    'They jog a comfortable one.',
+    'Single from a thick edge, safe.',
+    'Worked to square leg for one.',
+    'One run, innings ticking.',
+    'Dabbed down for a single.',
+    'Smart single under pressure.',
+    'One off the hips.',
+    'Rotated again — single.',
+    'Pushed to midwicket, one.',
+    'Single keeps the partnership alive.',
+    'Easy one, no throw.',
+    'Taken the one on offer.',
+    'Soft hands for a single.',
+    'One! Rate holds steady.',
+    'Glided to third man for one.',
+    'Single, and breathe.',
+    'Worked square for one.',
+    'One run — simple cricket.',
+    'Drop it and go.',
+    'Single stolen smartly.',
+    'One to the total, well run.',
   ],
   '2': [
-    'दो रन! सुपर रनिंग बिटवीन विकेट्स।',
-    'कपल पूरा, दो रन अकाउंट में।',
-    'फील्डर देर से पहुँचा, दो मिल गए।',
-    'अच्छी प्लेसमेंट, आसान दो।',
-    'दो रन — स्कोर बढ़ने लगा।',
-    'दौड़-दौड़ के दो कमाए।',
-    'गैप में डाला, टू रन्स।',
-    'दो! जैसे ऑफर में बॉय वन गेट वन।',
-    'रनिंग इतनी तेज़, स्टॉपवॉच हैरान।',
-    'दो रन पक्के, कोई रिस्क नहीं।',
-    'पुश किया डीप में, दो पूरे।',
-    'दो रन — मिड-ऑन परेशान।',
-    'कपल स्कैम्पर, एक्साइटिंग।',
-    'दो रन मिले तो लग रहा मैच जिता देंगे।',
-    'फील्डिंग स्लो, रनिंग फास्ट।',
-    'दो! स्कोरबोर्ड खुश।',
-    'अच्छी कॉलिंग, दो कंफर्म।',
-    'दो रन — छोटी सी खुशी।',
-    'प्लेसमेंट मास्टर, दो रन।',
-    'दौड़ के दो, साँस एक।',
-    'दो रन निकाल के थumbs अप।',
-    'गैप फाइंडर मोड ऑन।',
-    'दो रन! बॉलर सिर हिला रहा।',
-    'कपल पूरा किया जैसे प्रो।',
-    'दो रन से रन रेट सुधार।',
-    'स्मार्ट दो, नो हीरो शॉट।',
-    'दो! फील्डर की किस्मत खराब।',
-    'रनिंग बिटवीन — फुल मार्क्स।',
-    'दो रन, टीम क्लैप।',
-    'डीप स्क्वायर से दो।',
-    'दो रन — कैलकुलेशन सही।',
-    'जल्दी वापस आए, दो पक्के।',
-    'दो! जैसे डबल डोज खुशी।',
-    'प्लेसमेंट + रनिंग = दो।',
-    'दो रन मिला तो मूड बना।',
-    'फील्ड में छेद था, दो भर दिए।',
-    'दो रन — सेफ और स्टाइलिश।',
-    'कपल लेके स्ट्राइक बदली।',
-    'दो! कमेंट्री जोर से।',
-    'अच्छी हसल, दो रन।',
-    'दो रन से प्रेशर कम हुआ।',
-    'रन आउट का खतरा नहीं, दो पूरे।',
-    'दो! बैटर खुश, बॉलर सोच में।',
-    'गैप में टाइम्ड, दो आसान।',
-    'दो रन — छोटा बाउंड्री फील।',
-    'स्कैम्पर टू, फुल ड्रामा।',
-    'दो रन निकाल के मुस्कुराहट।',
-    'प्लेसमेंट क्लास, दो रन।',
-    'दो! ओवर का मिजाज बदला।',
-    'रनिंग गेम ऑन पॉइंट।',
+    'Two runs! Good placement.',
+    'They come back for two.',
+    'Placed in the gap — easy couple.',
+    'Two more on the board.',
+    'Driven wide, two taken.',
+    'Excellent running, two runs.',
+    'Punched through, they take two.',
+    'Two! Fielders slow to react.',
+    'Worked away for a couple.',
+    'Hard run two, well called.',
+    'Two runs into the deep.',
+    'Placed past the fielder for two.',
+    'They hustle two.',
+    'Couple of runs, nice shot.',
+    'Two on the bounce to the sweeper.',
+    'Good judgment — two runs.',
+    'Two! Partnership growing.',
+    'Angled away for two.',
+    'They pick up two comfortably.',
+    'Driven to the gap for two.',
+    'Two runs, no risk.',
+    'Worked off the pads for two.',
+    'Two! Scoreboard rolling.',
+    'Bisected the field for a couple.',
+    'Two runs into the vacant area.',
+    'Hard flat throw, still two.',
+    'They steal a second.',
+    'Two more, well placed.',
+    'Couple taken with ease.',
+    'Two runs — positive intent.',
+    'Punched down the ground for two.',
+    'Two! Keep them coming.',
+    'Opened up for a couple.',
+    'Two into the deep midwicket.',
+    'They race back for two.',
+    'Nice timing, two runs.',
+    'Two off a controlled pull.',
+    'Couple more, rate lifts.',
+    'Two runs past point.',
+    'They pick two with soft hands.',
+    'Two! Good cricket all round.',
+    'Driven hard, cut off — still two.',
+    'Two runs, no sweat.',
+    'Worked square for a couple.',
+    'Two! Building an over.',
+    'Placed perfectly for two.',
+    'They jog two, calm heads.',
+    'Two more in the book.',
+    'Couple of runs, pressure eases.',
+    'Two! Nicely done.',
   ],
   '3': [
-    'तीन रन! सुपरब रनिंग, कमाल।',
-    'थ्री रन्स — फील्डर हैरान।',
-    'कड़ी मेहनत, तीन पूरे।',
-    'डीप में धकेला, तीन मिल गए।',
-    'तीन! हसल लेवल मैक्स।',
-    'रनिंग इतनी, मैराथन लग रही।',
-    'तीन रन — दुर्लभ और कीमती।',
-    'फील्डर थका, तीन कमाए।',
-    'थ्री! स्कोरबोर्ड नाच रहा।',
-    'जबरदस्त कॉलिंग, तीन पक्के।',
-    'तीन रन निकाल के हीरो बने।',
-    'गैप + स्पीड = तीन।',
-    'तीन! बॉलर का प्लान फेल।',
-    'हसल मास्टरक्लास।',
-    'तीन रन — टीम खड़ी हो गई।',
-    'दौड़-दौड़ के तीन, साँस फूल।',
-    'थ्री रन्स, फुल एड्रेनालिन।',
-    'फील्डिंग मिस्टेक, तीन गिफ्ट।',
-    'तीन! जैसे जैकपॉट।',
-    'रनिंग बिटवीन विकेट्स अवॉर्ड।',
-    'तीन रन से ओवर महँगा।',
-    'सुपरब जजमेंट, तीन।',
-    'तीन! कप्तान ताली बजा रहा।',
-    'डीप कवर से तीन।',
-    'थ्री रन्स — मोमेंट ऑफ मैच।',
-    'मेहनत का फल, तीन रन।',
-    'तीन! फील्डर ने हाथ खड़े किए।',
-    'हसल + प्लेसमेंट = तीन।',
-    'तीन रन, स्कोर में जान।',
-    'जल्दी-जल्दी तीन पूरे।',
-    'थ्री! कमेंट्री पागल।',
-    'रन आउट रिस्क लिया, तीन मिले।',
-    'तीन रन — ब्रेव कॉल।',
-    'फील्डर की थकान, बैटर की जीत।',
-    'तीन! जैसे फ्री हिट।',
-    'सुपरब रनिंग, तीन कंफर्म।',
-    'तीन रन से रन रेट बूस्ट।',
-    'हसल किंग, तीन रन।',
-    'थ्री! स्टेडियम (ग्रुप) खुश।',
-    'गैप में धकेला, तीन आसान।',
-    'तीन रन निकाल के सेलिब्रेशन।',
-    'रनिंग गेम ने कमाल कर दिया।',
-    'तीन! बॉलर हैरान।',
-    'मेहनती तीन, स्टाइलिश नहीं लेकिन काम का।',
-    'थ्री रन्स — कैलकुलेटर खुश।',
-    'तीन रन, ओवर का ट्विस्ट।',
-    'हसल लेवल 100, तीन रन।',
-    'तीन! टीम को एनर्जी।',
-    'सुपरब कॉल, तीन पूरे।',
-    'तीन रन — आज का स्पेशल।',
+    'Three runs! Superb running.',
+    'They push hard for three.',
+    'Three! Excellent hustle.',
+    'Driven deep, three taken.',
+    'Three runs — rare and valuable.',
+    'All the way for three!',
+    'Great call, three runs.',
+    'Three! Fielders exhausted.',
+    'Pushed into the deep for three.',
+    'Three runs, pure athleticism.',
+    'They scamper three brilliantly.',
+    'Three! Over just got expensive.',
+    'Hard running yields three.',
+    'Three runs past the sweeper.',
+    'They dare a third — make it!',
+    'Three! Momentum shift.',
+    'Driven wide, three completed.',
+    'Three runs on the board.',
+    'Hustle of the over — three.',
+    'Three! Captain loves that.',
+    'Outfield slow, still three.',
+    'Three runs, no throw in time.',
+    'They steal three with sharp legs.',
+    'Three! Big over brewing.',
+    'Pushed past mid-off for three.',
+    'Three runs — high value.',
+    'They turn two into three.',
+    'Three! Outstanding running.',
+    'Deep in the pocket, three taken.',
+    'Three runs, field looks ragged.',
+    'They go for three and get it.',
+    'Three! Rate jumps.',
+    'Excellent placement for three.',
+    'Three runs off a controlled drive.',
+    'They charge the third.',
+    'Three! Crowd on its feet.',
+    'Worked into a huge gap for three.',
+    'Three runs, pure determination.',
+    'They make three look easy.',
+    'Three! Keep the foot down.',
+    'Long chase, three completed.',
+    'Three runs — smart cricket.',
+    'They push every yard for three.',
+    'Three! Over tilted their way.',
+    'Driven hard, three all the way.',
+    'Three runs into the deep.',
+    'They earn every one of those three.',
+    'Three! Brilliant between the wickets.',
+    'Gap found, three taken.',
+    'Three runs — job done.',
   ],
   '4': [
-    'चौका! बाउंड्री पार, फोर।',
-    'FOUR! कवर ड्राइव कमाल।',
-    'क्रैक! गेंद रेसिंग टू द फेन्स।',
-    'चौका लगा, ग्रुप में शोर।',
-    'टाइम्ड टू परफेक्शन, फोर।',
-    'बाउंड्री! फील्डर सिर्फ़ देखता रहा।',
-    'चौका — जैसे बर्थडे गिफ्ट।',
-    'शॉट इतना मीठा, मिठाई लग रही।',
-    'FOUR! बॉलर का चेहरा लाल।',
-    'गेंद को कहा — \'जा, बाउंड्री मिल।\'',
-    'चौका लगा के बैटर मुस्कुराया।',
-    'क्लासी ड्राइव, फोर रन्स।',
-    'बाउंड्री रोप छू के बाहर।',
-    'FOUR! स्कोरबोर्ड जंप।',
-    'पॉवर + टाइमिंग = चौका।',
-    'चौका! कमेंट्री जोश में।',
-    'फील्ड तोड़ी, फोर पक्का।',
-    'शॉट ऑफ द डे, फोर।',
-    'चौका लगा, पार्टी शुरू।',
-    'गेंद ने कहा बाई, बाउंड्री।',
-    'FOUR! टीम खुशी से उछली।',
-    'कवर में गैप, चौका नक्का।',
-    'टाइम्ड ब्यूटीफुली, फोर।',
-    'चौका — बॉलर की नींद उड़ी।',
-    'क्रैकिंग शॉट, बाउंड्री।',
-    'FOUR! जैसे फ्री टिकट।',
-    'पक्का चौका, कोई शंका नहीं।',
-    'बैट से संगीत, फोर रन।',
-    'चौका लगा के पोज दिया।',
-    'बाउंड्री लाइन ने सलाम किया।',
-    'FOUR! रन रेट ऊपर।',
-    'क्लीन हिट, फोर।',
-    'चौका! अंपायर ने सिग्नल दिया।',
-    'शॉट इतना साफ, आईना।',
-    'FOUR — कैमरा फोकस बैटर पर।',
-    'गेंद उड़ी, बाउंड्री मिली।',
-    'चौका लगा, बॉलर सोच में।',
-    'क्लास apart, फोर रन्स।',
-    'बाउंड्री! ग्रुप चैट में फायर।',
-    'FOUR! मूड ऑन।',
-    'टाइमिंग मास्टर, चौका।',
-    'चौका — आज का हाईलाइट।',
-    'पॉवर शॉट, फोर।',
-    'FOUR! स्कोर में चार की छलांग।',
-    'फील्डर दौड़ा, गेंद पहले पहुँची।',
-    'चौका लगा के हीरो फील।',
-    'ब्यूटीफुल स्ट्रोक, फोर।',
-    'FOUR! बॉलर को चाय पानी।',
-    'बाउंड्री पार्टी।',
-    'चौका! कमाल का शॉट।',
+    'FOUR! Races away to the fence.',
+    'Cracked through the covers — boundary!',
+    'Four runs! Timed to perfection.',
+    'That pierces the field — FOUR!',
+    'Boundary! No chance for the fielder.',
+    'Four! Sweet sound off the bat.',
+    'Driven to the rope for four.',
+    'FOUR! Overpitched and punished.',
+    'Cut away for a blistering four.',
+    'Four runs, pure class.',
+    'Pulled to the fence — FOUR!',
+    'Four! Bowler under pressure.',
+    'Threaded the gap for four.',
+    'FOUR! Scoreboard jumps.',
+    'Lofted just over — one bounce four.',
+    'Four runs along the carpet.',
+    'Smashed past midwicket for four.',
+    'FOUR! Statement shot.',
+    'Guided to the third-man boundary.',
+    'Four! Free swing, full reward.',
+    'Cover drive for four — textbook.',
+    'FOUR! Crowd roars.',
+    'Whipped off the pads to the fence.',
+    'Four runs, no stopping that.',
+    'Upper cut for four!',
+    'FOUR! Rate skyrockets.',
+    'Drilled down the ground for four.',
+    'Four! Fielders can only watch.',
+    'Square drive races away — four.',
+    'FOUR! Perfect timing.',
+    'Slogged to cow corner for four.',
+    'Four runs, over getting messy.',
+    'Late cut for four — delicate.',
+    'FOUR! Power and placement.',
+    'Hammered through extra cover.',
+    'Four! Bowler resets the mark.',
+    'Flicked fine for four.',
+    'FOUR! Absolute bullet.',
+    'Stepped down and four more.',
+    'Four runs to long-on.',
+    'FOUR! In the slot, out of the park almost.',
+    'Cut hard past point for four.',
+    'Four! Partnership on fire.',
+    'Driven on the up for four.',
+    'FOUR! Classic shot.',
+    'Pulled in front of square for four.',
+    'Four runs, clean as a whistle.',
+    'FOUR! No second thoughts.',
+    'Bludgeoned to the boundary.',
+    'Four! Take a bow.',
   ],
   '5': [
-    'पाँच रन! ओवरथ्रो का कमाल।',
-    'FIVE! मिसफील्ड + रनिंग।',
-    'पाँच रन — अजीब लेकिन मज़ेदार।',
-    'फील्डर ने गलती की, पाँच मिल गए।',
-    'FIVE रन्स, कैओस मोड।',
-    'ओवरथ्रो ड्रामा, पाँच पूरे।',
-    'पाँच! जैसे बोनस लेवल।',
-    'रनिंग + थ्रो मिस = पाँच।',
-    'FIVE — दुर्लभ स्कोर।',
-    'पाँच रन निकाल के सब हैरान।',
-    'मिसफील्ड पार्टी, पाँच।',
-    'पाँच रन — लकी डे।',
-    'थ्रो वाइल्ड, पाँच कमाए।',
-    'FIVE! स्कोरबोर्ड कन्फ्यूज।',
-    'पाँच रन, फुल ड्रामा।',
-    'फील्डिंग एरर, बैटर खुश।',
-    'पाँच! जैसे जैकपॉट प्लस।',
-    'ओवरथ्रो ने गेम बदल दिया।',
-    'पाँच रन — अनअपेक्षित गिफ्ट।',
-    'FIVE रन्स, टीम हँसी।',
-    'कैओस में पाँच निकल आए।',
-    'पाँच! बॉलर हाथ खड़े।',
-    'मिसफील्ड की सजा, पाँच रन।',
-    'पाँच रन — स्टोरी ऑफ द बॉल।',
-    'थ्रो इतना बुरा, पाँच पक्के।',
-    'FIVE! कमेंट्री भी हैरान।',
-    'पाँच रन मिला तो लग रहा सिक्स।',
-    'रनिंग ब्रिलियंट, फील्डिंग नहीं।',
-    'पाँच! ओवर महँगा हुआ।',
-    'अजीबोगरीब पाँच, मज़ेदार।',
-    'FIVE रन्स — याद रहेगा।',
-    'पाँच रन, फील्डर शर्मिंदा।',
-    'ओवरथ्रो स्पेशल।',
-    'पाँच! स्कोर में पंच।',
-    'मिस + हसल = पाँच।',
-    'पाँच रन निकाल के सेलिब्रेट।',
-    'FIVE — बोनस रन्स।',
-    'पाँच! ग्रुप में हँसी।',
-    'फील्डिंग कॉमेडी, पाँच रन।',
-    'पाँच रन — अनोखा मोमेंट।',
-    'थ्रो मिस्ड, रन मैक्सिड।',
-    'FIVE! कैलकुलेटर चेक करो।',
-    'पाँच रन, मूड बना।',
-    'कैओस क्रिकेट, पाँच।',
-    'पाँच! बॉलर की किस्मत खराब।',
-    'मिसफील्ड अवॉर्ड, पाँच रन।',
-    'पाँच रन — ट्विस्ट एंड टर्न।',
-    'FIVE रन्स, फुल मस्ती।',
-    'पाँच! आज का अनोखा।',
-    'ओवरथ्रो ने पाँच दे दिए।',
+    'Five runs! Overthrow chaos.',
+    'Five! Misfield gifts extras.',
+    'Unusual five — running and a wild throw.',
+    'Five runs! Fielders all over the place.',
+    'Five! Bonus from the chaos.',
+    'Overthrow turns two into five.',
+    'Five runs — rare score.',
+    'Five! Comedy of errors.',
+    'They scramble five somehow.',
+    'Five runs off a single bad throw.',
+    'Five! Captain is not amused.',
+    'Wild throw, five completed.',
+    'Five runs — unexpected gift.',
+    'Five! Keep running!',
+    'Misfield and five on the board.',
+    'Five runs from pure hustle plus error.',
+    'Five! Over already expensive.',
+    'They turn a two into five.',
+    'Five runs — scoreboard confuses itself.',
+    'Five! Fielding coach covers face.',
+    'Overthrow special — five runs.',
+    'Five runs, take them all.',
+    'Five! Chaos cricket.',
+    'Bad bounce, worse throw — five.',
+    'Five runs into the total.',
+    'Five! Never leave a throw unpunished.',
+    'They steal five with sharp eyes.',
+    'Five runs — highlight of the over.',
+    'Five! Bowler can\'t believe it.',
+    'Misfield parade ends in five.',
+    'Five runs, pure opportunism.',
+    'Five! Legs and luck.',
+    'Throw misses, five finished.',
+    'Five runs — rare as a unicorn.',
+    'Five! Keep the scoreboard honest.',
+    'They push for everything — five.',
+    'Five runs from one loose moment.',
+    'Five! Over the top drama.',
+    'Bonus five after the fumble.',
+    'Five runs — smile on the faces.',
+    'Five! Fielding nightmare.',
+    'They convert two into five.',
+    'Five runs, absolute mess.',
+    'Five! Take the freebies.',
+    'Overthrow five, loud cheers.',
+    'Five runs — unexpected jackpot.',
+    'Five! Never stop running.',
+    'Wild arm, five on the board.',
+    'Five runs from the mix-up.',
+    'Five! Chaos pays off.',
   ],
   '6': [
-    'छक्का! भीड़ में गेंद।',
-    'SIX! आउट ऑफ द ग्राउंड।',
-    'मैक्सिमम! बॉलर सिर्फ़ देखता रहा।',
-    'छक्का लगा, रॉकेट शॉट।',
-    'ह्यूज हिट, स्टैंड्स में।',
-    'SIX! जैसे मिसाइल।',
-    'गेंद को कहा — \'जा, चाँद मिल।\'',
-    'छक्का — पार्टी टाइम।',
-    'पॉवर हिट, सिक्स रन्स।',
-    'SIX! स्कोरबोर्ड उछला।',
-    'बॉलर की गेंद को विदाई।',
-    'छक्का लगा के पोज़।',
-    'मैक्सिमम! कमेंट्री पागल।',
-    'SIX — टीम नाच रही।',
-    'हिट इतना बड़ा, GPS खो गया।',
-    'छक्का! बॉलर का सपना टूटा।',
-    'आउट ऑफ द पार्क, सिक्स।',
-    'SIX! कैमरा खोज रहा गेंद।',
-    'रॉकेट शॉट, मैक्सिमम।',
-    'छक्का लगा, ग्रुप में आग।',
-    'पॉवर प्ले, सिक्स।',
-    'SIX! जैसे फ्री डिनर।',
-    'गेंद उड़ी आसमान, सिक्स।',
-    'छक्का — मोमेंट ऑफ मैच।',
-    'ह्यूज! स्टैंड्स में लैंड।',
-    'SIX! बॉलर पानी माँग रहा।',
-    'मैक्सिमम हिट, फुल जॉय।',
-    'छक्का लगा के हीरो।',
-    'SIX — रन रेट बूस्ट।',
-    'पक्का छक्का, कोई डाउट नहीं।',
-    'गेंद ने बाउंड्री पार की छलांग।',
-    'SIX! कप्तान ताली।',
-    'रॉकेट, सिक्स रन्स।',
-    'छक्का! आज का हाईलाइट।',
-    'आउट ऑफ द ग्राउंड स्पेशल।',
-    'SIX! फील्डर ने हाथ छोड़ दिए।',
-    'पॉवर + एलिवेशन = सिक्स।',
-    'छक्का लगा, सेलिब्रेशन।',
-    'मैक्सिमम! मूड ऑन।',
-    'SIX — स्कोर में धमाका।',
-    'हिट द स्टैंड्स, सिक्स।',
-    'छक्का! बॉलर की प्लानिंग ध्वस्त।',
-    'रॉकेट लॉन्च, सिक्स।',
-    'SIX! ग्रुप चैट में 🔥',
-    'गेंद गायब, सिक्स रन।',
-    'छक्का — फ्रीडम शॉट।',
-    'मैक्सिमम पार्टी।',
-    'SIX! कमाल का हिट।',
-    'पॉवर शॉट ऑफ द डे।',
-    'छक्का लगा के मुस्कुराहट।',
+    'SIX! Gone into the crowd!',
+    'Maximum! Out of the ground!',
+    'Six runs! Absolute rocket.',
+    'SIX! Bowler can only watch.',
+    'Smashed into the stands — six!',
+    'Six! Huge hit.',
+    'Lofted high and handsome — SIX!',
+    'Six runs over long-on.',
+    'SIX! In the slot and dispatched.',
+    'Picked up and deposited — six!',
+    'Six! Rate goes through the roof.',
+    'Clean strike, six more.',
+    'SIX! Monster hit.',
+    'Swung through the line for six.',
+    'Six runs into the second tier.',
+    'SIX! Statement of intent.',
+    'Hammered over midwicket for six.',
+    'Six! No chance for anyone.',
+    'Stepped out and six!',
+    'SIX! Crowd loses it.',
+    'Muscled over the rope for six.',
+    'Six runs — pure power.',
+    'SIX! Length ball punished.',
+    'Flat six over extra cover!',
+    'Six! Bowler stares at the sky.',
+    'Launched into orbit — six.',
+    'SIX! Partnership exploding.',
+    'Full toss, six runs.',
+    'Six! Take that.',
+    'Slog-swept for a big six.',
+    'SIX! Maximum damage.',
+    'High and long — six more.',
+    'Six runs, clean as can be.',
+    'SIX! Over the sightscreen.',
+    'Bludgeoned for six.',
+    'Six! Free hit energy without the free hit.',
+    'Danced down, six up!',
+    'SIX! Absolute meat of the bat.',
+    'Picked the bones out — six.',
+    'Six runs into the night.',
+    'SIX! Captain wants another.',
+    'Swung hard, six hard.',
+    'Six! Fielders don\'t even move.',
+    'Lofted straight for six.',
+    'SIX! Scoreboard on fire.',
+    'Into the crowd for six more.',
+    'Six! Pure timing, not just muscle.',
+    'SIX! Over is ruined.',
+    'Deposited over cow corner — six.',
+    'Six! Stand and deliver.',
   ],
   'out': [
-    'आउट! नंबर मैच, बैटर गया।',
-    'विकेट! बॉलर ने पढ़ लिया।',
-    'सेम नंबर, गोन! वॉक बैक।',
-    'आउट! माइंड गेम्स जीते बॉलर ने।',
-    'नंबर एक जैसे, विकेट गिर गया।',
-    'बोल्ड हिम! टाइम टू गो।',
-    'आउट — बैटर शॉक में।',
-    'विकेट! ग्रुप में शोर।',
-    'सेम नंबर = OUT, सिंपल मैथ।',
-    'बॉलर मुस्कुराया, बैटर चला।',
-    'आउट! डक आउट या बिग स्कोर, फर्क नहीं।',
-    'नंबर मैच, सपना खत्म।',
-    'विकेट गिरा, बॉलर सेलिब्रेट।',
-    'आउट! कमेंट्री सीरियस।',
-    'सेम अंक, गोन फॉर अ डक/स्कोर।',
-    'बॉलर ने प्लान सफल किया।',
-    'आउट — पैवेलियन का रास्ता।',
-    'विकेट! टीम शांत।',
-    'नंबर गेम हारा बैटर।',
-    'आउट! अगला बैटर तैयार रहे।',
-    'सेम नंबर, लास्ट लाफ बॉलर का।',
-    'विकेट गिरते ही माहौल बदला।',
-    'आउट! स्मार्ट बॉलिंग।',
-    'नंबर मैच = गेम ओवर फॉर बैटर।',
-    'बॉलर किंग, बैटर आउट।',
-    'आउट! ड्रामा खत्म इस बैटर का।',
-    'विकेट! कप्तान सोच में।',
-    'सेम नंबर ने धोखा दिया।',
-    'आउट — वॉक ऑफ शेम या प्राइड।',
-    'बॉलर ने पढ़ा, विकेट लिया।',
-    'आउट! स्कोरकार्ड में W।',
-    'नंबर एक, सपने अनेक, आउट एक।',
-    'विकेट! बॉलर का दिन।',
-    'आउट — ग्रुप में \'ooo\'।',
-    'सेम नंबर, सिंपल OUT।',
-    'बॉलर चैंपियन, बैटर रिटायर्ड।',
-    'आउट! अगली एंट्री प्लीज।',
-    'विकेट गिरा के सेलिब्रेशन।',
-    'नंबर मैच ने मैच पलट दिया।',
-    'आउट! माइंड रीडिंग बॉलर।',
-    'सेम अंक, फुल स्टॉप।',
-    'विकेट! प्रेशर काम आया।',
-    'आउट — बैटर की गलती।',
-    'बॉलर ने सही अंदाज़ा लगाया।',
-    'आउट! टीम को झटका।',
-    'नंबर गेम, विकेट फ्रेम।',
-    'विकेट गिर, मूड गिर।',
-    'आउट! पैवेलियन बुला रहा।',
-    'सेम नंबर = एंड ऑफ स्टोरी।',
-    'बॉलर विजेता, बैटर आउट।',
+    'Same number — OUT! Bowler wins.',
+    'OUT! Numbers matched perfectly.',
+    'Wicket! Mind games over.',
+    'Bowled him — same number!',
+    'OUT! Time to walk back.',
+    'Gone! Bowler read it right.',
+    'Wicket! The guess was perfect.',
+    'OUT! Partnership broken.',
+    'Same digits, different fate — OUT.',
+    'Wicket! Crowd erupts.',
+    'OUT! Batsman can\'t believe it.',
+    'Numbers aligned — that\'s out.',
+    'Wicket! Fresh batter please.',
+    'OUT! Plan executed.',
+    'Same number seals it — OUT.',
+    'Wicket! Bowler celebrates.',
+    'OUT! End of the road this over.',
+    'Matched and dispatched — OUT.',
+    'Wicket! Pressure paid off.',
+    'OUT! Simple as matching numbers.',
+    'Gone for a duck / big score — still OUT.',
+    'Wicket! Next please.',
+    'OUT! The mind game is real.',
+    'Same call, different result — wicket.',
+    'OUT! Bowler had the last laugh.',
+    'Wicket! Stumps in the mind.',
+    'OUT! Walk back to the dugout.',
+    'Numbers don\'t lie — OUT.',
+    'Wicket! Over just flipped.',
+    'OUT! Perfect read by the bowler.',
+    'Same number, game over for the batter.',
+    'Wicket! Celebration time.',
+    'OUT! That one hurt.',
+    'Matched on the money — OUT.',
+    'Wicket! New batter incoming.',
+    'OUT! Classic hand-cricket dismissal.',
+    'Same guess, fatal result.',
+    'Wicket! Keep them coming.',
+    'OUT! No second chance.',
+    'Numbers collided — batter out.',
+    'Wicket! Pure skill in the call.',
+    'OUT! Innings takes a hit.',
+    'Same number strikes again.',
+    'Wicket! Bowler on fire.',
+    'OUT! That\'s the danger of matching.',
+    'Mind-read complete — OUT.',
+    'Wicket! Big moment.',
+    'OUT! Back to the pavilion.',
+    'Same number, different emotion — OUT.',
+    'Wicket! The bowler smiles.',
   ],
 };
 const pick = (a) => a[Math.floor(Math.random() * a.length)];
 
 // ─── Resolve a ball: bowler number (locked) vs batsman number ───────────
 async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
+  touchMatch(m.id);
   const bowlNum = Number(pend.bowl_number);
   const isWicket = batNum === bowlNum;
   const runs = isWicket ? 0 : batNum;
@@ -4903,7 +4944,77 @@ async function main() {
   BOT_USERNAME = me.username;
   console.log(`Bot @${me.username}`);
   await bot.launch();
-  console.log(`Running… (version ${BOT_VERSION})`);
+  
+// ═════════════════ STUCK GAME WATCHDOG ═════════════════
+// If a live match has no ball progress for STUCK_MINUTES, auto-cancel so the GC can start a new game.
+async function lastMatchActivity(matchId) {
+  const mem = matchActivity.get(mkey(matchId));
+  if (mem) return mem;
+  try {
+    const { rows } = await q(
+      `SELECT COALESCE(
+          (SELECT MAX(d.created_at) FROM deliveries d
+             JOIN innings i ON i.id = d.innings_id WHERE i.match_id = $1),
+          (SELECT created_at FROM matches WHERE id = $1),
+          NOW()
+        ) AS last_at`,
+      [matchId]
+    );
+    return rows[0]?.last_at ? new Date(rows[0].last_at).getTime() : Date.now();
+  } catch (e) {
+    console.error('lastMatchActivity:', e.message);
+    return Date.now();
+  }
+}
+
+async function cancelStuckMatch(m, reason) {
+  try {
+    clearTurnClock(m.id);
+    stopIdleWatch(m.id);
+    clearLobby(m.id);
+    matchActivity.delete(mkey(m.id));
+    await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE match_id=$1 AND is_resolved=FALSE`, [m.id]);
+    await q(
+      `UPDATE matches SET status='cancelled' WHERE id=$1 AND status NOT IN ('completed','cancelled')`,
+      [m.id]
+    );
+    const groupId = Number(m.group_chat_id);
+    await bot.telegram.sendMessage(
+      groupId,
+      `🛑 *GAME AUTO-CANCELLED*\n` +
+        `> No response for *${STUCK_MINUTES} minutes*.\n` +
+        `> ${reason || 'Match was stuck.'}\n` +
+        `> Start a new one with /team or /startsolo.`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (e) {
+    console.error('cancelStuckMatch:', e.message);
+  }
+}
+
+async function stuckGamesTick() {
+  try {
+    const { rows } = await q(
+      `SELECT * FROM matches WHERE status IN ('innings1','innings2','captains','toss','waiting')`
+    );
+    const now = Date.now();
+    const limit = STUCK_MINUTES * 60 * 1000;
+    for (const m of rows) {
+      const last = await lastMatchActivity(m.id);
+      // lobby/setup: also respect idle watch, but hard-cap at STUCK_MINUTES of zero delivery activity
+      if (now - last >= limit) {
+        await cancelStuckMatch(m, 'Players did not respond — freeing the group for a new game.');
+      }
+    }
+  } catch (e) {
+    console.error('stuckGamesTick:', e.message);
+  }
+}
+
+setInterval(() => stuckGamesTick().catch(() => {}), STUCK_CHECK_MS);
+
+
+console.log(`Running… (version ${BOT_VERSION})`);
   try {
     const rep = await assetReport();
     console.log('Assets:\n' + rep.join('\n'));
