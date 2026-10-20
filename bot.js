@@ -28,7 +28,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r19-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r21-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -1422,7 +1422,7 @@ const PGIF_KEYS = new Set([
   '0', '1', '2', '3', '4', '5', '6', 'out', 'dugout', 'stance', 'runup', 'batentry', 'bowlentry',
   'starter', 'opener', 'toss', '50', '100', '150', '200', '3w', '5fer', 'hatrick', 'motm',
 ]);
-const PGIF_LEGACY = { batentry: 'newbatsman', bowlentry: 'newbowler', dugout: 'duck' }; // dugout also checks old 'duck' row
+const PGIF_LEGACY = { batentry: 'newbatsman', bowlentry: 'newbowler', dugout: 'duck', duck: 'dugout', dot: '0', '5w': '5fer' }; // dugout also checks old 'duck' row
 const PGIF_LABELS = {
   0: 'DOT BALL',
   dot: 'DOT BALL',
@@ -1550,8 +1550,9 @@ async function sendResultGif(telegram, chatId, key, replyToMessageId, caption = 
 // A message that MUST be delivered: GIF + HTML caption when a GIF is saved for `key`, otherwise the same text.
 // `extra` may hold reply_markup / reply_to_message_id. Returns the sent message.
 async function sendCaptionedGif(telegram, chatId, key, html, extra = {}) {
+  const keys = Array.isArray(key) ? key : [key];
   try {
-    const gif = await getPgif(key);
+    const gif = await getPgif(keys);
     if (gif) {
       return await sendGifFile(telegram, chatId, gif, {
         caption: html,
@@ -1561,13 +1562,19 @@ async function sendCaptionedGif(telegram, chatId, key, html, extra = {}) {
       });
     }
   } catch (e) {
-    console.error(`Could not send pgif ${key}:`, e.message);
+    console.error(`Could not send pgif ${keys.join(',')}:`, e.message);
   }
-  return telegram.sendMessage(chatId, html, {
-    parse_mode: 'HTML',
-    allow_sending_without_reply: true,
-    ...extra,
-  });
+  try {
+    return await telegram.sendMessage(chatId, html, {
+      parse_mode: 'HTML',
+      allow_sending_without_reply: true,
+      ...extra,
+    });
+  } catch (e2) {
+    // reply_to may be gone — send without it
+    const { reply_to_message_id, ...rest } = extra || {};
+    return telegram.sendMessage(chatId, html, { parse_mode: 'HTML', ...rest });
+  }
 }
 
 // HTML mention
@@ -2665,13 +2672,23 @@ bot.command('team', async (ctx) => {
 });
 
 // Cancelling needs the host's permission: Yes / No
-async function cancelMatchNow(m) {
+async function cancelMatchNow(m, telegram = null) {
   clearLobby(m.id);
   stopIdleWatch(m.id);
   clearTurnClock(m.id);
   clearWarns(m.id);
   endVote(m.id);
+  matchActivity.delete(mkey(m.id));
   await q(`UPDATE matches SET status='cancelled' WHERE id=$1`, [m.id]);
+  const tg = telegram || bot.telegram;
+  const groupId = Number(m.group_chat_id);
+  if (groupId) {
+    try {
+      await sendMatchDataFile(tg, groupId, m.id);
+    } catch (e) {
+      console.error('cancel match data file:', e.message);
+    }
+  }
 }
 
 bot.command('endmatch', async (ctx) => {
@@ -3925,7 +3942,14 @@ bot.hears(/^[0-6]$/, async (ctx) => {
     } catch (_) {}
     await resolveBall(ctx.telegram, m, inn, pend, num, ctx.message.message_id);
   } catch (e) {
-    console.error(e);
+    console.error('ball resolve error:', e);
+    try {
+      await ctx.reply('⚠️ Could not resolve that ball. Try again or host: /endmatch.\n' + String(e.message || e).slice(0, 120));
+    } catch (_) {}
+    try {
+      const m2 = await getActiveMatch(ctx.chat.id);
+      if (m2) await ensureTurnClock(m2.id);
+    } catch (_) {}
   }
 });
 
@@ -3998,6 +4022,170 @@ bot.action(/^bowl:(.+):([1-6])$/, async (ctx) => {
   await ctx.answerCbQuery('Buttons are no longer used — send your number as a message.', { show_alert: true });
 });
 
+
+// ─── Full match data file (sent when match ends / is cancelled) ───
+async function buildMatchDataText(matchId) {
+  const m = await getMatch(matchId);
+  if (!m) return 'Match not found.';
+  const players = await getPlayers(matchId);
+  const { rows: inns } = await q(
+    `SELECT * FROM innings WHERE match_id=$1 ORDER BY innings_number`,
+    [matchId]
+  );
+  const { rows: dels } = await q(
+    `SELECT d.*, i.innings_number, i.batting_team, i.bowling_team,
+            b.username AS bat_user, b.first_name AS bat_first, b.last_name AS bat_last, b.telegram_id AS bat_tg,
+            o.username AS bowl_user, o.first_name AS bowl_first, o.last_name AS bowl_last, o.telegram_id AS bowl_tg
+       FROM deliveries d
+       JOIN innings i ON i.id = d.innings_id
+       LEFT JOIN match_players b ON b.id = d.batsman_id
+       LEFT JOIN match_players o ON o.id = d.bowler_id
+      WHERE i.match_id = $1
+      ORDER BY i.innings_number, d.over_number, d.ball_number`,
+    [matchId]
+  );
+  const { rows: bats } = await q(
+    `SELECT bs.*, mp.username, mp.first_name, mp.last_name, mp.telegram_id, mp.team_label, mp.roster_position,
+            i.innings_number
+       FROM batting_stats bs
+       JOIN match_players mp ON mp.id = bs.player_id
+       JOIN innings i ON i.id = bs.innings_id
+      WHERE i.match_id = $1
+      ORDER BY i.innings_number, mp.roster_position`,
+    [matchId]
+  );
+  const { rows: bowls } = await q(
+    `SELECT bw.*, mp.username, mp.first_name, mp.last_name, mp.telegram_id, mp.team_label, mp.roster_position,
+            i.innings_number
+       FROM bowling_stats bw
+       JOIN match_players mp ON mp.id = bw.player_id
+       JOIN innings i ON i.id = bw.innings_id
+      WHERE i.match_id = $1
+      ORDER BY i.innings_number, mp.roster_position`,
+    [matchId]
+  );
+
+  const pname = (r) => {
+    const full = [r.first_name || r.bat_first || r.bowl_first, r.last_name || r.bat_last || r.bowl_last]
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+    if (full) return full;
+    const u = r.username || r.bat_user || r.bowl_user;
+    if (u) return '@' + u;
+    return String(r.telegram_id || r.bat_tg || r.bowl_tg || '—');
+  };
+
+  const lines = [];
+  lines.push('══════════════════════════════════════');
+  lines.push('         CRIC MONSTER — MATCH DATA');
+  lines.push('══════════════════════════════════════');
+  lines.push(`Match ID     : ${m.id}`);
+  lines.push(`Group        : ${m.group_title || m.group_chat_id || '—'}`);
+  lines.push(`Mode         : ${m.mode || '—'}`);
+  lines.push(`Status       : ${m.status || '—'}`);
+  lines.push(`Overs        : ${m.total_overs != null ? m.total_overs : '—'}`);
+  lines.push(`Target       : ${m.target != null ? m.target : '—'}`);
+  lines.push(`Winner       : ${m.winner_team != null ? m.winner_team : '—'}`);
+  lines.push(`Spam-free    : ${m.spam_free ? 'yes' : 'no'}`);
+  lines.push(`Created      : ${m.created_at || '—'}`);
+  lines.push(`Completed    : ${m.completed_at || '—'}`);
+  if (m.penalty_log) {
+    lines.push('Penalties    :');
+    for (const pl of String(m.penalty_log).split('\n').filter(Boolean)) lines.push('  • ' + pl);
+  }
+  lines.push('');
+  lines.push('── PLAYERS ──');
+  for (const p of players) {
+    const n = name(p);
+    lines.push(
+      `  #${p.roster_position || '?'} ${n}` +
+        (p.username ? ` (@${p.username})` : '') +
+        `  tg:${p.telegram_id}` +
+        (p.team_label ? `  Team ${p.team_label}` : '') +
+        (p.is_captain ? '  [C]' : '')
+    );
+  }
+  lines.push('');
+  for (const inn of inns) {
+    lines.push(`── INNINGS ${inn.innings_number} ──`);
+    lines.push(
+      `  Batting: Team ${inn.batting_team || '—'} | Bowling: Team ${inn.bowling_team || '—'}`
+    );
+    lines.push(
+      `  Score: ${inn.total_runs || 0}/${inn.total_wickets || 0}  (${oversStr(inn.balls_bowled || 0)} ov)` +
+        (inn.is_completed ? '  [completed]' : '')
+    );
+    lines.push('');
+    lines.push('  Batting:');
+    const innBats = bats.filter((b) => Number(b.innings_number) === Number(inn.innings_number));
+    for (const b of innBats) {
+      const sr =
+        Number(b.balls_faced) > 0
+          ? ((Number(b.runs) * 100) / Number(b.balls_faced)).toFixed(1)
+          : '0.0';
+      lines.push(
+        `    ${pname(b)}  ${b.runs || 0}(${b.balls_faced || 0})  4s:${b.fours || 0} 6s:${b.sixes || 0}  SR:${sr}` +
+          (b.is_out ? `  OUT${b.dismissal_type ? ' (' + b.dismissal_type + ')' : ''}` : '  not out')
+      );
+    }
+    if (!innBats.length) lines.push('    (none)');
+    lines.push('');
+    lines.push('  Bowling:');
+    const innBowls = bowls.filter((b) => Number(b.innings_number) === Number(inn.innings_number));
+    for (const b of innBowls) {
+      lines.push(
+        `    ${pname(b)}  ${b.wickets || 0}/${b.runs_conceded || 0}  (${oversStr(b.balls_bowled || 0)})`
+      );
+    }
+    if (!innBowls.length) lines.push('    (none)');
+    lines.push('');
+    lines.push('  Ball-by-ball:');
+    const innDels = dels.filter((d) => Number(d.innings_number) === Number(inn.innings_number));
+    for (const d of innDels) {
+      const res =
+        d.is_wicket === true || d.is_wicket === 1 || d.is_wicket === 't'
+          ? 'W'
+          : String(d.runs_scored);
+      lines.push(
+        `    ${d.over_number}.${d.ball_number}  bat:${pname({ first_name: d.bat_first, last_name: d.bat_last, username: d.bat_user, telegram_id: d.bat_tg })} ` +
+          `(${d.bat_number}) vs bowl:${pname({ first_name: d.bowl_first, last_name: d.bowl_last, username: d.bowl_user, telegram_id: d.bowl_tg })} ` +
+          `(${d.bowl_number})  → ${res}`
+      );
+    }
+    if (!innDels.length) lines.push('    (no deliveries)');
+    lines.push('');
+  }
+  lines.push('══════════════════════════════════════');
+  lines.push(`Generated by Cric Monster · ${new Date().toISOString()}`);
+  return lines.join('\n');
+}
+
+async function sendMatchDataFile(telegram, chatId, matchId) {
+  try {
+    const text = await buildMatchDataText(matchId);
+    const dir = path.join('/tmp', 'cricmonster');
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (_) {}
+    const filePath = path.join(dir, `match_${matchId}_${Date.now()}.txt`);
+    fs.writeFileSync(filePath, text, 'utf8');
+    await telegram.sendDocument(
+      chatId,
+      { source: filePath, filename: `CricMonster_Match_${matchId}.txt` },
+      { caption: '📄 Full match data' }
+    );
+    try {
+      fs.unlinkSync(filePath);
+    } catch (_) {}
+  } catch (e) {
+    console.error('sendMatchDataFile:', e.message);
+    try {
+      await telegram.sendMessage(chatId, '⚠️ Could not attach match data file: ' + String(e.message || e).slice(0, 120));
+    } catch (_) {}
+  }
+}
+
 // ─── Match finish (cards) ────────────────────────────────
 // Solo: single innings finished (everyone is out)
 async function finishSolo(telegram, groupId, m, inn) {
@@ -4011,6 +4199,8 @@ async function finishSolo(telegram, groupId, m, inn) {
     awardsText(aw);
   await sendSoloFinal(telegram, groupId, m, caption, bat, bowl);
   await sendMotmGif(telegram, groupId, aw.motm);
+  try { await sendLong(telegram, groupId, await fullScorecard(m.id)); } catch (_) {}
+  await sendMatchDataFile(telegram, groupId, m.id);
 }
 
 // Team: second innings finished
@@ -4046,6 +4236,7 @@ async function finishTeam(telegram, groupId, m, inn2) {
   await sendTeamFinal(telegram, groupId, m, caption);
   await sendMotmGif(telegram, groupId, aw.motm);
   await sendLong(telegram, groupId, await fullScorecard(m.id));
+  await sendMatchDataFile(telegram, groupId, m.id);
 }
 
 
@@ -4616,8 +4807,8 @@ const pick = (a) => a[Math.floor(Math.random() * a.length)];
 async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
   touchMatch(m.id);
   const bowlNum = Number(pend.bowl_number);
-  const isWicket = batNum === bowlNum;
-  const runs = isWicket ? 0 : batNum;
+  const isWicket = Number(batNum) === bowlNum;
+  const runs = isWicket ? 0 : Number(batNum) || 0;
   const strikerId = inn.striker_player_id;
   const nonId = inn.non_striker_player_id;
   const bowlerId = inn.current_bowler_id;
@@ -4626,9 +4817,26 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
 
   clearTurnClock(m.id);
 
-    const client = await pool.connect();
-    try {
+  const client = await pool.connect();
+  try {
       await client.query('BEGIN');
+
+      // Ensure stats rows exist (avoids silent no-op updates)
+      if (strikerId) {
+        await client.query(
+          `INSERT INTO batting_stats (innings_id, player_id) VALUES ($1,$2)
+           ON CONFLICT (innings_id, player_id) DO NOTHING`,
+          [inn.id, strikerId]
+        );
+      }
+      if (bowlerId) {
+        await client.query(
+          `INSERT INTO bowling_stats (innings_id, player_id) VALUES ($1,$2)
+           ON CONFLICT (innings_id, player_id) DO NOTHING`,
+          [inn.id, bowlerId]
+        );
+      }
+
       await client.query(
         `INSERT INTO deliveries (innings_id, over_number, ball_number, batsman_id, bowler_id, bat_number, bowl_number, runs_scored, is_wicket)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
@@ -4705,8 +4913,8 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
          pending_bat_number=NULL, ball_state='idle' WHERE id=$1`,
         [
           inn.id,
-          inn.total_runs + runs,
-          inn.total_wickets + (isWicket ? 1 : 0),
+          (Number(inn.total_runs) || 0) + runs,
+          (Number(inn.total_wickets) || 0) + (isWicket ? 1 : 0),
           newBalls,
           newStriker,
           isSolo ? null : newNon,
@@ -4731,7 +4939,7 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
     : runs === 0
     ? `${pe('ball','⚪')} <b>DOT BALL</b>`
     : `${runs === 6 ? pe('six','🚀') : runs === 4 ? pe('fire','🔥') : pe('bat','🏏')} <b>${runs} RUN${runs === 1 ? '' : 'S'}!</b>`;
-  const cmt = pick(COMMENT[isWicket ? 'out' : String(runs)]);
+  const cmt = pick(COMMENT[isWicket ? 'out' : String(runs)] || COMMENT['0'] || ['Nice ball.']);
 
   // milestones (each has its own /pgif GIF; the normal result GIF is the fallback)
   const strikerP = await getPlayer(strikerId);
@@ -4817,7 +5025,8 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
           `${pe('ok','🎊')} Congratulations ${disp(strikerP)} — hit the <b>50!</b>`
       );
     }
-    gifKeys.push(String(runs));
+    if (runs === 0) gifKeys.push('0', 'dot');
+    else gifKeys.push(String(runs));
   }
 
   // Partnership milestones (team mode only): runs since last wicket
@@ -4859,13 +5068,25 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
     `${head}  ·  <b>${batNum}/${bowlNum}</b>\n` +
     `<blockquote>🎙️ <i>${escapeHtml(cmt)}</i></blockquote>` +
     (notes.length ? `\n${notes.join('\n')}` : '');
-  await sendCaptionedGif(telegram, groupId, gifKeys, html, {
-    reply_to_message_id: Number(batMsgId) || undefined,
-  });
+  try {
+    await sendCaptionedGif(telegram, groupId, gifKeys, html, {
+      reply_to_message_id: Number(batMsgId) || undefined,
+    });
+  } catch (e) {
+    console.error('result gif/text failed:', e.message);
+    try {
+      await telegram.sendMessage(groupId, stripPe(html), { parse_mode: 'HTML' });
+    } catch (_) {}
+  }
 
-  // dugout/duck-out GIF is already in gifKeys when out for 0 (single send)
-
-  await progressAfterBall(telegram, m, inn2, isWicket);
+  try {
+    await progressAfterBall(telegram, m, inn2, isWicket);
+  } catch (e) {
+    console.error('progressAfterBall failed:', e.message);
+    try {
+      await ensureTurnClock(m.id);
+    } catch (_) {}
+  }
 }
 
 bot.catch((err, ctx) => {
@@ -4962,6 +5183,7 @@ async function cancelStuckMatch(m, reason) {
         `> Start a new one with /team or /startsolo.`,
       { parse_mode: 'Markdown' }
     );
+    await sendMatchDataFile(bot.telegram, groupId, m.id);
   } catch (e) {
     console.error('cancelStuckMatch:', e.message);
   }
