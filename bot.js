@@ -28,7 +28,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r8-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r9-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -1300,10 +1300,14 @@ const PGIF_ALIASES = {
   duckout: 'dugout',
   'duck-out': 'dugout',
   'duck_out': 'dugout',
+  mom: 'motm',
+  manofthematch: 'motm',
+  'man-of-the-match': 'motm',
+  'man_of_the_match': 'motm',
 };
 const PGIF_KEYS = new Set([
   '0', '1', '2', '3', '4', '5', '6', 'out', 'duck', 'dugout', 'stance', 'runup', 'batentry', 'bowlentry',
-  'starter', 'opener', 'toss', '50', '100', '150', '200', '3w', '5fer', 'hatrick',
+  'starter', 'opener', 'toss', '50', '100', '150', '200', '3w', '5fer', 'hatrick', 'motm',
 ]);
 const PGIF_LEGACY = { batentry: 'newbatsman', bowlentry: 'newbowler' }; // keys saved by an older version
 const PGIF_LABELS = {
@@ -1326,6 +1330,7 @@ const PGIF_LABELS = {
   runup: 'BOWLER RUN-UP',
   batentry: 'BATSMAN ENTRY',
   bowlentry: 'BOWLER ENTRY',
+  motm: 'MAN OF THE MATCH',
 };
 
 async function canConfigurePgif(ctx) {
@@ -1348,7 +1353,7 @@ bot.command('pgif', async (ctx) => {
     const key = PGIF_ALIASES[rawKey] || rawKey;
     if (!PGIF_KEYS.has(key))
       return ctx.reply(
-        'Reply to a GIF with:\n/pgif 0 (or /pgif dot) … /pgif 6 · /pgif out · /pgif duck · /pgif dugout (duck out)\n/pgif stance · /pgif runup · /pgif batentry · /pgif bowlentry\n/pgif starter (or fielding) · /pgif opener · /pgif toss\n/pgif 50 · /pgif 100 · /pgif 150 · /pgif 200 · /pgif 3w · /pgif 5w (or 5fer) · /pgif hatrick'
+        'Reply to a GIF with:\n/pgif 0 (or /pgif dot) … /pgif 6 · /pgif out · /pgif duck · /pgif dugout (duck out)\n/pgif stance · /pgif runup · /pgif batentry · /pgif bowlentry\n/pgif starter (or fielding) · /pgif opener · /pgif toss\n/pgif 50 · /pgif 100 · /pgif 150 · /pgif 200 · /pgif 3w · /pgif 5w (or 5fer) · /pgif hatrick · /pgif motm'
       );
     if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only a group admin or the owner configured in BOT_OWNER_ID / ADMIN_IDS can set GIFs.');
 
@@ -1438,6 +1443,90 @@ async function sendCaptionedGif(telegram, chatId, key, html, extra = {}) {
 }
 
 // HTML mention
+
+// MOTM celebration GIF (set with /pgif motm)
+async function sendMotmGif(telegram, chatId, motmPlayer) {
+  if (!motmPlayer) return false;
+  const html =
+    `🏅 <b>${fancy('MAN OF THE MATCH')}</b>\n` +
+    `🎊 Congratulations ${htag(motmPlayer)}!\n` +
+    `<blockquote>${escapeHtml(String(motmPlayer.runs || 0))} run${Number(motmPlayer.runs) === 1 ? '' : 's'}` +
+    (motmPlayer.wkts ? ` · ${motmPlayer.wkts} wicket${Number(motmPlayer.wkts) === 1 ? '' : 's'}` : '') +
+    `</blockquote>`;
+  return sendCaptionedGif(telegram, chatId, 'motm', html);
+}
+
+// Ordered list for /giflist and /showgif
+const PGIF_LIST_ORDER = [
+  '0', '1', '2', '3', '4', '5', '6',
+  'out', 'duck', 'dugout',
+  'stance', 'runup', 'batentry', 'bowlentry',
+  'starter', 'opener', 'toss',
+  '50', '100', '150', '200',
+  '3w', '5fer', 'hatrick', 'motm',
+];
+
+bot.command('giflist', async (ctx) => {
+  try {
+    const { rows } = await q(`SELECT result_key FROM public.pgif_settings`);
+    const have = new Set(rows.map((r) => String(r.result_key)));
+    // also count legacy keys
+    for (const [k, leg] of Object.entries(PGIF_LEGACY)) {
+      if (have.has(leg)) have.add(k);
+    }
+    let ok = 0;
+    const lines = [];
+    for (const key of PGIF_LIST_ORDER) {
+      const label = PGIF_LABELS[key] || key;
+      // resolve via aliases already stored as canonical key
+      const set = have.has(key) || (PGIF_LEGACY[key] && have.has(PGIF_LEGACY[key]));
+      if (set) ok += 1;
+      lines.push(`${set ? '✅' : '❌'} <code>${key}</code> — ${escapeHtml(label)}`);
+    }
+    const total = PGIF_LIST_ORDER.length;
+    const html =
+      `🎞️ <b>${fancy('GIF LIST')}</b>\n` +
+      `<blockquote>${ok}/${total} configured</blockquote>\n` +
+      lines.join('\n') +
+      `\n\nSet missing ones: reply to a GIF with <code>/pgif &lt;key&gt;</code>\n` +
+      `Admin: <code>/showgif</code> to preview all saved GIFs`;
+    await ctx.reply(html, { parse_mode: 'HTML' });
+  } catch (e) {
+    console.error('giflist', e);
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
+bot.command('showgif', async (ctx) => {
+  try {
+    if (!(await canConfigurePgif(ctx)))
+      return ctx.reply('❌ Only group admin / bot owner can use /showgif');
+    const { rows } = await q(
+      `SELECT result_key, file_id, media_type FROM public.pgif_settings ORDER BY result_key`
+    );
+    if (!rows.length) return ctx.reply('❌ No GIFs saved yet. Use /pgif <key> while replying to a GIF.');
+
+    await ctx.reply(`🎞️ Showing *${rows.length}* saved GIF(s)…`, { parse_mode: 'Markdown' });
+    for (const r of rows) {
+      const label = PGIF_LABELS[r.result_key] || r.result_key;
+      const cap = `✅ <b>${escapeHtml(String(r.result_key))}</b> — ${escapeHtml(label)}`;
+      try {
+        await sendGifFile(ctx.telegram, ctx.chat.id, r, {
+          caption: cap,
+          parse_mode: 'HTML',
+        });
+        await sleep(400);
+      } catch (e) {
+        await ctx.reply(`❌ ${r.result_key}: ${e.message}`).catch(() => {});
+      }
+    }
+    await ctx.reply('✅ Done. Use /giflist to see missing keys.');
+  } catch (e) {
+    console.error('showgif', e);
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
 const htag = (p) => `<a href="tg://user?id=${Number(p.telegram_id ?? p.id)}">${escapeHtml(name(p))}</a>`;
 
 // Spam rules: team = spam-free by default, solo = spam allowed by default (host can switch with /spam)
@@ -1499,7 +1588,9 @@ bot.command('help', async (ctx) => {
       `A batsman who misses ${BAT_RETIRE_LIMIT} turns is retired OUT.\n` +
       `If a lobby does nothing, the host gets warnings and the game ends after ${IDLE_WARN_LIMIT}.\n\n` +
       `*GIF setup (reply to a GIF):*\n` +
-      `/pgif 0 … /pgif 6 · /pgif out · /pgif dugout (duck out)\n/pgif duck · /pgif stance (batsman batting) · /pgif runup (bowler bowling)\n/pgif batentry · /pgif bowlentry · /pgif starter (fielding) · /pgif opener · /pgif toss\n/pgif 50 · /pgif 100 · /pgif 150 · /pgif 200 · /pgif 3w · /pgif 5w (or 5fer) · /pgif hatrick`,
+      `/giflist — which event GIFs are set (✅/❌)\n` +
+      `/showgif — admin: preview every saved GIF\n` +
+      `/pgif 0 … /pgif 6 · /pgif out · /pgif dugout (duck out)\n/pgif duck · /pgif stance (batsman batting) · /pgif runup (bowler bowling)\n/pgif batentry · /pgif bowlentry · /pgif starter (fielding) · /pgif opener · /pgif toss\n/pgif 50 · /pgif 100 · /pgif 150 · /pgif 200 · /pgif 3w · /pgif 5w (or 5fer) · /pgif hatrick · /pgif motm`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -3741,6 +3832,7 @@ async function finishSolo(telegram, groupId, m, inn) {
     `> 📊 Total: *${inn.total_runs}/${inn.total_wickets}* in ${oversStr(inn.balls_bowled)} overs\n\n` +
     awardsText(aw);
   await sendSoloFinal(telegram, groupId, m, caption, bat, bowl);
+  await sendMotmGif(telegram, groupId, aw.motm);
 }
 
 // Team: second innings finished
@@ -3774,6 +3866,7 @@ async function finishTeam(telegram, groupId, m, inn2) {
   const aw = await matchAwards(m.id, winner);
   caption += `${awardsText(aw)}`;
   await sendTeamFinal(telegram, groupId, m, caption);
+  await sendMotmGif(telegram, groupId, aw.motm);
   await sendLong(telegram, groupId, await fullScorecard(m.id));
 }
 
