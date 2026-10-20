@@ -28,7 +28,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r9-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r10-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -1275,6 +1275,7 @@ bot.start(async (ctx) => {
 //  bowlentry  → new bowler comes       (old names newbatsman / newbowler / runnerup still work)
 const PGIF_ALIASES = {
   dot: '0',
+  duck: 'dugout',
   newbowler: 'bowlentry',
   bowlerentry: 'bowlentry',
   newbatsman: 'batentry',
@@ -1306,14 +1307,13 @@ const PGIF_ALIASES = {
   'man_of_the_match': 'motm',
 };
 const PGIF_KEYS = new Set([
-  '0', '1', '2', '3', '4', '5', '6', 'out', 'duck', 'dugout', 'stance', 'runup', 'batentry', 'bowlentry',
+  '0', '1', '2', '3', '4', '5', '6', 'out', 'dugout', 'stance', 'runup', 'batentry', 'bowlentry',
   'starter', 'opener', 'toss', '50', '100', '150', '200', '3w', '5fer', 'hatrick', 'motm',
 ]);
-const PGIF_LEGACY = { batentry: 'newbatsman', bowlentry: 'newbowler' }; // keys saved by an older version
+const PGIF_LEGACY = { batentry: 'newbatsman', bowlentry: 'newbowler', dugout: 'duck' }; // dugout also checks old 'duck' row
 const PGIF_LABELS = {
   0: 'DOT BALL',
   dot: 'DOT BALL',
-  duck: 'DUCK (out for 0)',
   50: 'FIFTY',
   100: 'CENTURY',
   150: '150 RUNS',
@@ -1349,11 +1349,27 @@ async function canConfigurePgif(ctx) {
 bot.command('pgif', async (ctx) => {
   try {
     const parts = String(ctx.message?.text || '').trim().split(/\s+/);
-    const rawKey = String(parts[1] || '').toLowerCase();
+    let rawKey = String(parts[1] || '').toLowerCase();
+    // /pgif remove <key>  or  /pgif rm <key>
+    if (rawKey === 'remove' || rawKey === 'rm' || rawKey === 'delete' || rawKey === 'del') {
+      if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only a group admin or bot owner can remove GIFs.');
+      const rk = String(parts[2] || '').toLowerCase();
+      const key = PGIF_ALIASES[rk] || rk;
+      if (!rk || !PGIF_KEYS.has(key))
+        return ctx.reply('Usage: `/pgif remove <key>`\nExample: `/pgif remove 50`\nSee keys: /giflist', { parse_mode: 'Markdown' });
+      const leg = PGIF_LEGACY[key];
+      const { rowCount } = await q(
+        `DELETE FROM public.pgif_settings WHERE result_key = $1 OR result_key = $2`,
+        [key, leg || key]
+      );
+      if (!rowCount) return ctx.reply(`❌ No GIF saved for *${key}*`, { parse_mode: 'Markdown' });
+      const label = PGIF_LABELS[key] || key;
+      return ctx.reply(`🗑️ Removed GIF for *${mdEsc(label)}* (\`${key}\`)`, { parse_mode: 'Markdown' });
+    }
     const key = PGIF_ALIASES[rawKey] || rawKey;
     if (!PGIF_KEYS.has(key))
       return ctx.reply(
-        'Reply to a GIF with:\n/pgif 0 (or /pgif dot) … /pgif 6 · /pgif out · /pgif duck · /pgif dugout (duck out)\n/pgif stance · /pgif runup · /pgif batentry · /pgif bowlentry\n/pgif starter (or fielding) · /pgif opener · /pgif toss\n/pgif 50 · /pgif 100 · /pgif 150 · /pgif 200 · /pgif 3w · /pgif 5w (or 5fer) · /pgif hatrick · /pgif motm'
+        'Reply to a GIF with:\n/pgif 0 (or /pgif dot) … /pgif 6 · /pgif out · /pgif dugout (duck out)\n/pgif stance · /pgif runup · /pgif batentry · /pgif bowlentry\n/pgif starter · /pgif opener · /pgif toss\n/pgif 50 · /pgif 100 · /pgif 150 · /pgif 200 · /pgif 3w · /pgif 5w · /pgif hatrick · /pgif motm\n\nRemove: /pgif remove <key>  or  /rmgif <key>'
       );
     if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only a group admin or the owner configured in BOT_OWNER_ID / ADMIN_IDS can set GIFs.');
 
@@ -1459,7 +1475,7 @@ async function sendMotmGif(telegram, chatId, motmPlayer) {
 // Ordered list for /giflist and /showgif
 const PGIF_LIST_ORDER = [
   '0', '1', '2', '3', '4', '5', '6',
-  'out', 'duck', 'dugout',
+  'out', 'dugout',
   'stance', 'runup', 'batentry', 'bowlentry',
   'starter', 'opener', 'toss',
   '50', '100', '150', '200',
@@ -1470,10 +1486,12 @@ bot.command('giflist', async (ctx) => {
   try {
     const { rows } = await q(`SELECT result_key FROM public.pgif_settings`);
     const have = new Set(rows.map((r) => String(r.result_key)));
-    // also count legacy keys
+    // also count legacy keys (and reverse: old duck row counts as dugout)
     for (const [k, leg] of Object.entries(PGIF_LEGACY)) {
       if (have.has(leg)) have.add(k);
+      if (have.has(k)) have.add(leg);
     }
+    if (have.has('duck')) have.add('dugout');
     let ok = 0;
     const lines = [];
     for (const key of PGIF_LIST_ORDER) {
@@ -1489,10 +1507,34 @@ bot.command('giflist', async (ctx) => {
       `<blockquote>${ok}/${total} configured</blockquote>\n` +
       lines.join('\n') +
       `\n\nSet missing ones: reply to a GIF with <code>/pgif &lt;key&gt;</code>\n` +
-      `Admin: <code>/showgif</code> to preview all saved GIFs`;
+      `Admin: <code>/showgif</code> preview · <code>/rmgif &lt;key&gt;</code> remove`;
     await ctx.reply(html, { parse_mode: 'HTML' });
   } catch (e) {
     console.error('giflist', e);
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
+
+bot.command(['rmgif', 'ungif', 'delgif'], async (ctx) => {
+  try {
+    if (!(await canConfigurePgif(ctx)))
+      return ctx.reply('❌ Only group admin / bot owner can remove GIFs.');
+    const parts = String(ctx.message?.text || '').trim().split(/\s+/);
+    const rk = String(parts[1] || '').toLowerCase();
+    const key = PGIF_ALIASES[rk] || rk;
+    if (!rk || !PGIF_KEYS.has(key))
+      return ctx.reply('Usage: `/rmgif <key>`\nExample: `/rmgif 50`\nSee all keys: /giflist', { parse_mode: 'Markdown' });
+    const leg = PGIF_LEGACY[key];
+    const { rowCount } = await q(
+      `DELETE FROM public.pgif_settings WHERE result_key = $1 OR result_key = $2`,
+      [key, leg || key]
+    );
+    if (!rowCount) return ctx.reply(`❌ No GIF saved for *${key}*`, { parse_mode: 'Markdown' });
+    const label = PGIF_LABELS[key] || key;
+    return ctx.reply(`🗑️ Removed GIF for *${mdEsc(label)}* (\`${key}\`)`, { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error('rmgif', e);
     await ctx.reply('❌ ' + e.message);
   }
 });
@@ -1590,6 +1632,7 @@ bot.command('help', async (ctx) => {
       `*GIF setup (reply to a GIF):*\n` +
       `/giflist — which event GIFs are set (✅/❌)\n` +
       `/showgif — admin: preview every saved GIF\n` +
+      `/rmgif <key> — admin: remove a saved GIF\n` +
       `/pgif 0 … /pgif 6 · /pgif out · /pgif dugout (duck out)\n/pgif duck · /pgif stance (batsman batting) · /pgif runup (bowler bowling)\n/pgif batentry · /pgif bowlentry · /pgif starter (fielding) · /pgif opener · /pgif toss\n/pgif 50 · /pgif 100 · /pgif 150 · /pgif 200 · /pgif 3w · /pgif 5w (or 5fer) · /pgif hatrick · /pgif motm`,
     { parse_mode: 'Markdown' }
   );
@@ -4608,8 +4651,8 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
       );
     }
     if (afterRuns === 0) {
-      gifKeys.push('duck');
-      notes.push(`🦆 <b>DUCK!</b> ${disp(strikerP)} is out for 0.`);
+      gifKeys.push('dugout');
+      notes.push(`🦆 <b>DUCK OUT!</b> ${disp(strikerP)} is out for 0.`);
     }
     gifKeys.push('out');
   } else {
@@ -4684,11 +4727,7 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
     reply_to_message_id: Number(batMsgId) || undefined,
   });
 
-  if (isWicket && afterRuns === 0) {
-    // dugout GIF only on duck (out for 0)
-    const outP = await getPlayer(strikerId);
-    if (outP) await sendResultGif(telegram, groupId, 'dugout', undefined, dugoutCaption(outP));
-  }
+  // dugout/duck-out GIF is already in gifKeys when out for 0 (single send)
 
   await progressAfterBall(telegram, m, inn2, isWicket);
 }
