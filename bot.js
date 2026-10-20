@@ -14,6 +14,8 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const { Pool } = require('pg');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -28,7 +30,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r22-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r28-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -220,7 +222,7 @@ const MIN_TEAM_PLAYERS = 2; // striker + non-striker
 const MAX_BOWLER_OVERS = 4;
 const LOBBY_SECONDS = 60; // solo lobby timer
 const TEAM_JOIN_SECONDS = 45; // team lobby join window
-const TEAM_JOIN_WARN_LAST = 10; // warn when this many seconds left
+const TEAM_JOIN_WARN_LAST = 10; // send warning this many seconds before end
 const MAX_SOLO_PLAYERS = 100; // effectively unlimited
 
 // ── Discipline rules ──
@@ -458,7 +460,6 @@ try {
 } catch (e) {
   console.error('sharp is not installed - image cards disabled (run: npm i sharp)');
 }
-const path = require('path');
 const https = require('https');
 
 const ASSET_DIR = path.join(__dirname, 'assets');
@@ -2341,7 +2342,7 @@ bot.command('extend30', async (ctx) => {
 // ─── TEAM ────────────────────────────────────────────────
 // /team (no match running) or /startteam [maxTeamSize] → team lobby with host banner
 
-// ─── Team join phase (45s + last-10s warning) ────────────
+// ─── Team join phase: Team A 45s → Team B 45s → team list ───
 function clearTeamJoinTimer(matchId) {
   const t = teamJoinTimers.get(mkey(matchId));
   if (!t) return;
@@ -2351,19 +2352,26 @@ function clearTeamJoinTimer(matchId) {
 }
 
 async function startTeamJoinPhase(telegram, matchId, chatId) {
+  // Step 1/2: Team A only
+  await runTeamJoinWindow(telegram, matchId, chatId, 'A');
+}
+
+async function runTeamJoinWindow(telegram, matchId, chatId, label) {
   clearTeamJoinTimer(matchId);
-  const endsAt = Date.now() + TEAM_JOIN_SECONDS * 1000;
+  const m0 = await getMatch(matchId);
+  if (!m0 || m0.status !== 'waiting' || m0.mode === 'solo') return;
+
+  const cmd = label === 'A' ? '/team\\_a' : '/team\\_b';
   const warnAt = Math.max(0, (TEAM_JOIN_SECONDS - TEAM_JOIN_WARN_LAST) * 1000);
 
+  // Clean prompt — no "warning coming" text (warning is still sent at T-10s)
   await telegram.sendMessage(
     chatId,
-    `📌 *JOIN TEAMS* — *${TEAM_JOIN_SECONDS}s*\n` +
+    `📌 *JOIN TEAM ${label}*\n` +
       `${line()}\n` +
-      `> Tap /team\\_a to join *Team A*\n` +
-      `> Tap /team\\_b to join *Team B*\n\n` +
+      `> Tap ${cmd} to join *Team ${label}*\n\n` +
       `⏱ Timer: *${TEAM_JOIN_SECONDS} seconds*\n` +
-      `⚠️ Warning in the last *${TEAM_JOIN_WARN_LAST}s*\n\n` +
-      `Host can still /add\\_a /add\\_b · /startgame when ready`,
+      `Host: /add\\_${label.toLowerCase()} bhi use kar sakta hai`,
     { parse_mode: 'Markdown' }
   );
 
@@ -2371,13 +2379,12 @@ async function startTeamJoinPhase(telegram, matchId, chatId) {
     try {
       const m = await getMatch(matchId);
       if (!m || m.status !== 'waiting') return;
-      const a = await getPlayers(matchId, 'A');
-      const b = await getPlayers(matchId, 'B');
+      const pl = await getPlayers(matchId, label);
       await telegram.sendMessage(
         chatId,
-        `⚠️ *${TEAM_JOIN_WARN_LAST}s LEFT TO JOIN!*\n` +
-          `> Team A: *${a.length}* · Team B: *${b.length}*\n` +
-          `> Quick: /team\\_a or /team\\_b`,
+        `⚠️ *${TEAM_JOIN_WARN_LAST}s LEFT — Team ${label}!*\n` +
+          `> Team ${label}: *${pl.length}* player${pl.length === 1 ? '' : 's'}\n` +
+          `> Jaldi: ${cmd}`,
         { parse_mode: 'Markdown' }
       );
     } catch (e) {
@@ -2386,10 +2393,33 @@ async function startTeamJoinPhase(telegram, matchId, chatId) {
   }, warnAt);
 
   const timer = setTimeout(() => {
-    endTeamJoinPhase(telegram, matchId, chatId).catch((e) => console.error('endTeamJoinPhase:', e.message));
+    onTeamJoinWindowEnd(telegram, matchId, chatId, label).catch((e) =>
+      console.error('onTeamJoinWindowEnd:', e.message)
+    );
   }, TEAM_JOIN_SECONDS * 1000);
 
-  teamJoinTimers.set(mkey(matchId), { timer, warnTimer, endsAt, chatId });
+  teamJoinTimers.set(mkey(matchId), { timer, warnTimer, chatId, label });
+}
+
+async function onTeamJoinWindowEnd(telegram, matchId, chatId, label) {
+  clearTeamJoinTimer(matchId);
+  const m = await getMatch(matchId);
+  if (!m || m.status !== 'waiting' || m.mode === 'solo') return;
+
+  const pl = await getPlayers(matchId, label);
+  let summary = `✅ *Team ${label} window closed*\n> Players: *${pl.length}*\n`;
+  for (const p of pl) summary += `  ${p.roster_position}. ${mn(p)}\n`;
+  if (!pl.length) summary += `  _(empty)_\n`;
+  await telegram.sendMessage(chatId, summary, { parse_mode: 'Markdown' });
+
+  if (label === 'A') {
+    // Step 2/2: Team B
+    await runTeamJoinWindow(telegram, matchId, chatId, 'B');
+    return;
+  }
+
+  // Both windows done → full team list
+  await endTeamJoinPhase(telegram, matchId, chatId);
 }
 
 async function endTeamJoinPhase(telegram, matchId, chatId) {
@@ -2400,7 +2430,7 @@ async function endTeamJoinPhase(telegram, matchId, chatId) {
   const a = await getPlayers(matchId, 'A');
   const b = await getPlayers(matchId, 'B');
   let list =
-    `📋 *TEAM LIST* (join window closed)\n${line()}\n` +
+    `📋 *TEAM LIST*\n${line()}\n` +
     `🅰 *Team A* (${a.length})\n`;
   for (const p of a) list += `  ${p.roster_position}. ${mn(p)}\n`;
   if (!a.length) list += `  _(empty)_\n`;
@@ -2408,22 +2438,24 @@ async function endTeamJoinPhase(telegram, matchId, chatId) {
   for (const p of b) list += `  ${p.roster_position}. ${mn(p)}\n`;
   if (!b.length) list += `  _(empty)_\n`;
   list +=
-    `\n> You can still join with /team\\_a /team\\_b until the host starts.\n` +
-    `> Host/captains: /add\\_a /add\\_b\n\n` +
-    `👑 Next: host runs /startgame → choose captains → toss`;
+    `\n> Still join: /team\\_a · /team\\_b (until host starts)\n` +
+    `> Host: /add\\_a /add\\_b`;
 
   await telegram.sendMessage(chatId, list, { parse_mode: 'Markdown' });
 
-  // Soft nudge: if both teams have enough players, remind host
-  if (a.length >= MIN_TEAM_PLAYERS && b.length >= MIN_TEAM_PLAYERS) {
-    await telegram.sendMessage(
-      chatId,
-      `✅ Both teams ready.\n👑 Host: /startgame to pick captains & start the toss.`,
-      { parse_mode: 'Markdown' }
-    );
+  // Always tag the host to start the game
+  const hostId = Number(m.host_telegram_id);
+  const hostTag = `[Host](tg://user?id=${hostId})`;
+  let hostMsg =
+    `👑 ${hostTag} — join timer over.\n` +
+    `> Send /startgame to choose captains and start the toss.`;
+  if (a.length < MIN_TEAM_PLAYERS || b.length < MIN_TEAM_PLAYERS) {
+    hostMsg +=
+      `\n\n⚠️ Need at least *${MIN_TEAM_PLAYERS}* per team ` +
+      `(A: ${a.length}, B: ${b.length}). Add players first.`;
   }
+  await telegram.sendMessage(chatId, hostMsg, { parse_mode: 'Markdown' });
 }
-
 
 async function createTeamMatch(ctx) {
   if (!isGroup(ctx)) return ctx.reply('❌ Use this command in a group');
@@ -4045,11 +4077,26 @@ bot.hears(/^[0-6]$/, async (ctx) => {
           .catch(() => {});
       }
     } catch (_) {}
-    await resolveBall(ctx.telegram, m, inn, pend, num, ctx.message.message_id);
+    try {
+      await resolveBall(ctx.telegram, m, inn, pend, num, ctx.message.message_id);
+    } catch (e) {
+      // Re-open the ball so the batsman can try again (e.g. after DB constraint fix / restart)
+      try {
+        await q(
+          `UPDATE pending_balls SET is_resolved=FALSE WHERE callback_token=$1 AND bowl_number IS NOT NULL`,
+          [pend.callback_token]
+        );
+      } catch (_) {}
+      throw e;
+    }
   } catch (e) {
     console.error('ball resolve error:', e);
     try {
-      await ctx.reply('⚠️ Could not resolve that ball. Try again or host: /endmatch.\n' + String(e.message || e).slice(0, 120));
+      await ctx.reply(
+        '⚠️ Could not resolve that ball. Send *0–6* again.\n' +
+          String(e.message || e).slice(0, 120),
+        { parse_mode: 'Markdown' }
+      );
     } catch (_) {}
     try {
       const m2 = await getActiveMatch(ctx.chat.id);
@@ -4268,25 +4315,35 @@ async function buildMatchDataText(matchId) {
 
 async function sendMatchDataFile(telegram, chatId, matchId) {
   try {
+    const fsys = require('fs');
+    const pathMod = require('path');
     const text = await buildMatchDataText(matchId);
-    const dir = path.join('/tmp', 'cricmonster');
+    const dir = pathMod.join('/tmp', 'cricmonster');
     try {
-      fs.mkdirSync(dir, { recursive: true });
+      fsys.mkdirSync(dir, { recursive: true });
     } catch (_) {}
-    const filePath = path.join(dir, `match_${matchId}_${Date.now()}.txt`);
-    fs.writeFileSync(filePath, text, 'utf8');
+    const filePath = pathMod.join(dir, `match_${matchId}_${Date.now()}.txt`);
+    fsys.writeFileSync(filePath, text, 'utf8');
     await telegram.sendDocument(
       chatId,
       { source: filePath, filename: `CricMonster_Match_${matchId}.txt` },
       { caption: '📄 Full match data' }
     );
     try {
-      fs.unlinkSync(filePath);
+      fsys.unlinkSync(filePath);
     } catch (_) {}
   } catch (e) {
     console.error('sendMatchDataFile:', e.message);
     try {
-      await telegram.sendMessage(chatId, '⚠️ Could not attach match data file: ' + String(e.message || e).slice(0, 120));
+      // Fallback: send as text chunks if file send fails
+      const text = await buildMatchDataText(matchId).catch(() => null);
+      if (text) {
+        await sendLong(telegram, chatId, '📄 *MATCH DATA*\n```\n' + text.slice(0, 3500) + '\n```', {
+          parse_mode: 'Markdown',
+        });
+      } else {
+        await telegram.sendMessage(chatId, '⚠️ Could not attach match data file: ' + String(e.message || e).slice(0, 120));
+      }
     } catch (_) {}
   }
 }
@@ -5225,24 +5282,58 @@ async function rearmAfterRestart() {
   }
 }
 
-// Time penalties can push scores below zero. If the database has CHECK (runs >= 0) style
-// constraints on these columns, drop them once at startup (otherwise the penalty UPDATE would fail).
+// Time penalties can push scores below zero. Also bat_number must allow 0 (dot ball).
+// Drop bad CHECKs at startup and install correct ranges.
 async function relaxNegativeRunConstraints() {
   try {
     const { rows } = await q(
       `SELECT c.conname, c.conrelid::regclass::text AS tbl, pg_get_constraintdef(c.oid) AS def
          FROM pg_constraint c
         WHERE c.contype='c'
-          AND c.conrelid::regclass::text IN ('innings','batting_stats','public.innings','public.batting_stats')`
+          AND (
+            c.conrelid::regclass::text IN (
+              'innings','batting_stats','deliveries',
+              'public.innings','public.batting_stats','public.deliveries'
+            )
+            OR c.conname ILIKE '%bat_number%'
+            OR c.conname ILIKE '%bowl_number%'
+            OR c.conname ILIKE '%runs%'
+          )`
     );
     for (const r of rows) {
-      if (/\b(total_runs|runs)\b\s*>=\s*0|\b(total_runs|runs)\b\s*>\s*-1/i.test(r.def)) {
-        await q(`ALTER TABLE ${r.tbl} DROP CONSTRAINT "${r.conname}"`);
-        console.log(`Dropped constraint ${r.conname} on ${r.tbl} (negative runs are needed for time penalties)`);
+      const def = String(r.def || '');
+      const drop =
+        /\b(total_runs|runs)\b\s*>=\s*0|\b(total_runs|runs)\b\s*>\s*-1/i.test(def) ||
+        /bat_number/i.test(def) ||
+        /bowl_number/i.test(def) ||
+        /deliveries_bat_number_check/i.test(r.conname) ||
+        /deliveries_bowl_number_check/i.test(r.conname);
+      if (drop) {
+        try {
+          await q(`ALTER TABLE ${r.tbl} DROP CONSTRAINT IF EXISTS "${r.conname}"`);
+          console.log(`Dropped constraint ${r.conname} on ${r.tbl}`);
+        } catch (e2) {
+          console.error(`drop ${r.conname}:`, e2.message);
+        }
       }
     }
   } catch (e) {
     console.error('constraint check skipped:', e.message);
+  }
+
+  // Correct ranges: batsman 0–6 (0 = dot), bowler 1–6
+  try {
+    await q(`ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_bat_number_check`);
+    await q(`ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_bowl_number_check`);
+    await q(
+      `ALTER TABLE deliveries ADD CONSTRAINT deliveries_bat_number_check CHECK (bat_number >= 0 AND bat_number <= 6)`
+    );
+    await q(
+      `ALTER TABLE deliveries ADD CONSTRAINT deliveries_bowl_number_check CHECK (bowl_number IS NULL OR (bowl_number >= 1 AND bowl_number <= 6))`
+    );
+    console.log('deliveries bat/bowl number checks set (bat 0–6, bowl 1–6)');
+  } catch (e) {
+    console.error('deliveries check install:', e.message);
   }
 }
 
