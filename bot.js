@@ -28,7 +28,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r18-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r19-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -4920,31 +4920,6 @@ async function relaxNegativeRunConstraints() {
   }
 }
 
-// ─── Launch ──────────────────────────────────────────────
-async function main() {
-  await q('SELECT 1');
-  await q('ALTER TABLE pending_balls ADD COLUMN IF NOT EXISTS batting_message_id BIGINT');
-  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS setup_phase TEXT');
-  await q('ALTER TABLE match_teams ADD COLUMN IF NOT EXISTS penalty_runs INTEGER NOT NULL DEFAULT 0');
-  await q('ALTER TABLE pending_balls ADD COLUMN IF NOT EXISTS bowl_number INTEGER');
-  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS spam_free BOOLEAN');
-  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS penalty_log TEXT');
-  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS toss_caller TEXT');
-  await q(`CREATE TABLE IF NOT EXISTS pgif_settings (
-    result_key TEXT PRIMARY KEY,
-    file_id TEXT NOT NULL,
-    media_type TEXT NOT NULL DEFAULT 'animation',
-    updated_by TEXT,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )`);
-  await relaxNegativeRunConstraints();
-  console.log('DB OK');
-  await rearmAfterRestart();
-  const me = await bot.telegram.getMe();
-  BOT_USERNAME = me.username;
-  console.log(`Bot @${me.username}`);
-  await bot.launch();
-  
 // ═════════════════ STUCK GAME WATCHDOG ═════════════════
 // If a live match has no ball progress for STUCK_MINUTES, auto-cancel so the GC can start a new game.
 async function lastMatchActivity(matchId) {
@@ -5014,6 +4989,33 @@ async function stuckGamesTick() {
 setInterval(() => stuckGamesTick().catch(() => {}), STUCK_CHECK_MS);
 
 
+
+// ─── Launch ──────────────────────────────────────────────
+async function main() {
+  await q('SELECT 1');
+  await q('ALTER TABLE pending_balls ADD COLUMN IF NOT EXISTS batting_message_id BIGINT');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS setup_phase TEXT');
+  await q('ALTER TABLE match_teams ADD COLUMN IF NOT EXISTS penalty_runs INTEGER NOT NULL DEFAULT 0');
+  await q('ALTER TABLE pending_balls ADD COLUMN IF NOT EXISTS bowl_number INTEGER');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS spam_free BOOLEAN');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS penalty_log TEXT');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS toss_caller TEXT');
+  await q('ALTER TABLE match_players ADD COLUMN IF NOT EXISTS last_name TEXT');
+  await q(`CREATE TABLE IF NOT EXISTS pgif_settings (
+    result_key TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    media_type TEXT NOT NULL DEFAULT 'animation',
+    updated_by TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await relaxNegativeRunConstraints();
+  console.log('DB OK');
+  await rearmAfterRestart();
+  const me = await bot.telegram.getMe();
+  BOT_USERNAME = me.username;
+  console.log(`Bot @${me.username}`);
+  await bot.launch();
+  
 console.log(`Running… (version ${BOT_VERSION})`);
   try {
     const rep = await assetReport();
