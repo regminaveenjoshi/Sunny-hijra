@@ -30,7 +30,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r31-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r32-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -3556,22 +3556,29 @@ async function applyPlayerPenalty(inn, player) {
 // Solo: automatic bowling change (next player in join order who is not the batsman)
 async function soloRotateBowler(m, inn) {
   const all = await getPlayers(m.id, 'A');
-  const idx = all.findIndex((p) => p.id === inn.current_bowler_id);
+  if (!all.length) return null;
+  const fromId = inn.current_bowler_id || inn.last_bowler_id;
+  const idx = all.findIndex((p) => p.id === fromId);
   let chosen = null;
   for (let k = 1; k <= all.length; k++) {
-    const cand = all[(idx + k + all.length) % all.length];
-    if (cand.id !== inn.striker_player_id && cand.id !== inn.current_bowler_id) {
+    const cand = all[(Math.max(idx, 0) + k) % all.length];
+    if (cand.id !== inn.striker_player_id && cand.id !== fromId) {
       chosen = cand;
       break;
     }
   }
+  if (!chosen) chosen = all.find((p) => p.id !== inn.striker_player_id) || all[0];
   if (!chosen) return null;
   await q(
     `INSERT INTO bowling_stats (innings_id, player_id) VALUES ($1,$2)
      ON CONFLICT (innings_id, player_id) DO NOTHING`,
     [inn.id, chosen.id]
   );
-  await q(`UPDATE innings SET current_bowler_id=$2 WHERE id=$1`, [inn.id, chosen.id]);
+  await q(`UPDATE innings SET current_bowler_id=$2, last_bowler_id=COALESCE($3, last_bowler_id) WHERE id=$1`, [
+    inn.id,
+    chosen.id,
+    fromId || null,
+  ]);
   return chosen;
 }
 
@@ -4548,6 +4555,23 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
       const ovSum = await overSummary(m.id, inn2);
       await telegram.sendMessage(groupId, `🔔 *Over complete!*\n${ovSum}`, { parse_mode: 'Markdown' });
     }
+
+    // Solo: new bowler every 3 balls
+    if (isSolo && !inn2.current_bowler_id && inn2.striker_player_id) {
+      const bw = await soloRotateBowler(m, inn2);
+      if (bw) {
+        showBoard = true;
+        inn2 = (await q(`SELECT * FROM innings WHERE id=$1`, [inn2.id])).rows[0] || inn2;
+        await telegram.sendMessage(
+          groupId,
+          `🎳 *New bowler* (every 3 balls): *${mn(bw)}*`,
+          { parse_mode: 'Markdown' }
+        );
+        try {
+          await sendResultGif(telegram, groupId, 'bowlentry', undefined, newBowlerCaption(bw));
+        } catch (_) {}
+      }
+    }
   }
 
   if (matchFinished) {
@@ -5076,10 +5100,15 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
         newNon = tmp;
       }
 
-      // Solo: keep same bowler always; team: clear on over end
+      // Solo: new bowler every 3 balls; team: clear on over end
       let currentBowler = bowlerId;
       let lastBowler = inn.last_bowler_id || bowlerId;
-      if (!isSolo) {
+      if (isSolo) {
+        if (newBalls % 3 === 0) {
+          currentBowler = null; // progressAfterBall will pick next bowler
+          lastBowler = bowlerId;
+        }
+      } else {
         currentBowler = endOver ? null : bowlerId;
         lastBowler = endOver ? bowlerId : lastBowler;
       }
@@ -5242,8 +5271,9 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
       console.error('partnership check', e.message);
     }
   }
+  // Only batsman number is shown publicly — bowler's number stays hidden
   const html =
-    `${head}  ·  <b>${batNum}/${bowlNum}</b>\n` +
+    `${head}  ·  <b>${batNum}</b>\n` +
     `<blockquote>🎙️ <i>${escapeHtml(cmt)}</i></blockquote>` +
     (notes.length ? `\n${notes.join('\n')}` : '');
   try {
