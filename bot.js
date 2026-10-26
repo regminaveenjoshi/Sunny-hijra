@@ -7,8 +7,9 @@
  *        -> captain buttons -> toss -> bat/bowl choice -> host /setovers (1-20)
  *        -> /bat /bowl (captains) -> type 0-6
  *
- * Cards (host banner + final stats image) need the ./assets folder next to this file
- * and the `sharp` package. If sharp/assets are missing the bot falls back to text.
+ * Cards need the ./assets folder next to this file and the `sharp` package:
+ *   host.jpg (solo host) · solo_final.jpg (Man of the Match) · team_final.jpg · team_banner.jpg · players_list.jpg
+ * If sharp/assets are missing the bot falls back to text.
  */
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
@@ -30,7 +31,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r32-2026-10-20'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r34-2026-10-26'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -479,52 +480,63 @@ function cleanName(s, fallback = 'Player') {
   return c || fallback;
 }
 
-// ---- Layout (pixel coordinates measured on the template images) ----
+// ---- Layout (pixel coordinates measured on the template images in ./assets) ----
+// host.jpg (1280x640) - SOLO ONLY: DP goes in the big circle, host name pill sits on the lower part of the DP
 const HOST_LAYOUT = {
-  file: 'host.png',
-  circle: { cx: 1327, cy: 363, r: 198 },
-  bar: { x0: 1085, x1: 1560, cy: 665, px: 58 },
+  file: 'host.jpg',
+  circle: { cx: 997, cy: 315, r: 219 },
+  pill: { cx: 997, cy: 440, h: 56, maxW: 296 },
 };
 
-const TEAM_LAYOUT = {
-  file: 'team_final.png',
-  // team A rows are at dy = 0, team B rows at dy = TEAM_ROW_DY
-  rowDy: { A: 0, B: 508 },
+// solo_final.jpg (1280x934) - MAN OF THE MATCH card (the "PLAYER NAME" text is already erased from the file)
+const MOTM_LAYOUT = {
+  file: 'solo_final.jpg',
+  circle: { cx: 650.5, cy: 445, r: 97 },
+  name: { cx: 650, cy: 644, maxW: 250, px: 32, color: '#2b1700' },
+  top: { cy: 753, xs: [236.5, 442, 644, 844.5, 1047.5], w: 138 }, // RUNS BALLS 4s 6s STRIKE RATE
+  bot: { cy: 874, xs: [442, 644, 844.5], w: 138 }, // WICKETS BALLS ECONOMY
+  px: 28,
+};
+
+// team_final.jpg (853x1280) - team result card
+const TEAMFIN_LAYOUT = {
+  file: 'team_final.jpg',
+  top: { cy: 71, px: 24, date: { cx: 190, w: 200 }, time: { cx: 428, w: 190 }, gc: { cx: 664, w: 205 } },
+  bar: { A: { cx: 430, cy: 311 }, B: { cx: 427, cy: 841 }, w: 360, px: 27 },
+  rowDy: { A: 0, B: 532 },
+  clipAboveY: null, // DP circles are placed fully above the name bars (never cut)
   bat: {
-    circle: { cx: 239.5, cy: 574, r: 62 },
-    barText: { x0: 180, x1: 346, cy: 640, px: 26 },
-    boxes: [
-      { x0: 52, x1: 174, y0: 718, y1: 780 },
-      { x0: 187, x1: 309, y0: 718, y1: 780 },
-      { x0: 323, x1: 445, y0: 718, y1: 780 },
-    ],
+    circle: { cx: 205, cy: 430, r: 44 },
+    name: { cx: 205, cy: 490, w: 172 },
+    xs: [62, 135, 206, 270, 345], // RUNS BALLS 6s 4s STRIKE RATE
+    ws: [56, 58, 50, 50, 74],
+    cy: 572,
   },
   bowl: {
-    circle: { cx: 785.3, cy: 574, r: 62 },
-    barText: { x0: 723, x1: 889, cy: 640, px: 26 },
-    boxes: [
-      { x0: 584, x1: 705, y0: 718, y1: 780 },
-      { x0: 719, x1: 841, y0: 718, y1: 780 },
-      { x0: 854, x1: 976, y0: 718, y1: 780 },
-    ],
+    circle: { cx: 649, cy: 430, r: 44 },
+    name: { cx: 650, cy: 490, w: 172 },
+    xs: [532, 655, 772], // WICKETS BALLS ECONOMY
+    ws: [96, 96, 96],
+    cy: 572,
   },
-  clipAboveY: 617, // bar top outline (team A row) - DP must not cover the bar
-  boxPx: 36,
+  motm: { circle: { cx: 425, cy: 719, r: 48 }, name: { cx: 426, cy: 788, w: 230 }, clipAboveY: null },
+  winner: { cx: 430, cy: 1237, w: 330, px: 34 },
+  namePx: 22,
+  valPx: 24,
 };
 
-const SOLO_LAYOUT = {
-  file: 'solo_final.png',
-  rowDy: { bat: 0, bowl: 496 },
-  circle: { cx: 355.5, cy: 631, r: 80 },
-  barText: { x0: 262, x1: 498, cy: 712, px: 34 },
-  boxes: [
-    { x0: 127, x1: 358, y0: 802, y1: 869 },
-    { x0: 396, x1: 631, y0: 802, y1: 869 },
-    { x0: 668, x1: 900, y0: 802, y1: 869 },
-  ],
-  clipAboveY: 684,
-  boxPx: 46,
+// team_banner.jpg (1280x934) - TEAM A vs TEAM B (host + both captains)
+const BANNER_LAYOUT = {
+  file: 'team_banner.jpg',
+  host: { cx: 640.5, cy: 451.5, r: 67 },
+  A: { cx: 291, cy: 596, r: 135 },
+  B: { cx: 989.5, cy: 595, r: 135 },
+  nameHost: { cx: 640, cy: 623, w: 270, px: 26 },
+  nameA: { cx: 292, cy: 872, w: 340, px: 34 },
+  nameB: { cx: 990, cy: 872, w: 340, px: 34 },
 };
+
+const PLAYERS_LIST_FILE = 'players_list.jpg'; // 1280x640 "PLAYERS LIST - Let's Begin" banner (used as is)
 
 // ---- Text helpers ----
 function needSharp() {
@@ -542,15 +554,15 @@ async function renderText(text, px, color = '#ffffff') {
 }
 
 // Draw only as many characters as fit in maxW (no shrinking, no "...")
-async function textTruncated(text, px, maxW) {
+async function textTruncated(text, px, maxW, color = '#ffffff') {
   let t = String(text);
-  let img = await renderText(t, px);
+  let img = await renderText(t, px, color);
   if (img.info.width > maxW) {
     t = t.slice(0, Math.max(1, Math.floor((t.length * maxW) / img.info.width)));
-    img = await renderText(t, px);
+    img = await renderText(t, px, color);
     while (img.info.width > maxW && t.length > 1) {
       t = t.slice(0, -1);
-      img = await renderText(t, px);
+      img = await renderText(t, px, color);
     }
   }
   return img;
@@ -613,7 +625,7 @@ async function circleImage(dpBuf, d) {
   );
   try {
     return await sharp(dpBuf)
-      .resize(d, d, { fit: 'cover', position: 'centre' })
+      .resize(d, d, { fit: 'cover', position: 'attention' })
       .ensureAlpha()
       .composite([{ input: mask, blend: 'dest-in' }])
       .png()
@@ -638,239 +650,132 @@ async function dpLayer(dpBuf, c, dy = 0, clipY = null) {
 
 const fmt1 = (n) => (Number.isFinite(n) ? n.toFixed(2) : '0.00');
 
-// ═══ HOST BANNER ═══
-async function renderHostCardTemplate({ dp, username, firstName }) {
+// Shrink the font until the text fits maxW (then cut characters if still too wide)
+async function fitText(text, px, maxW, color = '#ffffff', minPx = 16) {
+  let size = px;
+  let img = await renderText(text, size, color);
+  while (img.info.width > maxW && size > minPx) {
+    size -= 2;
+    img = await renderText(text, size, color);
+  }
+  if (img.info.width > maxW) img = await textTruncated(text, size, maxW, color);
+  return img;
+}
+
+// text layer centred on (cx, cy)
+async function putCentered(layers, text, px, cx, cy, maxW, color = '#ffffff') {
+  if (text === undefined || text === null || text === '') return;
+  const img = await fitText(String(text), px, maxW, color);
+  layers.push(centered(img, cx, cy, 1));
+}
+
+// IST by default; set CARD_TZ (e.g. 'Asia/Dhaka') to change
+function cardDateTime(d = new Date()) {
+  const tz = process.env.CARD_TZ || 'Asia/Kolkata';
+  const date = new Intl.DateTimeFormat('en-GB', { timeZone: tz, day: '2-digit', month: 'short', year: 'numeric' }).format(d);
+  const time = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: true }).format(d);
+  return { date, time };
+}
+
+// ═══ HOST BANNER (SOLO only) ═══
+async function renderHostCard({ dp, username, firstName }) {
   needSharp();
   const L = HOST_LAYOUT;
   const label = username ? `@${cleanName(username, '')}` : cleanName(firstName);
   const layers = [await dpLayer(dp, L.circle)];
-  const txt = await textTruncated(label, L.bar.px, L.bar.x1 - L.bar.x0);
-  layers.push(centered(txt, (L.bar.x0 + L.bar.x1) / 2, L.bar.cy, 1));
+  const txt = await fitText(label, 40, L.pill.maxW - 56, '#ffe9a8', 20);
+  const w = Math.min(L.pill.maxW, Math.max(180, txt.info.width + 56));
+  const pill = Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${L.pill.h}">
+       <rect x="2" y="2" rx="${L.pill.h / 2 - 2}" ry="${L.pill.h / 2 - 2}" width="${w - 4}" height="${L.pill.h - 4}" fill="#000" fill-opacity="0.72" stroke="#d9b45a" stroke-width="3"/>
+     </svg>`
+  );
+  layers.push({ input: pill, left: Math.round(L.pill.cx - w / 2), top: Math.round(L.pill.cy - L.pill.h / 2) });
+  layers.push(centered(txt, L.pill.cx, L.pill.cy, 1));
   return sharp(path.join(ASSET_DIR, L.file)).composite(layers).jpeg({ quality: 90 }).toBuffer();
 }
 
-// Used automatically when assets/host.png is missing or is not a valid image
-async function renderHostCardGenerated({ dp, username, firstName }) {
-  const W = 1280, H = 790;
-  const headerH = Math.round((300 * W) / 1024);
-  const bg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">
-    <defs>
-      <radialGradient id="c" cx="55%" cy="75%" r="75%"><stop offset="0" stop-color="#5a0000"/><stop offset="0.55" stop-color="#1c0000"/><stop offset="1" stop-color="#000"/></radialGradient>
-      <filter id="n"><feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="2" seed="5"/>
-        <feColorMatrix type="matrix" values="0 0 0 0 0.8  0 0 0 0 0  0 0 0 0 0  0 0 0 0.5 0"/></filter>
-    </defs>
-    <rect width="${W}" height="${H}" fill="url(#c)"/><rect width="${W}" height="${H}" filter="url(#n)" opacity="0.22"/>
-  </svg>`);
-  const header = await loadHeader(W, headerH);
-
-  const c = { cx: 960, cy: 545, r: 150 };
-  const layers = header ? [{ input: header, left: 0, top: 0 }] : [];
-  layers.push(await dpLayer(dp, { ...c, r: c.r - 6 }));
-  const overlay = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">
-    <defs><filter id="glow" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="9"/></filter></defs>
-    ${ringSvg(c.cx, c.cy, c.r)}${ribbonSvg(c.cx, c.cy + c.r + 50, 440, 76)}
-  </svg>`);
-  layers.push({ input: overlay, left: 0, top: 0 });
-
-  const host = await renderText('HOST', 230, '#ff2a2a');
-  layers.push({ input: host.data, left: 90, top: 470 });
-  const label = username ? `@${cleanName(username, '')}` : cleanName(firstName);
-  const txt = await textTruncated(label, 40, 360);
-  layers.push({ input: txt.data, left: Math.round(c.cx - txt.info.width / 2), top: Math.round(c.cy + c.r + 50 - txt.info.height / 2 + 1) });
-  return sharp(bg).composite(layers).jpeg({ quality: 90 }).toBuffer();
+// ═══ MAN OF THE MATCH card (solo result) ═══
+// p = { dp, name, runs, balls, fours, sixes, sr, wkts, bballs, eco } (bat or bowl part may be empty)
+async function renderMotmCard(p) {
+  needSharp();
+  const L = MOTM_LAYOUT;
+  const layers = [await dpLayer(p && p.dp, L.circle)];
+  if (p && p.name) await putCentered(layers, cleanName(p.name), L.name.px, L.name.cx, L.name.cy, L.name.maxW, L.name.color);
+  const batted = p && p.balls > 0;
+  const bowled = p && p.bballs > 0;
+  const top = batted ? [p.runs, p.balls, p.fours, p.sixes, fmt1(p.sr)] : ['-', '-', '-', '-', '-'];
+  const bot = bowled ? [p.wkts, p.bballs, fmt1(p.eco)] : ['-', '-', '-'];
+  for (let i = 0; i < 5; i++) await putCentered(layers, String(top[i]), L.px, L.top.xs[i], L.top.cy, L.top.w);
+  for (let i = 0; i < 3; i++) await putCentered(layers, String(bot[i]), L.px, L.bot.xs[i], L.bot.cy, L.bot.w);
+  return sharp(path.join(ASSET_DIR, L.file)).composite(layers).jpeg({ quality: 90 }).toBuffer();
 }
 
-async function renderHostCard(args) {
+// ═══ TEAM FINAL card ═══
+// A / B = { bat: {dp,name,runs,balls,fours,sixes,sr} | null, bowl: {dp,name,wkts,balls,eco} | null }
+// info = { date, time, gc, barA, barB, winner, motm: {dp,name} | null }
+async function renderTeamFinalCard({ A, B, info }) {
   needSharp();
-  try {
-    return await renderHostCardTemplate(args);
-  } catch (e) {
-    console.error('host.png template failed, using the generated host banner:', e.message);
-    return renderHostCardGenerated(args);
-  }
-}
-
-// ═══ TEAM FINAL CARD ═══
-// team = { bat: {dp, name, runs, balls, sr} | null, bowl: {dp, name, wkts, balls, eco} | null }
-async function renderTeamFinalCard({ A, B }) {
-  needSharp();
-  const L = TEAM_LAYOUT;
+  const L = TEAMFIN_LAYOUT;
   const layers = [];
+
+  // date / time / group
+  await putCentered(layers, info.date, L.top.px, L.top.date.cx, L.top.cy, L.top.date.w);
+  await putCentered(layers, info.time, L.top.px, L.top.time.cx, L.top.cy, L.top.time.w);
+  await putCentered(layers, cleanName(info.gc, 'GROUP'), L.top.px, L.top.gc.cx, L.top.cy, L.top.gc.w);
+
+  // team bars (name + score)
+  await putCentered(layers, info.barA, L.bar.px, L.bar.A.cx, L.bar.A.cy, L.bar.w);
+  await putCentered(layers, info.barB, L.bar.px, L.bar.B.cx, L.bar.B.cy, L.bar.w);
+
+  // best batsman / best bowler of each team
   for (const [label, team] of [['A', A], ['B', B]]) {
     const dy = L.rowDy[label];
-    for (const kind of ['bat', 'bowl']) {
-      const slot = L[kind];
-      const p = team && team[kind];
-      layers.push(await dpLayer(p && p.dp, slot.circle, dy, L.clipAboveY));
-      if (p && p.name) {
-        const t = await textTruncated(cleanName(p.name), slot.barText.px, slot.barText.x1 - slot.barText.x0);
-        layers.push({ input: t.data, left: slot.barText.x0, top: Math.round(slot.barText.cy + dy - t.info.height / 2 + 1) });
-      }
-      const vals = p
-        ? kind === 'bat'
-          ? [String(p.runs), String(p.balls), fmt1(p.sr)]
-          : [String(p.wkts), String(p.balls), fmt1(p.eco)]
-        : ['-', '-', '-'];
-      for (let i = 0; i < 3; i++) {
-        const b = slot.boxes[i];
-        const img = await textShrunk(vals[i], L.boxPx, b.x1 - b.x0 - 14, b.y1 - b.y0 - 8);
-        layers.push(centered(img, (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2 + dy, 1));
-      }
-    }
-  }
-  return sharp(path.join(ASSET_DIR, L.file)).composite(layers).jpeg({ quality: 90 }).toBuffer();
-}
+    const bat = team && team.bat;
+    const bowl = team && team.bowl;
 
-// ═══ SOLO FINAL CARD ═══
-async function renderSoloFinalCard({ bat, bowl }) {
-  needSharp();
-  const L = SOLO_LAYOUT;
-  const layers = [];
-  for (const [kind, p] of [['bat', bat], ['bowl', bowl]]) {
-    const dy = L.rowDy[kind];
-    layers.push(await dpLayer(p && p.dp, L.circle, dy, L.clipAboveY));
-    if (p && p.name) {
-      const t = await textTruncated(cleanName(p.name), L.barText.px, L.barText.x1 - L.barText.x0);
-      layers.push({ input: t.data, left: L.barText.x0, top: Math.round(L.barText.cy + dy - t.info.height / 2 + 1) });
-    }
-    const vals = p
-      ? kind === 'bat'
-        ? [String(p.runs), String(p.balls), fmt1(p.sr)]
-        : [String(p.wkts), String(p.balls), fmt1(p.eco)]
-      : ['-', '-', '-'];
-    for (let i = 0; i < 3; i++) {
-      const b = L.boxes[i];
-      const img = await textShrunk(vals[i], L.boxPx, b.x1 - b.x0 - 20, b.y1 - b.y0 - 8);
-      layers.push(centered(img, (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2 + dy, 1));
-    }
-  }
-  return sharp(path.join(ASSET_DIR, L.file)).composite(layers).jpeg({ quality: 90 }).toBuffer();
-}
+    layers.push(await dpLayer(bat && bat.dp, L.bat.circle, dy, L.clipAboveY));
+    if (bat && bat.name) await putCentered(layers, cleanName(bat.name), L.namePx, L.bat.name.cx, L.bat.name.cy + dy, L.bat.name.w);
+    const bv = bat ? [bat.runs, bat.balls, bat.sixes, bat.fours, fmt1(bat.sr)] : ['-', '-', '-', '-', '-'];
+    for (let i = 0; i < 5; i++) await putCentered(layers, String(bv[i]), L.valPx, L.bat.xs[i], L.bat.cy + dy, L.bat.ws[i]);
 
-// Logo strip from the poster; returns null when the poster file is missing / broken (banners then work without it)
-async function loadHeader(W, headerH) {
-  try {
-    let header = await sharp(path.join(ASSET_DIR, TEAM_LAYOUT.file))
-      .extract({ left: 0, top: 0, width: 1024, height: 300 })
-      .resize(W, headerH)
-      .ensureAlpha()
-      .png()
-      .toBuffer();
-    const fade = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${headerH}"><defs>
-      <linearGradient id="f" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="1"/><stop offset="0.7" stop-color="#fff" stop-opacity="1"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>
-      <rect width="${W}" height="${headerH}" fill="url(#f)"/></svg>`);
-    return await sharp(header).composite([{ input: fade, blend: 'dest-in' }]).png().toBuffer();
-  } catch (e) {
-    console.error('banner header image unavailable:', e.message);
-    return null;
+    layers.push(await dpLayer(bowl && bowl.dp, L.bowl.circle, dy, L.clipAboveY));
+    if (bowl && bowl.name) await putCentered(layers, cleanName(bowl.name), L.namePx, L.bowl.name.cx, L.bowl.name.cy + dy, L.bowl.name.w);
+    const wv = bowl ? [bowl.wkts, bowl.balls, fmt1(bowl.eco)] : ['-', '-', '-'];
+    for (let i = 0; i < 3; i++) await putCentered(layers, String(wv[i]), L.valPx, L.bowl.xs[i], L.bowl.cy + dy, L.bowl.ws[i]);
   }
+
+  // man of the match
+  layers.push(await dpLayer(info.motm && info.motm.dp, L.motm.circle, 0, L.motm.clipAboveY));
+  if (info.motm && info.motm.name) await putCentered(layers, cleanName(info.motm.name), L.namePx + 2, L.motm.name.cx, L.motm.name.cy, L.motm.name.w);
+
+  // winner
+  await putCentered(layers, info.winner, L.winner.px, L.winner.cx, L.winner.cy, L.winner.w, '#ffd54a');
+
+  return sharp(path.join(ASSET_DIR, L.file)).composite(layers).jpeg({ quality: 90 }).toBuffer();
 }
 
 // ═══ MATCH BANNER (host + Team A captain + Team B captain) ═══
-const BANNER_W = 1280;
-const BANNER_H = 940;
-
-const ringSvg = (cx, cy, r) =>
-  `<g><circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#ff1a1a" stroke-width="16" filter="url(#glow)" opacity="0.95"/>
-   <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#ff2f2f" stroke-width="9"/>
-   <circle cx="${cx}" cy="${cy}" r="${r - 8}" fill="none" stroke="#ffd6d6" stroke-width="2" opacity="0.9"/></g>`;
-
-const ribbonSvg = (cx, cy, w, h) => {
-  const x0 = cx - w / 2, x1 = cx + w / 2, y0 = cy - h / 2, y1 = cy + h / 2, k = h / 2;
-  const pts = `${x0},${cy} ${x0 + k},${y0} ${x1 - k},${y0} ${x1},${cy} ${x1 - k},${y1} ${x0 + k},${y1}`;
-  return `<g><polygon points="${pts}" fill="#070707" stroke="#ff1a1a" stroke-width="8" filter="url(#glow)" opacity="0.9"/>
-   <polygon points="${pts}" fill="#070707" stroke="#ff3131" stroke-width="4"/></g>`;
-};
-
 async function renderMatchBanner({ hostDp, hostName, capA, capB }) {
   needSharp();
-  const W = BANNER_W, H = BANNER_H;
-  // background: dark red arena glow + grain
-  const bg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">
-    <defs>
-      <radialGradient id="c" cx="50%" cy="62%" r="70%"><stop offset="0" stop-color="#5a0000"/><stop offset="0.55" stop-color="#1c0000"/><stop offset="1" stop-color="#000"/></radialGradient>
-      <radialGradient id="l" cx="18%" cy="70%" r="40%"><stop offset="0" stop-color="#a00000" stop-opacity="0.55"/><stop offset="1" stop-color="#a00000" stop-opacity="0"/></radialGradient>
-      <radialGradient id="r" cx="82%" cy="70%" r="40%"><stop offset="0" stop-color="#a00000" stop-opacity="0.55"/><stop offset="1" stop-color="#a00000" stop-opacity="0"/></radialGradient>
-      <filter id="n"><feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="2" seed="7"/>
-        <feColorMatrix type="matrix" values="0 0 0 0 0.8  0 0 0 0 0  0 0 0 0 0  0 0 0 0.5 0"/></filter>
-    </defs>
-    <rect width="${W}" height="${H}" fill="url(#c)"/><rect width="${W}" height="${H}" fill="url(#l)"/><rect width="${W}" height="${H}" fill="url(#r)"/>
-    <rect width="${W}" height="${H}" filter="url(#n)" opacity="0.22"/>
-  </svg>`);
-
-  // header (logo strip from the poster) with a soft fade at the bottom
-  const headerH = Math.round((300 * W) / 1024);
-  const header = await loadHeader(W, headerH);
-
-  const hostC = { cx: 640, cy: 455, r: 82 };
-  const aC = { cx: 290, cy: 600, r: 150 };
-  const bC = { cx: 990, cy: 600, r: 150 };
-
-  const layers = header ? [{ input: header, left: 0, top: 0 }] : [];
-  layers.push(await dpLayer(hostDp, { ...hostC, r: hostC.r - 6 }));
-  layers.push(await dpLayer(capA && capA.dp, { ...aC, r: aC.r - 6 }));
-  layers.push(await dpLayer(capB && capB.dp, { ...bC, r: bC.r - 6 }));
-
-  const overlay = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">
-    <defs><filter id="glow" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="9"/></filter></defs>
-    ${ringSvg(hostC.cx, hostC.cy, hostC.r)}${ringSvg(aC.cx, aC.cy, aC.r)}${ringSvg(bC.cx, bC.cy, bC.r)}
-    ${ribbonSvg(hostC.cx, hostC.cy + hostC.r + 38, 190, 46)}
-    ${ribbonSvg(aC.cx, aC.cy + aC.r + 52, 380, 74)}
-    ${ribbonSvg(bC.cx, bC.cy + bC.r + 52, 380, 74)}
-  </svg>`);
-  layers.push({ input: overlay, left: 0, top: 0 });
-
-  const put = async (text, px, cx, cy, color = '#ffffff', maxW = 9999) => {
-    const img = await textTruncated(text, px, maxW);
-    layers.push({ input: img.data, left: Math.round(cx - img.info.width / 2), top: Math.round(cy - img.info.height / 2 + 1) });
-  };
-  await put('HOST', 28, hostC.cx, hostC.cy + hostC.r + 38);
-  await put('TEAM A', 50, aC.cx, aC.cy + aC.r + 52);
-  await put('TEAM B', 50, bC.cx, bC.cy + bC.r + 52);
-  await put('VS', 110, 640, 745);
-  const nm = (s) => (s ? cleanName(s) : '');
-  if (hostName) await put(`@${nm(hostName)}`, 28, hostC.cx, hostC.cy + hostC.r + 84, '#fff', 330);
-  if (capA && capA.name) await put(`C  ${nm(capA.name)}`, 32, aC.cx, aC.cy + aC.r + 122, '#fff', 360);
-  if (capB && capB.name) await put(`C  ${nm(capB.name)}`, 32, bC.cx, bC.cy + bC.r + 122, '#fff', 360);
-
-  return sharp(bg).composite(layers).jpeg({ quality: 90 }).toBuffer();
+  const L = BANNER_LAYOUT;
+  const layers = [
+    await dpLayer(hostDp, L.host),
+    await dpLayer(capA && capA.dp, L.A),
+    await dpLayer(capB && capB.dp, L.B),
+  ];
+  const gold = '#ffe08a';
+  if (hostName) await putCentered(layers, `@${cleanName(hostName)}`, L.nameHost.px, L.nameHost.cx, L.nameHost.cy, L.nameHost.w, gold);
+  if (capA && capA.name) await putCentered(layers, `C  ${cleanName(capA.name)}`, L.nameA.px, L.nameA.cx, L.nameA.cy, L.nameA.w, gold);
+  if (capB && capB.name) await putCentered(layers, `C  ${cleanName(capB.name)}`, L.nameB.px, L.nameB.cx, L.nameB.cy, L.nameB.w, gold);
+  return sharp(path.join(ASSET_DIR, L.file)).composite(layers).jpeg({ quality: 90 }).toBuffer();
 }
 
-// ═══ PLAYERS LIST banner (used by /members and /team) - generated here, cached ═══
+// ═══ PLAYERS LIST banner ("PLAYERS LIST - Let's Begin") - the template is sent as it is ═══
 let playersBannerCache = null;
 async function renderPlayersBanner() {
-  needSharp();
   if (playersBannerCache) return playersBannerCache;
-  const W = BANNER_W, H = 640;
-  const headerH = Math.round((300 * W) / 1024);
-  const bg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">
-    <defs>
-      <radialGradient id="c" cx="50%" cy="70%" r="75%"><stop offset="0" stop-color="#5a0000"/><stop offset="0.55" stop-color="#1c0000"/><stop offset="1" stop-color="#000"/></radialGradient>
-      <filter id="n"><feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="2" seed="11"/>
-        <feColorMatrix type="matrix" values="0 0 0 0 0.8  0 0 0 0 0  0 0 0 0 0  0 0 0 0.5 0"/></filter>
-      <linearGradient id="l" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ff2a2a" stop-opacity="0"/><stop offset="1" stop-color="#ff2a2a" stop-opacity="1"/></linearGradient>
-      <linearGradient id="r" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ff2a2a" stop-opacity="1"/><stop offset="1" stop-color="#ff2a2a" stop-opacity="0"/></linearGradient>
-    </defs>
-    <rect width="${W}" height="${H}" fill="url(#c)"/>
-    <rect width="${W}" height="${H}" filter="url(#n)" opacity="0.22"/>
-    <rect x="170" y="585" width="360" height="5" fill="url(#l)"/><rect x="750" y="585" width="360" height="5" fill="url(#r)"/>
-  </svg>`);
-  const header = await loadHeader(W, headerH);
-
-  const t1 = await renderText('PLAYERS', 118, '#ffffff');
-  const t2 = await renderText('LIST', 118, '#ff2a2a');
-  const gap = 28;
-  const total = t1.info.width + gap + t2.info.width;
-  const x0 = Math.round((W - total) / 2);
-  const y = 395;
-  const sub = await renderText("Let's Begin", 46, '#ff5a5a');
-  const layers = [
-    ...(header ? [{ input: header, left: 0, top: 0 }] : []),
-    { input: t1.data, left: x0, top: y },
-    { input: t2.data, left: x0 + t1.info.width + gap, top: y },
-    { input: sub.data, left: Math.round((W - sub.info.width) / 2), top: 540 },
-  ];
-  playersBannerCache = await sharp(bg).composite(layers).jpeg({ quality: 90 }).toBuffer();
+  playersBannerCache = fs.readFileSync(path.join(ASSET_DIR, PLAYERS_LIST_FILE));
   return playersBannerCache;
 }
 
@@ -878,7 +783,7 @@ async function renderPlayersBanner() {
 async function assetReport() {
   const fs = require('fs');
   const out = [];
-  for (const f of ['host.png', 'team_final.png', 'solo_final.png', 'default_dp.png']) {
+  for (const f of ['host.jpg', 'solo_final.jpg', 'team_final.jpg', 'team_banner.jpg', 'players_list.jpg', 'default_dp.png']) {
     const file = path.join(ASSET_DIR, f);
     if (!fs.existsSync(file)) {
       out.push(`${f} — MISSING${f === 'default_dp.png' ? ' (a built-in avatar is used)' : ''}`);
@@ -920,6 +825,7 @@ function downloadBuf(url) {
 
 // returns Buffer or null (no photo / hidden / error)
 async function getUserDp(telegram, userId) {
+  if (Number(userId) <= -1001) return null; // bot players have no photo
   try {
     const res = await telegram.getUserProfilePhotos(Number(userId), 0, 1);
     if (!res || !res.total_count) return null;
@@ -1184,6 +1090,51 @@ async function teamScoreboard(match, inn) {
 }
 
 // ─── Team lists with markers ([🧢] captain, ❌ out, 🏃 batting, 🎯 bowling) ───
+// "@username (First Last)" - or just the name / the username / the id, whatever exists
+function handleOf(p) {
+  if (!p) return '—';
+  const full = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
+  if (p.username && full) return `@${p.username} (${full})`;
+  if (p.username) return `@${p.username}`;
+  if (full) return full;
+  const id = p.telegram_id ?? p.id;
+  return id != null ? String(id) : '—';
+}
+const playerTag = (p) => mdEsc(handleOf(p));
+
+// ┣ 1. @user (Name) [🧢]  ... ┗ last
+function rosterBlock(players, markOf = () => '') {
+  if (!players.length) return `  _(empty)_\n`;
+  let t = '';
+  players.forEach((p, i) => {
+    const branch = i === players.length - 1 ? '┗' : '┣';
+    t += `${branch} ${p.roster_position}. ${playerTag(p)}${markOf(p)}\n`;
+  });
+  return t;
+}
+
+// Players-list banner ("Let's Begin") with the text as caption. Telegram captions stop at 1024
+// characters, so whatever does not fit goes into a follow-up message.
+async function sendPlayersListPhoto(telegram, chatId, text) {
+  const lines = String(text).split('\n');
+  let cap = '';
+  let i = 0;
+  for (; i < lines.length; i++) {
+    if ((cap + lines[i] + '\n').length > 1000) break;
+    cap += lines[i] + '\n';
+  }
+  const rest = lines.slice(i).join('\n');
+  try {
+    const img = await renderPlayersBanner();
+    await telegram.sendPhoto(chatId, { source: img }, { caption: cap.trim() || '📋', parse_mode: 'Markdown' });
+  } catch (e) {
+    await reportCardError('Players banner', e);
+    await sendLong(telegram, chatId, text);
+    return;
+  }
+  if (rest.trim()) await sendLong(telegram, chatId, rest);
+}
+
 async function rosterText(match) {
   const inn = await getInnings(match.id);
   const isSolo = match.mode === 'solo';
@@ -1204,15 +1155,15 @@ async function rosterText(match) {
       ? `🎮 *PLAYERS* (${pl.length})\n`
       : `${L === 'A' ? '🅰' : '🅱'} *TEAM ${L}* - ${score}\n`;
     if (match.status === 'waiting') t += `⎣ _Joining..._\n`;
-    for (const p of pl) {
+    const markOf = (p) => {
       let mark = '';
       if (!isSolo && team?.captain_id && Number(p.telegram_id) === Number(team.captain_id)) mark += ' [🧢]';
       if (outSet.has(p.id)) mark += ' ❌';
       if (inn && (p.id === inn.striker_player_id || p.id === inn.non_striker_player_id)) mark += ' 🏃';
       if (inn && p.id === inn.current_bowler_id) mark += ' 🎯';
-      t += `${p.roster_position}. ${mn(p)}${mark}\n`;
-    }
-    if (!pl.length) t += `   (empty)\n`;
+      return mark;
+    };
+    t += rosterBlock(pl, markOf);
     t += '\n';
   }
   return t;
@@ -1234,14 +1185,7 @@ async function sendMembers(ctx, m) {
     `📊 *${fancy('MATCH OVERVIEW')}*\n` +
     `> ${pe('crown','👑')} Host: ${await hostLabel(m)}\n` +
     `> ⏳ Overs: *${started ? m.total_overs : 'None'}* | 🔄 *${statusLabel(m)}*`;
-  try {
-    const img = await renderPlayersBanner();
-    await ctx.telegram.sendPhoto(ctx.chat.id, { source: img }, { caption, parse_mode: 'Markdown' });
-  } catch (e) {
-    await reportCardError('Players banner', e);
-    await ctx.telegram.sendMessage(ctx.chat.id, caption, { parse_mode: 'Markdown' });
-  }
-  await sendLong(ctx.telegram, ctx.chat.id, await rosterText(m));
+  await sendPlayersListPhoto(ctx.telegram, ctx.chat.id, caption + '\n\n' + (await rosterText(m)));
 }
 
 // Telegram limit is 4096 chars: split long texts at line breaks
@@ -1697,7 +1641,10 @@ bot.command('showgif', async (ctx) => {
   }
 });
 
-const htag = (p) => `<a href="tg://user?id=${Number(p.telegram_id ?? p.id)}">${escapeHtml(name(p))}</a>`;
+const htag = (p) =>
+  isBotId(p.telegram_id ?? p.id)
+    ? `<b>${escapeHtml(name(p))}</b>`
+    : `<a href="tg://user?id=${Number(p.telegram_id ?? p.id)}">${escapeHtml(name(p))}</a>`;
 
 // Spam rules: team = spam-free by default, solo = spam allowed by default (host can switch with /spam)
 function spamFreeOn(m) {
@@ -1738,11 +1685,16 @@ bot.command('help', async (ctx) => {
       `/leavesolo — leave\n` +
       `/forcestart or /startgame — start (min 2)\n` +
       `/extend30 — +30s\n` +
+      `/soloball 3 or 6 — bowler changes every 3 or 6 balls (next player by number)\n` +
       `Then just type 0-6 when it is your turn to bat\n\n` +
+      `*PRACTICE vs BOT*\n` +
+      `/vsbotsolo [3|6] — 1v1 against the bot\n` +
+      `/botteam 5 or /botteam 10 — your team vs a bot team\n\n` +
       `*TEAM*\n` +
       `/team — create a team lobby (unlimited players)\n` +
       `/team\\_a  /team\\_b — join a team\n` +
       `/add\\_a  /add\\_b — host/captain adds players (@user, id, reply — many at once)\n` +
+      `/setcap\\_a  /setcap\\_b <no.> — host sets a captain\n` +
       `/startgame — host starts: captains → toss → bat/bowl\n` +
       `/setovers — host picks overs (1-20)\n` +
       `/bat 1 · /ball 1 — captains pick players, then type 0-6\n\n` +
@@ -1899,7 +1851,8 @@ async function bestBatter(matchId, label = null) {
   }
   const { rows } = await q(
     `SELECT mp.telegram_id, mp.username, mp.first_name,
-            SUM(bs.runs)::int AS runs, SUM(bs.balls_faced)::int AS balls
+            SUM(bs.runs)::int AS runs, SUM(bs.balls_faced)::int AS balls,
+            SUM(bs.fours)::int AS fours, SUM(bs.sixes)::int AS sixes
        FROM batting_stats bs
        JOIN innings i ON i.id = bs.innings_id
        JOIN match_players mp ON mp.id = bs.player_id
@@ -1999,7 +1952,7 @@ async function matchAwards(matchId, winnerLabel = null) {
   return { orange, purple, motm };
 }
 
-const tagOf = (p) => `[${mdEsc(name(p))}](tg://user?id=${Number(p.telegram_id)})`;
+const tagOf = (p) => (isBotId(p.telegram_id) ? `*${mdEsc(name(p))}*` : `[${mdEsc(name(p))}](tg://user?id=${Number(p.telegram_id)})`);
 
 function awardsText(aw) {
   const o = aw.orange
@@ -2014,8 +1967,44 @@ function awardsText(aw) {
   return `> ${o}\n> ${p}\n> ${m}`;
 }
 
-// Final result image + caption (team: Team A / Team B best performers)
-async function sendTeamFinal(telegram, groupId, m, caption) {
+// full numbers of one player in a match (for the MOTM card)
+async function playerMatchStats(matchId, telegramId) {
+  const { rows } = await q(
+    `SELECT mp.telegram_id, mp.username, mp.first_name, mp.last_name,
+            COALESCE(b.runs,0) AS runs, COALESCE(b.balls,0) AS balls, COALESCE(b.fours,0) AS fours, COALESCE(b.sixes,0) AS sixes,
+            COALESCE(w.wkts,0) AS wkts, COALESCE(w.bballs,0) AS bballs, COALESCE(w.conceded,0) AS conceded
+       FROM match_players mp
+       LEFT JOIN (SELECT bs.player_id, SUM(bs.runs)::int AS runs, SUM(bs.balls_faced)::int AS balls,
+                         SUM(bs.fours)::int AS fours, SUM(bs.sixes)::int AS sixes
+                    FROM batting_stats bs JOIN innings i ON i.id = bs.innings_id
+                   WHERE i.match_id=$1 GROUP BY bs.player_id) b ON b.player_id = mp.id
+       LEFT JOIN (SELECT bw.player_id, SUM(bw.wickets)::int AS wkts, SUM(bw.balls_bowled)::int AS bballs,
+                         SUM(bw.runs_conceded)::int AS conceded
+                    FROM bowling_stats bw JOIN innings i ON i.id = bw.innings_id
+                   WHERE i.match_id=$1 GROUP BY bw.player_id) w ON w.player_id = mp.id
+      WHERE mp.match_id=$1 AND mp.telegram_id=$2
+      LIMIT 1`,
+    [matchId, telegramId]
+  );
+  const r = rows[0];
+  if (!r) return null;
+  const runs = Number(r.runs), balls = Number(r.balls), bballs = Number(r.bballs), conceded = Number(r.conceded);
+  return {
+    ...r,
+    runs,
+    balls,
+    fours: Number(r.fours),
+    sixes: Number(r.sixes),
+    sr: balls > 0 ? (runs * 100) / balls : 0,
+    wkts: Number(r.wkts),
+    bballs,
+    eco: bballs > 0 ? (conceded * 6) / bballs : 0,
+  };
+}
+
+// Final result image + caption (team: Date / Time / GC, Team A + Team B best performers, MOTM, Winner)
+// extra = { inns: [innings rows], winner: 'A' | 'B' | 'tie', motm: awards.motm }
+async function sendTeamFinal(telegram, groupId, m, caption, extra = {}) {
   const [batA, bowlA, batB, bowlB] = await Promise.all([
     bestBatter(m.id, 'A'),
     bestBowler(m.id, 'A'),
@@ -2023,22 +2012,39 @@ async function sendTeamFinal(telegram, groupId, m, caption) {
     bestBowler(m.id, 'B'),
   ]);
   try {
+    const motm = extra.motm || null;
     const dps = await Promise.all(
-      [batA, bowlA, batB, bowlB].map((p) => (p ? getUserDp(telegram, p.telegram_id) : null))
+      [batA, bowlA, batB, bowlB, motm].map((p) => (p ? getUserDp(telegram, p.telegram_id) : null))
     );
     const mk = (p, dp, bat) =>
       p
         ? bat
-          ? { dp, name: cardName(p), runs: p.runs, balls: p.balls, sr: p.sr }
+          ? { dp, name: cardName(p), runs: p.runs, balls: p.balls, fours: p.fours, sixes: p.sixes, sr: p.sr }
           : { dp, name: cardName(p), wkts: p.wkts, balls: p.balls, eco: p.eco }
         : null;
+    const inns = extra.inns || [];
+    const bar = (L) => {
+      const i = inns.find((x) => x.batting_team === L);
+      return i ? `TEAM ${L}  ${i.total_runs}/${i.total_wickets} (${oversStr(i.balls_bowled)} ov)` : `TEAM ${L}`;
+    };
+    const w = extra.winner;
+    const { date, time } = cardDateTime(m.completed_at ? new Date(m.completed_at) : new Date());
     const img = await renderTeamFinalCard({
       A: { bat: mk(batA, dps[0], true), bowl: mk(bowlA, dps[1], false) },
       B: { bat: mk(batB, dps[2], true), bowl: mk(bowlB, dps[3], false) },
+      info: {
+        date,
+        time,
+        gc: m.group_title || 'GROUP',
+        barA: bar('A'),
+        barB: bar('B'),
+        winner: w === 'tie' ? 'MATCH TIED' : w ? `TEAM ${w}` : '',
+        motm: motm ? { dp: dps[4], name: cardName(motm) } : null,
+      },
     });
     await telegram.sendPhoto(groupId, { source: img }, { caption, parse_mode: 'Markdown' });
   } catch (e) {
-    console.error('team final card failed:', e.message);
+    await reportCardError('Team final card', e);
     await telegram.sendMessage(
       groupId,
       caption + '\n\n' + performersText('TEAM A', batA, bowlA) + '\n' + performersText('TEAM B', batB, bowlB),
@@ -2047,20 +2053,27 @@ async function sendTeamFinal(telegram, groupId, m, caption) {
   }
 }
 
-// Final result image + caption (solo: best batsman + best bowler overall)
-async function sendSoloFinal(telegram, groupId, m, caption, bat, bowl) {
+// Final result image + caption (solo: Man of the Match card)
+async function sendSoloFinal(telegram, groupId, m, caption, motm, bat, bowl) {
   try {
-    const [dpB, dpW] = await Promise.all([
-      bat ? getUserDp(telegram, bat.telegram_id) : null,
-      bowl ? getUserDp(telegram, bowl.telegram_id) : null,
-    ]);
-    const img = await renderSoloFinalCard({
-      bat: bat ? { dp: dpB, name: cardName(bat), runs: bat.runs, balls: bat.balls, sr: bat.sr } : null,
-      bowl: bowl ? { dp: dpW, name: cardName(bowl), wkts: bowl.wkts, balls: bowl.balls, eco: bowl.eco } : null,
+    if (!motm) throw new Error('no MOTM');
+    const [dp, st] = await Promise.all([getUserDp(telegram, motm.telegram_id), playerMatchStats(m.id, motm.telegram_id)]);
+    const s = st || motm;
+    const img = await renderMotmCard({
+      dp,
+      name: cardName(s),
+      runs: Number(s.runs || 0),
+      balls: Number(s.balls || 0),
+      fours: Number(s.fours || 0),
+      sixes: Number(s.sixes || 0),
+      sr: Number(s.sr || 0),
+      wkts: Number(s.wkts || 0),
+      bballs: Number(s.bballs || 0),
+      eco: Number(s.eco || 0),
     });
     await telegram.sendPhoto(groupId, { source: img }, { caption, parse_mode: 'Markdown' });
   } catch (e) {
-    console.error('solo final card failed:', e.message);
+    if (String(e.message) !== 'no MOTM') await reportCardError('MOTM card', e);
     await telegram.sendMessage(groupId, caption + '\n\n' + performersText('SOLO', bat, bowl), {
       parse_mode: 'Markdown',
     });
@@ -2120,6 +2133,7 @@ async function beginSoloFromLobby(matchId, chatId, telegram) {
       `\n🏏 First Batter: *${mn(batter)}*  (#1)\n` +
       `🎳 First Bowler: *${mn(bowler)}*  (#2)\n\n` +
       `♾ Unlimited overs — every player bats until OUT\n` +
+      `🎳 Bowler changes every *${Number(m.solo_balls) === 6 ? 6 : 3}* balls (next player by number)\n` +
       `${pe('ball','🎯')} Same number = OUT\n` +
       `📩 The bowler sends a number in the bot's DM first, then *${mn(batter)}* types *0–6* in the group!`,
     { parse_mode: 'Markdown' }
@@ -2197,6 +2211,8 @@ async function createSoloLobby(ctx) {
     touchMatch(m.id);
     startLobbyTimer(m.id, ctx.chat.id, ctx.from.id, ctx.telegram, LOBBY_SECONDS);
     await q(`UPDATE matches SET spam_free=$2 WHERE id=$1`, [m.id, false]); // solo: spam allowed by default
+    const soloBalls = parseInt((ctx.message.text.split(/\s+/)[1] || ''), 10) === 6 ? 6 : 3;
+    await q(`UPDATE matches SET solo_balls=$2 WHERE id=$1`, [m.id, soloBalls]);
 
     await sendHostBanner(
       ctx,
@@ -2205,7 +2221,8 @@ async function createSoloLobby(ctx) {
         `> ${pe('people','👥')} Players: *1*  ·  max ${MAX_SOLO_PLAYERS}\n` +
         `> ${pe('clock','⏱')} Lobby: *${LOBBY_SECONDS}s*\n` +
         `> ${pe('target','🎯')} Same number = OUT  ·  numbers 0–6\n` +
-        `> ${pe('zap','⚡')} Mode: *Spam* (host: /spam to switch)\n\n` +
+        `> ${pe('zap','⚡')} Mode: *Spam* (host: /spam to switch)\n` +
+        `> 🎳 Bowler changes every *${soloBalls}* balls — host: /soloball 3 or 6\n\n` +
         `${pe('mega','📢')} /join\\_solo — join (#1 bats, #2 bowls…)\n` +
         `${pe('door','🚪')} /leavesolo — leave\n` +
         `${pe('list','📋')} /members — player list\n\n` +
@@ -2213,7 +2230,10 @@ async function createSoloLobby(ctx) {
         `> /add — add players (@user, id or reply)\n` +
         `> /forcestart — start (min 2)\n` +
         `> /extend30 — +30s\n` +
-        `> /endmatch — cancel`
+        `> /endmatch — cancel`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('🎳 3 balls', `sb:${m.id}:3`), Markup.button.callback('🎳 6 balls', `sb:${m.id}:6`)],
+      ])
     );
   } catch (e) {
     console.error(e);
@@ -2439,18 +2459,15 @@ async function endTeamJoinPhase(telegram, matchId, chatId) {
   const a = await getPlayers(matchId, 'A');
   const b = await getPlayers(matchId, 'B');
   let list =
-    `📋 *TEAM LIST*\n${line()}\n` +
-    `🅰 *Team A* (${a.length})\n`;
-  for (const p of a) list += `  ${p.roster_position}. ${mn(p)}\n`;
-  if (!a.length) list += `  _(empty)_\n`;
-  list += `\n🅱 *Team B* (${b.length})\n`;
-  for (const p of b) list += `  ${p.roster_position}. ${mn(p)}\n`;
-  if (!b.length) list += `  _(empty)_\n`;
-  list +=
+    `📋 *TEAM LIST*\n` +
+    `🅰 *Team A* (${a.length})\n` +
+    rosterBlock(a) +
+    `\n🅱 *Team B* (${b.length})\n` +
+    rosterBlock(b) +
     `\n> Still join: /team\\_a · /team\\_b (until host starts)\n` +
     `> Host: /add\\_a /add\\_b`;
 
-  await telegram.sendMessage(chatId, list, { parse_mode: 'Markdown' });
+  await sendPlayersListPhoto(telegram, chatId, list);
 
   // Always tag the host to start the game
   const hostId = Number(m.host_telegram_id);
@@ -2497,8 +2514,9 @@ async function createTeamMatch(ctx) {
     // Idle host-warnings start only after /startgame (captains/toss), not during join timers
     await q(`UPDATE matches SET spam_free=$2 WHERE id=$1`, [m.id, true]); // team: spam-free by default
 
-    await sendHostBanner(
-      ctx,
+    await sendHtmlMessage(
+      ctx.telegram,
+      ctx.chat.id,
       `${pe('people','👥')} *${fancy('TEAM MATCH')}*\n` +
         `> ${pe('crown','👑')} Host: *${mn(ctx.from)}*\n` +
         `> ${pe('people','👤')} Players: *unlimited* per team\n` +
@@ -2532,6 +2550,7 @@ async function joinTeam(ctx, label) {
     const m = await getActiveMatch(ctx.chat.id);
     if (!m || m.status !== 'waiting' || m.mode === 'solo')
       return ctx.reply('❌ There is no team lobby open. Use /team to create one.');
+    if (m.vs_bot && label === 'B') return ctx.reply('🤖 Team B is the bot team — join Team A with /team_a');
     if (await getPlayerByTg(m.id, ctx.from.id)) return ctx.reply('❌ You are already in a team');
     const team = await getPlayers(m.id, label);
     if (team.length >= m.team_size) return ctx.reply(`❌ Team ${label} is full`);
@@ -2629,6 +2648,7 @@ async function addPlayers(ctx, label, viaAdd = false) {
       return ctx.reply('⚠️ Players can only be added before the match starts');
     if (m.mode !== 'solo' && viaAdd) return ctx.reply('Use /add_a or /add_b to choose the team.');
     if (m.mode === 'solo') label = 'A';
+    if (m.vs_bot && label === 'B') return ctx.reply('🤖 Team B is the bot team');
 
     const isHost = Number(m.host_telegram_id) === ctx.from.id;
     const team = m.mode === 'solo' ? null : await getTeam(m.id, label);
@@ -2765,8 +2785,8 @@ bot.command('spam', async (ctx) => {
 });
 
 // Host override: /setcaptain_a <number>  (the normal way is the captain buttons after /startgame)
-bot.command('setcaptain_a', async (ctx) => setCap(ctx, 'A'));
-bot.command('setcaptain_b', async (ctx) => setCap(ctx, 'B'));
+bot.command(['setcaptain_a', 'setcaptain_A', 'setcap_a', 'setcap_A'], async (ctx) => setCap(ctx, 'A'));
+bot.command(['setcaptain_b', 'setcaptain_B', 'setcap_b', 'setcap_B'], async (ctx) => setCap(ctx, 'B'));
 
 async function setCap(ctx, label) {
   if (!isGroup(ctx)) return;
@@ -2774,6 +2794,7 @@ async function setCap(ctx, label) {
     const m = await getActiveMatch(ctx.chat.id);
     if (!m || Number(m.host_telegram_id) !== ctx.from.id) return ctx.reply('❌ Only the host can do this');
     if (m.mode === 'solo') return ctx.reply('ℹ️ Solo has no captains');
+    if (m.vs_bot && label === 'B') return ctx.reply('🤖 Team B is the bot team (captain Bot 1)');
     if (!['waiting', 'captains'].includes(m.status)) return ctx.reply('⚠️ Captains can only be changed before the toss');
     const pos = parseInt((ctx.message.text.split(/\s+/)[1] || ''), 10);
     if (!pos) return ctx.reply(`Usage: /setcaptain_${label.toLowerCase()} <player number>`);
@@ -2897,6 +2918,17 @@ async function startGame(ctx) {
 
     if (m.mode === 'solo') return forceStartSolo(ctx, m);
 
+    if (m.vs_bot) {
+      const target = Math.max(2, Number(m.team_size) || 5);
+      let have = (await getPlayers(m.id, 'A')).length;
+      let nb = await botCount(m.id);
+      while (have < target) {
+        nb++;
+        await addBotPlayer(m.id, 'A', nb);
+        have++;
+      }
+    }
+
     const a = await getPlayers(m.id, 'A');
     const b = await getPlayers(m.id, 'B');
     if (a.length < MIN_TEAM_PLAYERS || b.length < MIN_TEAM_PLAYERS)
@@ -2999,7 +3031,7 @@ async function tryBeginToss(telegram, matchId) {
   const tB = await getTeam(matchId, 'B');
   if (!tA?.captain_id || !tB?.captain_id) return false;
 
-  const caller = Math.random() < 0.5 ? 'A' : 'B';
+  const caller = m.vs_bot ? 'A' : Math.random() < 0.5 ? 'A' : 'B';
   const upd = await q(
     `UPDATE matches SET status='toss', setup_phase='call', toss_caller=$2 WHERE id=$1 AND status='captains' RETURNING id`,
     [matchId, caller]
@@ -3095,6 +3127,14 @@ bot.action(/^tc:(.+):(H|T)$/, async (ctx) => {
 
     const winTeam = await getTeam(m.id, winner);
     const winCap = winTeam?.captain_id ? await getPlayerByTg(m.id, winTeam.captain_id) : null;
+    if (winCap && isBotId(winCap.telegram_id)) {
+      await ctx.telegram.sendMessage(
+        groupId,
+        `🪙 Coin: *${coin === 'H' ? 'HEADS' : 'TAILS'}* — ${mtag(callerP || ctx.from)} called *${call === 'H' ? 'HEADS' : 'TAILS'}*`,
+        { parse_mode: 'Markdown' }
+      );
+      return botTossChoose(ctx.telegram, m.id, winner);
+    }
     await sendTossChoice(
       ctx.telegram,
       m.id,
@@ -3266,6 +3306,8 @@ bot.action(/^ov:(.+):(\d+)$/, async (ctx) => {
         `🏏 <b>Team ${mm.current_batting_team} is batting</b>\n` +
         `<blockquote>${batCap ? htag(batCap) : 'Captain'}, send your openers → <code>/bat &lt;no.&gt;</code> (twice)</blockquote>`
     );
+    await botTeamAssist(m.id);
+    await ensureTurnClock(m.id);
   } catch (e) {
     console.error(e);
     await ctx.answerCbQuery(String(e.message).slice(0, 150), { show_alert: true }).catch(() => {});
@@ -3509,7 +3551,8 @@ function clearWarns(matchId) {
 }
 
 // Markdown mention that pings the player
-const mtag = (p) => `[${mdEsc(name(p))}](tg://user?id=${Number(p.telegram_id ?? p.id)})`;
+const mtag = (p) =>
+  isBotId(p.telegram_id ?? p.id) ? `*${mdEsc(name(p))}*` : `[${mdEsc(name(p))}](tg://user?id=${Number(p.telegram_id ?? p.id)})`;
 
 // GIF captions for the extra GIF events (/pgif batentry | bowlentry | dugout=duck out | stance | runup)
 const newBowlerCaption = (p) => `🎳 <b>NEW BOWLER</b>\n🎙️ ${escapeHtml(name(p))} takes the ball!`;
@@ -3664,18 +3707,21 @@ async function startBall(matchId) {
   const { rows: pr } = await q(`SELECT * FROM pending_balls WHERE callback_token=$1`, [token]);
   const pend = pr[0];
 
-  const dmOk = await sendBowlerPrompt(tg, pend);
+  const bowlerIsBot = isBotId(bowler.telegram_id);
+  const dmOk = bowlerIsBot ? true : await sendBowlerPrompt(tg, pend);
   const hat = await isHatTrickBall({ ...inn, current_bowler_id: bowler.id });
   const html =
     `🎳 <b>${fancy('RUN-UP')}</b>  <i>(Over ${overNum}.${ballNum})</i>\n` +
     `<blockquote>${htag(bowler)} to ${escapeHtml(name(striker))}\n` +
-    (dmOk
+    (bowlerIsBot
+      ? `🤖 ${htag(bowler)} is choosing the number…`
+      : dmOk
       ? `📩 ${htag(bowler)}, send your bowling number <b>1–6</b> in the bot's DM (${TURN_SECONDS}s)`
       : `⚠️ ${htag(bowler)}, open the bot's DM and press /start — then send <b>1–6</b> (${TURN_SECONDS}s)`) +
     (hat ? `\n🎩 <b>HAT-TRICK BALL!</b>` : '') +
     (spamFreeOn(m) ? `\n🛡 ${pe('ok','🛡')} Spam-free mode: no number 3 times in a row` : '') +
     `</blockquote>`;
-  const w = await sendCaptionedGif(tg, groupId, 'runup', html, openBotDmKb());
+  const w = await sendCaptionedGif(tg, groupId, 'runup', html, bowlerIsBot ? {} : openBotDmKb());
   await q(`UPDATE pending_balls SET batting_message_id=$2 WHERE callback_token=$1`, [token, w.message_id]);
   return true;
 }
@@ -3697,6 +3743,7 @@ async function turnState(matchId) {
 // Start the ball if it is time, and (re)arm the 60s clock for whoever is due. Safe to call any time.
 async function ensureTurnClock(matchId) {
   try {
+    await botTeamAssist(matchId);
     await startBall(matchId);
     let st = await turnState(matchId);
     if (st && st.repair) {
@@ -3705,6 +3752,7 @@ async function ensureTurnClock(matchId) {
       st = await turnState(matchId);
     }
     if (!st) return clearTurnClock(matchId);
+    botKick(st).catch(() => {});
     const cur = turnClocks.get(mkey(matchId));
     if (cur && cur.key === st.key) return; // same turn, keep the running clock
     clearTurnClock(matchId);
@@ -4377,12 +4425,22 @@ async function finishSolo(telegram, groupId, m, inn) {
   await q(`UPDATE matches SET status='completed', winner_team='A', completed_at=NOW() WHERE id=$1`, [m.id]);
   const [bat, bowl, aw] = await Promise.all([bestBatter(m.id), bestBowler(m.id), matchAwards(m.id)]);
   const players = await getPlayers(m.id, 'A');
+  let vsLine = '';
+  if (players.length === 2 && players.some((p) => isBotId(p.telegram_id))) {
+    const sts = await Promise.all(players.map((p) => playerMatchStats(m.id, p.telegram_id)));
+    const r = sts.map((x) => (x ? x.runs : 0));
+    vsLine =
+      `⚔️ ${mn(players[0])} *${r[0]}* — *${r[1]}* ${mn(players[1])}\n` +
+      (r[0] === r[1] ? `🤝 *It's a tie!*` : `🏆 Winner: *${mn(players[r[0] > r[1] ? 0 : 1])}*`) +
+      `\n\n`;
+  }
   const caption =
     `🏁 *${fancy('SOLO MATCH OVER')}*\n` +
     `> 👥 Players: *${players.length}*\n` +
     `> 📊 Total: *${inn.total_runs}/${inn.total_wickets}* in ${oversStr(inn.balls_bowled)} overs\n\n` +
+    vsLine +
     awardsText(aw);
-  await sendSoloFinal(telegram, groupId, m, caption, bat, bowl);
+  await sendSoloFinal(telegram, groupId, m, caption, aw.motm, bat, bowl);
   await sendMotmGif(telegram, groupId, aw.motm);
   try { await sendLong(telegram, groupId, await fullScorecard(m.id)); } catch (_) {}
   await sendMatchDataFile(telegram, groupId, m.id);
@@ -4418,7 +4476,7 @@ async function finishTeam(telegram, groupId, m, inn2) {
   caption += `\n`;
   const aw = await matchAwards(m.id, winner);
   caption += `${awardsText(aw)}`;
-  await sendTeamFinal(telegram, groupId, m, caption);
+  await sendTeamFinal(telegram, groupId, m, caption, { inns, winner, motm: aw.motm });
   await sendMotmGif(telegram, groupId, aw.motm);
   await sendLong(telegram, groupId, await fullScorecard(m.id));
   await sendMatchDataFile(telegram, groupId, m.id);
@@ -4564,7 +4622,7 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
         inn2 = (await q(`SELECT * FROM innings WHERE id=$1`, [inn2.id])).rows[0] || inn2;
         await telegram.sendMessage(
           groupId,
-          `🎳 *New bowler* (every 3 balls): *${mn(bw)}*`,
+          `🎳 *New bowler* (every ${Number(m.solo_balls) === 6 ? 6 : 3} balls): *${mn(bw)}*`,
           { parse_mode: 'Markdown' }
         );
         try {
@@ -5104,7 +5162,7 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
       let currentBowler = bowlerId;
       let lastBowler = inn.last_bowler_id || bowlerId;
       if (isSolo) {
-        if (newBalls % 3 === 0) {
+        if (newBalls % (Number(m.solo_balls) === 6 ? 6 : 3) === 0) {
           currentBowler = null; // progressAfterBall will pick next bowler
           lastBowler = bowlerId;
         }
@@ -5454,6 +5512,362 @@ setInterval(() => stuckGamesTick().catch(() => {}), STUCK_CHECK_MS);
 
 
 
+// ─── Practice modes: bot players (/vsbotsolo, /botteam) ──────────────────────────
+// Bot players are normal match_players rows with a negative telegram_id (-1001, -1002 …).
+const BOT_ID_START = -1001;
+const isBotId = (id) => id !== null && id !== undefined && Number.isFinite(Number(id)) && Number(id) <= BOT_ID_START;
+const botTgId = (n) => -1000 - Number(n); // Bot 1 -> -1001
+
+async function addBotPlayer(matchId, label, n) {
+  const id = botTgId(n);
+  await q(
+    `INSERT INTO users (telegram_id, username, first_name, last_name) VALUES ($1,NULL,$2,NULL)
+     ON CONFLICT (telegram_id) DO NOTHING`,
+    [id, `Bot ${n}`]
+  );
+  const { rows } = await q(
+    `SELECT COALESCE(MAX(roster_position),0)+1 AS n FROM match_players WHERE match_id=$1 AND team_label=$2`,
+    [matchId, label]
+  );
+  await q(
+    `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name)
+     VALUES ($1,$2,$3,$4,NULL,$5,NULL)`,
+    [matchId, id, label, rows[0].n, `Bot ${n}`]
+  );
+  return id;
+}
+
+async function botCount(matchId) {
+  const { rows } = await q(`SELECT COUNT(*)::int AS c FROM match_players WHERE match_id=$1 AND telegram_id <= $2`, [
+    matchId,
+    BOT_ID_START,
+  ]);
+  return rows[0].c;
+}
+
+const botBusy = new Set();
+const pickOf = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+// Called from ensureTurnClock: when the bot is the one on the clock, it plays after a short "thinking" delay
+async function botKick(st) {
+  if (!st || st.repair || !st.pend) return;
+  const { inn, pend, kind } = st;
+  const tok = `${kind}:${pend.callback_token}`;
+  if (botBusy.has(tok)) return;
+  let run = null;
+  if (kind === 'bowl' && isBotId(pend.bowler_telegram_id)) run = () => botLockNumber(pend.callback_token);
+  else if (kind === 'bat') {
+    const striker = await getPlayer(inn.striker_player_id);
+    if (striker && isBotId(striker.telegram_id)) run = () => botPlayBat(pend.callback_token);
+  }
+  if (!run) return;
+  botBusy.add(tok);
+  setTimeout(async () => {
+    try {
+      await run();
+    } catch (e) {
+      console.error('bot move failed:', e.message);
+    } finally {
+      botBusy.delete(tok);
+    }
+  }, 1800 + Math.random() * 1700);
+}
+
+// bot bowler locks a number (1-6)
+async function botLockNumber(token) {
+  const { rows } = await q(
+    `SELECT * FROM pending_balls WHERE callback_token=$1 AND is_resolved=FALSE AND bowl_number IS NULL`,
+    [token]
+  );
+  const pend = rows[0];
+  if (!pend) return;
+  const m = await getMatch(pend.match_id);
+  const { rows: ir } = await q(`SELECT * FROM innings WHERE id=$1`, [pend.innings_id]);
+  const inn = ir[0];
+  if (!m || !inn) return;
+
+  let n = 1 + Math.floor(Math.random() * 6);
+  for (let i = 0; i < 12 && (await bowlerSpamBlocked(m, inn, n)); i++) n = 1 + Math.floor(Math.random() * 6);
+  const upd = await q(
+    `UPDATE pending_balls SET bowl_number=$2 WHERE callback_token=$1 AND is_resolved=FALSE AND bowl_number IS NULL RETURNING callback_token`,
+    [token, n]
+  );
+  if (!upd.rowCount) return;
+
+  const groupId = Number(m.group_chat_id);
+  const striker = await getPlayer(inn.striker_player_id);
+  const bowler = await getPlayer(inn.current_bowler_id);
+  const hat = await isHatTrickBall(inn);
+  const html =
+    `🔒 <b>${fancy('NUMBER LOCKED')}</b>\n` +
+    `<blockquote>${bowler ? htag(bowler) : 'Bowler'} has locked the number!\n` +
+    `🏏 ${striker ? htag(striker) : 'Batsman'} takes the stance — send your number <b>${hat ? '1–6' : '0–6'}</b> in the group (${TURN_SECONDS}s)` +
+    (hat ? `\n🎩 <b>HAT-TRICK BALL!</b> 0 is not allowed.` : '') +
+    `</blockquote>`;
+  const lock = await sendCaptionedGif(bot.telegram, groupId, 'stance', html);
+  lockMsgs.set(token, lock.message_id);
+  await ensureTurnClock(m.id);
+}
+
+// bot batsman plays 0-6
+async function botPlayBat(token) {
+  const { rows } = await q(
+    `SELECT * FROM pending_balls WHERE callback_token=$1 AND is_resolved=FALSE AND bowl_number IS NOT NULL`,
+    [token]
+  );
+  const pend = rows[0];
+  if (!pend) return;
+  const m = await getMatch(pend.match_id);
+  const { rows: ir } = await q(`SELECT * FROM innings WHERE id=$1`, [pend.innings_id]);
+  const inn = ir[0];
+  if (!m || !inn || inn.ball_state !== 'waiting_bowl') return;
+  const striker = await getPlayer(inn.striker_player_id);
+  if (!striker || !isBotId(striker.telegram_id)) return;
+
+  const hat = await isHatTrickBall(inn);
+  let pool = [0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 6, 6];
+  if (hat) pool = pool.filter((x) => x !== 0);
+  const num = pickOf(pool);
+
+  const claim = await q(
+    `UPDATE pending_balls SET is_resolved=TRUE WHERE callback_token=$1 AND is_resolved=FALSE AND bowl_number IS NOT NULL`,
+    [token]
+  );
+  if (!claim.rowCount) return;
+  try {
+    await bot.telegram.sendMessage(Number(m.group_chat_id), `🤖 ${mtag(striker)} plays *${num}*`, {
+      parse_mode: 'Markdown',
+    });
+  } catch (_) {}
+  try {
+    await resolveBall(bot.telegram, m, inn, pend, num, undefined);
+  } catch (e) {
+    try {
+      await q(`UPDATE pending_balls SET is_resolved=FALSE WHERE callback_token=$1 AND bowl_number IS NOT NULL`, [token]);
+    } catch (_) {}
+    throw e;
+  }
+}
+
+// Bot captain duties in /botteam matches: openers, next batsman, bowler for every over
+async function botTeamAssist(matchId) {
+  try {
+    const m = await getMatch(matchId);
+    if (!m || m.mode === 'solo' || !m.vs_bot || !['innings1', 'innings2'].includes(m.status)) return;
+    let inn = await getInnings(matchId);
+    if (!inn || inn.ball_state !== 'idle') return;
+    const tg = bot.telegram;
+    const groupId = Number(m.group_chat_id);
+    const batTeam = await getTeam(m.id, inn.batting_team);
+    const bowlTeam = await getTeam(m.id, inn.bowling_team);
+
+    // batting side: fill the striker / non-striker places
+    if (isBotId(batTeam?.captain_id) && (!inn.striker_player_id || !inn.non_striker_player_id)) {
+      const pl = await getPlayers(m.id, inn.batting_team);
+      const { rows: outs } = await q(`SELECT player_id FROM batting_stats WHERE innings_id=$1 AND is_out`, [inn.id]);
+      const outSet = new Set(outs.map((r) => r.player_id));
+      for (let guard = 0; guard < 2 && (!inn.striker_player_id || !inn.non_striker_player_id); guard++) {
+        const busy = new Set([inn.striker_player_id, inn.non_striker_player_id].filter(Boolean));
+        const next = pl.find((p) => !outSet.has(p.id) && !busy.has(p.id));
+        if (!next) break;
+        await q(
+          `INSERT INTO batting_stats (innings_id, player_id) VALUES ($1,$2) ON CONFLICT (innings_id, player_id) DO NOTHING`,
+          [inn.id, next.id]
+        );
+        const col = !inn.striker_player_id ? 'striker_player_id' : 'non_striker_player_id';
+        await q(`UPDATE innings SET ${col}=$2 WHERE id=$1`, [inn.id, next.id]);
+        await tg.sendMessage(groupId, `🤖 Bot captain → 🏏 ${mn(next)} → *${col === 'striker_player_id' ? 'striker' : 'non-striker'}*`, {
+          parse_mode: 'Markdown',
+        });
+        try {
+          await sendResultGif(tg, groupId, 'batentry', undefined, newBatsmanCaption(next));
+        } catch (_) {}
+        inn = await getInnings(m.id);
+      }
+    }
+
+    // bowling side: choose the bowler for the next over
+    if (isBotId(bowlTeam?.captain_id) && !inn.current_bowler_id && inn.striker_player_id && inn.non_striker_player_id) {
+      const pl = await getPlayers(m.id, inn.bowling_team);
+      const { rows: st } = await q(`SELECT player_id, balls_bowled FROM bowling_stats WHERE innings_id=$1`, [inn.id]);
+      const balls = new Map(st.map((r) => [r.player_id, Number(r.balls_bowled) || 0]));
+      const maxO = m.max_overs_per_bowler || MAX_BOWLER_OVERS;
+      const notLast = (p) => !(inn.last_bowler_id === p.id && inn.balls_bowled % 6 === 0 && (balls.get(p.id) || 0) > 0);
+      let cands = pl.filter((p) => (balls.get(p.id) || 0) / 6 < maxO && notLast(p));
+      if (!cands.length) cands = pl.filter(notLast);
+      if (!cands.length) cands = pl;
+      const least = Math.min(...cands.map((p) => balls.get(p.id) || 0));
+      const bw = pickOf(cands.filter((p) => (balls.get(p.id) || 0) === least));
+      if (bw) {
+        await q(
+          `INSERT INTO bowling_stats (innings_id, player_id) VALUES ($1,$2) ON CONFLICT (innings_id, player_id) DO NOTHING`,
+          [inn.id, bw.id]
+        );
+        await q(`UPDATE innings SET current_bowler_id=$2 WHERE id=$1`, [inn.id, bw.id]);
+        await tg.sendMessage(groupId, `🤖 Bot captain → 🎳 ${mn(bw)} is bowling`, { parse_mode: 'Markdown' });
+        try {
+          await sendResultGif(tg, groupId, 'bowlentry', undefined, newBowlerCaption(bw));
+        } catch (_) {}
+      }
+    }
+  } catch (e) {
+    console.error('botTeamAssist failed:', e.message);
+  }
+}
+
+// Bot team won the toss: it chooses BAT or BALL by itself, then the host picks the overs
+async function botTossChoose(telegram, matchId, winner) {
+  const m = await getMatch(matchId);
+  if (!m) return;
+  const choice = Math.random() < 0.5 ? 'bat' : 'bowl';
+  const batFirst = choice === 'bat' ? winner : winner === 'A' ? 'B' : 'A';
+  const bowlFirst = batFirst === 'A' ? 'B' : 'A';
+  const upd = await q(
+    `UPDATE matches SET batting_first_team=$2, current_batting_team=$2, current_bowling_team=$3, setup_phase='overs'
+      WHERE id=$1 AND status='toss' AND setup_phase='choice' RETURNING id`,
+    [m.id, batFirst, bowlFirst]
+  );
+  if (!upd.rowCount) return;
+  const groupId = Number(m.group_chat_id);
+  await telegram.sendMessage(
+    groupId,
+    `🤖 *Team ${winner}* (bot) won the toss and chose to *${choice === 'bat' ? 'BAT' : 'BALL'}* first\n` +
+      `> 🏏 Batting first: Team *${batFirst}*\n> 🎳 Bowling first: Team *${bowlFirst}*`,
+    { parse_mode: 'Markdown' }
+  );
+  await telegram.sendMessage(
+    groupId,
+    `⏱ *HOST — SET OVERS*\n> [Host](tg://user?id=${Number(m.host_telegram_id)}), pick total overs (1–${MAX_OVERS}):`,
+    { parse_mode: 'Markdown', ...oversKb(m.id) }
+  );
+}
+
+// ─── /vsbotsolo [3|6] : 1v1 against the bot ───
+async function createVsBotSolo(ctx) {
+  if (!isGroup(ctx)) return ctx.reply('❌ Use this command in a group');
+  try {
+    if (await getActiveMatch(ctx.chat.id))
+      return ctx.reply(`⚠️ *Only one game per group.*\nA match is already running here.\nHost: /endmatch to cancel it first.`, {
+        parse_mode: 'Markdown',
+      });
+    const balls = parseInt((ctx.message.text.split(/\s+/)[1] || ''), 10) === 6 ? 6 : 3;
+    const { rows } = await q(
+      `INSERT INTO matches (group_chat_id, group_title, mode, host_telegram_id, team_size, total_overs, max_overs_per_bowler, status)
+       VALUES ($1,$2,'solo',$3,$4,$5,$6,'waiting') RETURNING *`,
+      [ctx.chat.id, ctx.chat.title || null, ctx.from.id, 2, DEFAULT_OVERS, MAX_BOWLER_OVERS]
+    );
+    const m = rows[0];
+    await q(`UPDATE matches SET spam_free=FALSE, solo_balls=$2, vs_bot=TRUE WHERE id=$1`, [m.id, balls]);
+    for (const L of ['A', 'B']) await q(`INSERT INTO match_teams (match_id, team_label) VALUES ($1,$2)`, [m.id, L]);
+    await q(
+      `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name, is_captain)
+       VALUES ($1,$2,'A',1,$3,$4,$5,TRUE)`,
+      [m.id, ctx.from.id, ctx.from.username || null, ctx.from.first_name || null, ctx.from.last_name || null]
+    );
+    await q(`UPDATE match_teams SET captain_id=$2 WHERE match_id=$1 AND team_label='A'`, [m.id, ctx.from.id]);
+    await upsertUser(ctx.from);
+    await addBotPlayer(m.id, 'A', 1);
+    touchMatch(m.id);
+    await sendHtmlMessage(
+      ctx.telegram,
+      ctx.chat.id,
+      `🤖 *${fancy('SOLO VS BOT')}*\n` +
+        `> ${pe('crown','👑')} You: *${mn(ctx.from)}*  vs  *Bot 1*\n` +
+        `> 🎳 Bowler changes every *${balls}* balls\n` +
+        `> ♾ Everyone bats until OUT — higher score wins`
+    );
+    await beginSoloFromLobby(m.id, ctx.chat.id, ctx.telegram);
+  } catch (e) {
+    console.error(e);
+    await ctx.reply('❌ ' + e.message);
+  }
+}
+bot.command(['vsbotsolo', 'vsbot'], createVsBotSolo);
+
+// ─── /botteam [2-11] : my team vs a bot team (practice) ───
+async function createBotTeam(ctx) {
+  if (!isGroup(ctx)) return ctx.reply('❌ Use this command in a group');
+  try {
+    if (await getActiveMatch(ctx.chat.id))
+      return ctx.reply(`⚠️ *Only one game per group.*\nA match is already running here.\nHost: /endmatch to cancel it first.`, {
+        parse_mode: 'Markdown',
+      });
+    let size = parseInt((ctx.message.text.split(/\s+/)[1] || ''), 10);
+    if (!size) size = 5;
+    size = Math.max(2, Math.min(11, size));
+
+    const { rows } = await q(
+      `INSERT INTO matches (group_chat_id, group_title, mode, host_telegram_id, team_size, total_overs, max_overs_per_bowler, status)
+       VALUES ($1,$2,'team',$3,$4,$5,$6,'waiting') RETURNING *`,
+      [ctx.chat.id, ctx.chat.title || null, ctx.from.id, size, DEFAULT_OVERS, MAX_BOWLER_OVERS]
+    );
+    const m = rows[0];
+    await q(`UPDATE matches SET spam_free=TRUE, vs_bot=TRUE WHERE id=$1`, [m.id]);
+    for (const L of ['A', 'B']) await q(`INSERT INTO match_teams (match_id, team_label) VALUES ($1,$2)`, [m.id, L]);
+    await upsertUser(ctx.from);
+    // host is player #1 of Team A, Team B is the bot team
+    await q(
+      `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name)
+       VALUES ($1,$2,'A',1,$3,$4,$5)`,
+      [m.id, ctx.from.id, ctx.from.username || null, ctx.from.first_name || null, ctx.from.last_name || null]
+    );
+    for (let n = 1; n <= size; n++) await addBotPlayer(m.id, 'B', n);
+    await q(`UPDATE match_teams SET captain_id=$2 WHERE match_id=$1 AND team_label='B'`, [m.id, botTgId(1)]);
+    await q(`UPDATE match_players SET is_captain=TRUE WHERE match_id=$1 AND telegram_id=$2`, [m.id, botTgId(1)]);
+    touchMatch(m.id);
+
+    await sendHtmlMessage(
+      ctx.telegram,
+      ctx.chat.id,
+      `🤖 *${fancy('TEAM VS BOT')}*\n` +
+        `> ${pe('crown','👑')} Host: *${mn(ctx.from)}*  (Team A #1)\n` +
+        `> 🅱 Team B: *${size} bots* (captain Bot 1)\n` +
+        `> 🅰 Team A: up to *${size}* players — missing places are filled with bots\n\n` +
+        `${pe('mega','📌')} *Join your team*\n` +
+        `> /team\\_a — join Team A\n` +
+        `> /add\\_a @user — host adds friends\n\n` +
+        `${pe('zap','⚡')} *Host*\n` +
+        `> /startgame — captain → toss → overs → play\n` +
+        `> /members — see the teams\n` +
+        `> /endmatch — cancel`
+    );
+  } catch (e) {
+    console.error(e);
+    await ctx.reply('❌ ' + e.message);
+  }
+}
+bot.command('botteam', createBotTeam);
+
+// ─── /soloball 3|6 : how many balls one bowler bowls in solo before the ball goes to the next player ───
+async function setSoloBalls(ctx, n) {
+  if (!isGroup(ctx)) return;
+  try {
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m || m.mode !== 'solo') return ctx.reply('❌ There is no solo match');
+    if (Number(m.host_telegram_id) !== ctx.from.id && !isAdmin(ctx.from.id)) return ctx.reply('❌ Only the host can change this');
+    if (m.status !== 'waiting') return ctx.reply('⚠️ This can only be changed before the match starts');
+    await q(`UPDATE matches SET solo_balls=$2 WHERE id=$1`, [m.id, n]);
+    await ctx.reply(`🎳 Solo: the bowler changes every *${n}* balls (next player by number)`, { parse_mode: 'Markdown' });
+  } catch (e) {
+    await ctx.reply('❌ ' + e.message);
+  }
+}
+bot.command('soloball', (ctx) => setSoloBalls(ctx, parseInt((ctx.message.text.split(/\s+/)[1] || ''), 10) === 6 ? 6 : 3));
+bot.command('solo3', (ctx) => setSoloBalls(ctx, 3));
+bot.command('solo6', (ctx) => setSoloBalls(ctx, 6));
+bot.action(/^sb:(.+):(3|6)$/, async (ctx) => {
+  try {
+    const m = await getMatch(ctx.match[1]);
+    if (!m || m.mode !== 'solo' || m.status !== 'waiting') return ctx.answerCbQuery('The lobby is closed', { show_alert: true });
+    if (Number(m.host_telegram_id) !== ctx.from.id && !isAdmin(ctx.from.id))
+      return ctx.answerCbQuery('Only the host can choose', { show_alert: true });
+    await q(`UPDATE matches SET solo_balls=$2 WHERE id=$1`, [m.id, Number(ctx.match[2])]);
+    await ctx.answerCbQuery(`Bowler changes every ${ctx.match[2]} balls`);
+  } catch (e) {
+    await ctx.answerCbQuery('Error', { show_alert: true }).catch(() => {});
+  }
+});
+
 // ─── Launch ──────────────────────────────────────────────
 async function main() {
   await q('SELECT 1');
@@ -5464,6 +5878,8 @@ async function main() {
   await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS spam_free BOOLEAN');
   await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS penalty_log TEXT');
   await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS toss_caller TEXT');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS solo_balls INTEGER');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS vs_bot BOOLEAN');
   await q('ALTER TABLE match_players ADD COLUMN IF NOT EXISTS last_name TEXT');
   await q(`CREATE TABLE IF NOT EXISTS pgif_settings (
     result_key TEXT PRIMARY KEY,
