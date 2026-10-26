@@ -934,7 +934,7 @@ async function scoreboard(matchId) {
     ? `🏏 Score: *${inn.total_runs}/${inn.total_wickets}*\n`
     : `🅰️ Team ${bat}  »  *${inn.total_runs}/${inn.total_wickets}*\n`;
   t += isSolo
-    ? `⏱ Overs: *${oversStr(inn.balls_bowled)}*\n`
+    ? `⏱ Balls: *${inn.balls_bowled}*\n`
     : `⏱ Overs: *${oversStr(inn.balls_bowled)} / ${totalOvers}*\n`;
   t += `📈 RR: *${crr}*\n`;
   if (match.penalty_log) {
@@ -2091,7 +2091,7 @@ async function beginSoloFromLobby(matchId, chatId, telegram) {
   if (players.length < 2) {
     await telegram.sendMessage(
       chatId,
-      `${pe('clock','⏰')} *Lobby time is up!*\n${pe('people','👥')} Players: ${players.length}\n${pe('no','❌')} Match cancelled. Try /startsolo again.`,
+      `${pe('clock','⏰')} *Lobby time is up!*\n${pe('people','👥')} Players: ${players.length}\n${pe('no','❌')} *Can't play with a single player.* Match cancelled — try /startsolo again when friends join.`,
       { parse_mode: 'Markdown' }
     );
     await q(`UPDATE matches SET status='cancelled' WHERE id=$1`, [matchId]);
@@ -2211,7 +2211,7 @@ async function createSoloLobby(ctx) {
     touchMatch(m.id);
     startLobbyTimer(m.id, ctx.chat.id, ctx.from.id, ctx.telegram, LOBBY_SECONDS);
     await q(`UPDATE matches SET spam_free=$2 WHERE id=$1`, [m.id, false]); // solo: spam allowed by default
-    const soloBalls = parseInt((ctx.message.text.split(/\s+/)[1] || ''), 10) === 6 ? 6 : 3;
+    const soloBalls = parseInt(((ctx.message?.text || '').split(/\s+/)[1] || ''), 10) === 6 ? 6 : 3;
     await q(`UPDATE matches SET solo_balls=$2 WHERE id=$1`, [m.id, soloBalls]);
 
     await sendHostBanner(
@@ -2234,6 +2234,11 @@ async function createSoloLobby(ctx) {
       Markup.inlineKeyboard([
         [Markup.button.callback('🎳 3 balls', `sb:${m.id}:3`), Markup.button.callback('🎳 6 balls', `sb:${m.id}:6`)],
       ])
+    );
+    await ctx.telegram.sendMessage(
+      ctx.chat.id,
+      `🎮 *Solo lobby is open!* (${LOBBY_SECONDS}s)\n👉 Tap to join: /joinsolo`,
+      { parse_mode: 'Markdown' }
     );
   } catch (e) {
     console.error(e);
@@ -4609,25 +4614,22 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
         `🔔 *Over complete!*\n${ovSum}\n👑 Team ${inn2.bowling_team}: /ball <no.>`,
         { parse_mode: 'Markdown' }
       );
-    } else if (isSolo && inn2.balls_bowled > 0 && inn2.balls_bowled % 6 === 0) {
-      const ovSum = await overSummary(m.id, inn2);
-      await telegram.sendMessage(groupId, `🔔 *Over complete!*\n${ovSum}`, { parse_mode: 'Markdown' });
     }
 
     // Solo: new bowler every 3 balls
     if (isSolo && !inn2.current_bowler_id && inn2.striker_player_id) {
+      const prevBowler = inn2.last_bowler_id || inn2.current_bowler_id;
       const bw = await soloRotateBowler(m, inn2);
       if (bw) {
-        showBoard = true;
         inn2 = (await q(`SELECT * FROM innings WHERE id=$1`, [inn2.id])).rows[0] || inn2;
-        await telegram.sendMessage(
-          groupId,
-          `🎳 *New bowler* (every ${Number(m.solo_balls) === 6 ? 6 : 3} balls): *${mn(bw)}*`,
-          { parse_mode: 'Markdown' }
-        );
-        try {
-          await sendResultGif(telegram, groupId, 'bowlentry', undefined, newBowlerCaption(bw));
-        } catch (_) {}
+        // announce only when the ball really goes to a different player
+        if (bw.id !== prevBowler) {
+          showBoard = true;
+          await telegram.sendMessage(groupId, `🎳 *New bowler:* *${mn(bw)}*`, { parse_mode: 'Markdown' });
+          try {
+            await sendResultGif(telegram, groupId, 'bowlentry', undefined, newBowlerCaption(bw));
+          } catch (_) {}
+        }
       }
     }
   }
@@ -5162,7 +5164,18 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
       let currentBowler = bowlerId;
       let lastBowler = inn.last_bowler_id || bowlerId;
       if (isSolo) {
-        if (newBalls % (Number(m.solo_balls) === 6 ? 6 : 3) === 0) {
+        // every bowler gets his own 3 (or 6) balls, counted from the moment he takes the ball
+        const per = Number(m.solo_balls) === 6 ? 6 : 3;
+        const { rows: stint } = await client.query(
+          `SELECT bowler_id FROM deliveries WHERE innings_id=$1 ORDER BY over_number DESC, ball_number DESC LIMIT 60`,
+          [inn.id]
+        );
+        let run = 0;
+        for (const r of stint) {
+          if (r.bowler_id !== bowlerId) break;
+          run++;
+        }
+        if (run > 0 && run % per === 0) {
           currentBowler = null; // progressAfterBall will pick next bowler
           lastBowler = bowlerId;
         }
@@ -5750,7 +5763,7 @@ async function createVsBotSolo(ctx) {
       return ctx.reply(`⚠️ *Only one game per group.*\nA match is already running here.\nHost: /endmatch to cancel it first.`, {
         parse_mode: 'Markdown',
       });
-    const balls = parseInt((ctx.message.text.split(/\s+/)[1] || ''), 10) === 6 ? 6 : 3;
+    const balls = parseInt(((ctx.message?.text || '').split(/\s+/)[1] || ''), 10) === 6 ? 6 : 3;
     const { rows } = await q(
       `INSERT INTO matches (group_chat_id, group_title, mode, host_telegram_id, team_size, total_overs, max_overs_per_bowler, status)
        VALUES ($1,$2,'solo',$3,$4,$5,$6,'waiting') RETURNING *`,
@@ -5792,7 +5805,7 @@ async function createBotTeam(ctx) {
       return ctx.reply(`⚠️ *Only one game per group.*\nA match is already running here.\nHost: /endmatch to cancel it first.`, {
         parse_mode: 'Markdown',
       });
-    let size = parseInt((ctx.message.text.split(/\s+/)[1] || ''), 10);
+    let size = parseInt(((ctx.message?.text || '').split(/\s+/)[1] || ''), 10);
     if (!size) size = 5;
     size = Math.max(2, Math.min(11, size));
 
@@ -5865,6 +5878,45 @@ bot.action(/^sb:(.+):(3|6)$/, async (ctx) => {
     await ctx.answerCbQuery(`Bowler changes every ${ctx.match[2]} balls`);
   } catch (e) {
     await ctx.answerCbQuery('Error', { show_alert: true }).catch(() => {});
+  }
+});
+
+// ─── Wrong input: tell bowler (DM) and batsman (group) to type just the number ───
+bot.on('text', async (ctx, next) => {
+  try {
+    const txt = String(ctx.message?.text || '').trim();
+    if (!txt || txt.startsWith('/')) return next && next();
+    if (/^[0-6]$/.test(txt)) return next && next();
+
+    if (ctx.chat && ctx.chat.type === 'private') {
+      const { rows } = await q(
+        `SELECT 1 FROM pending_balls WHERE bowler_telegram_id=$1 AND is_resolved=FALSE AND bowl_number IS NULL LIMIT 1`,
+        [ctx.from.id]
+      );
+      if (rows.length)
+        await ctx.reply('⚠️ Please type only the number *1–6* (0 is not allowed for bowlers).', {
+          parse_mode: 'Markdown',
+          reply_to_message_id: ctx.message.message_id,
+        });
+      return;
+    }
+    if (!isGroup(ctx)) return;
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m || !['innings1', 'innings2'].includes(m.status)) return;
+    const inn = await getInnings(m.id);
+    if (!inn || inn.ball_state !== 'waiting_bowl') return;
+    const { rows } = await q(`SELECT * FROM pending_balls WHERE innings_id=$1 AND is_resolved=FALSE`, [inn.id]);
+    const pend = rows[rows.length - 1];
+    if (!pend || pend.bowl_number == null) return;
+    const striker = await getPlayer(inn.striker_player_id);
+    if (!striker || Number(striker.telegram_id) !== ctx.from.id) return;
+    await ctx.reply('⚠️ Please type only the number *0–6*.', {
+      parse_mode: 'Markdown',
+      reply_to_message_id: ctx.message.message_id,
+      allow_sending_without_reply: true,
+    });
+  } catch (e) {
+    console.error('wrong-input handler:', e.message);
   }
 });
 
