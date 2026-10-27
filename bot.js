@@ -31,7 +31,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r34-2026-10-26'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r36-2026-10-27'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -53,9 +53,8 @@ const PE = {
   zap:      { id: '5809898661840169148', fb: '⚡' }, // lightning
   hand:     { id: '6107130683853903534', fb: '🤝' }, // handshake
   six:      { id: '6174505612487954828', fb: '🚀' }, // blast
-  crown:    { id: '6260439339621159849', fb: '👑' }, // crown
+  crown:    { id: '5217822164362739968', fb: '👑' }, // crown
   trophy:   { id: '6037519756590845010', fb: '🏆' }, // trophy
-  fire:     { id: '5346089086325130313', fb: '🔥' },
   plane:    { id: '6028346797368283073', fb: '✈️' },
   stop:     { id: '6086741365998227951', fb: '🚫' },
   point:    { id: '6086816966012573204', fb: '👉' },
@@ -70,7 +69,7 @@ const PE = {
   mega:     { id: '5271983638995545748', fb: '📢' }, // megaphone
   door:     { id: '6035130900075777681', fb: '🚪' }, // leave / exit
   list:     { id: '5233658378797994515', fb: '📋' }, // clipboard
-  refresh:  { id: '5348129380474306311', fb: '🔄' }, // reload
+  shield:   { id: '5348129380474306311', fb: '🛡' }, // shield with check
   game:     { id: '5938413566624272793', fb: '🎮' }, // controller
   game2:    { id: '5319120041780726017', fb: '🎮' }, // controller alt
   target:   { id: '5782962967716829279', fb: '🎯' }, // target
@@ -79,8 +78,13 @@ const PE = {
   plus:     { id: '5352996025097267519', fb: '➕' }, // add
   flag:     { id: '6070970465130648249', fb: '🚩' }, // red flag
   cart:     { id: '5431499171045581032', fb: '🛒' },
-  eyes:     { id: '6021793768196282527', fb: '👀' },
-  banned:   { id: '6021313238665271979', fb: '🚫' },
+  voice:    { id: '6021793768196282527', fb: '🗣' },
+  mute:     { id: '6021313238665271979', fb: '🔕' },
+  chart:    { id: '5282950412784117735', fb: '📈' }, // chart up
+  medal:    { id: '5188344996356448758', fb: '🏅' }, // trophy 2
+  swords:   { id: '5408935401442267103', fb: '⚔️' }, // vs
+  bulb:     { id: '5472146462362048818', fb: '💡' }, // help / tip
+  money:    { id: '5417924076503062111', fb: '💰' },
   // Never emit <tg-emoji> HTML (shows as raw code for most bots). Unicode only.
   e: (key, fb) => {
     const p = PE[key];
@@ -183,13 +187,30 @@ function md2html(src) {
       .replace(/\*([^*\n]+)\*/g, '<b>$1</b>')
       .replace(/_([^_\n]+)_/g, '<i>$1</i>')
       .replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  let pre = null;
+  const escPre = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   for (const line of s.split('\n')) {
+    if (line.trim() === '```') {
+      if (pre === null) {
+        flush();
+        pre = [];
+      } else {
+        out.push(`<pre>${escPre(pre.join('\n'))}</pre>`);
+        pre = null;
+      }
+      continue;
+    }
+    if (pre !== null) {
+      pre.push(line);
+      continue;
+    }
     if (/^>( |$)/.test(line)) quote.push(inline(line.slice(2)));
     else {
       flush();
       out.push(inline(line));
     }
   }
+  if (pre !== null) out.push(`<pre>${escPre(pre.join('\n'))}</pre>`);
   flush();
   return out
     .join('\n')
@@ -197,21 +218,130 @@ function md2html(src) {
     .replace(/\uE010(\d+)\uE011/g, (_, i) => held[Number(i)] || '');
 }
 
-// every Markdown message sent through the Telegram API is converted to HTML automatically
+// ─── Premium custom emoji in every message text / caption ───
+// Every normal emoji we write is swapped for its premium twin (<tg-emoji>) right before sending.
+// Set PREMIUM_TEXT=0 in the env to switch this off (buttons keep their premium icons).
+const PREMIUM_TEXT = process.env.PREMIUM_TEXT !== '0';
+const PREMIUM_EMOJI = {
+  '🏏': '5346089086325130313', // bat + ball
+  '🏃': '6030703634902161922', // batsman (striker)
+  '🎳': '6030872955397872051', // bowler
+  '⚪': '6021757930989164684', // ball (dot)
+  '🔴': '6104873438021686768', // red dot
+  '🟢': '6107134841382246388', // green dot
+  '🪙': '5382164415019768638', // coin
+  '👑': '5217822164362739968', // crown / captain / host
+  '🏆': '6037519756590845010', // trophy
+  '🏅': '5188344996356448758', // medal
+  '⏱': '5451732530048802485', '⏳': '5451732530048802485', '⏰': '5451732530048802485', // timer
+  '👥': '5296533616224906961', '👤': '5296533616224906961', // players
+  '📢': '5271983638995545748', '📌': '5271983638995545748', // announce
+  '🚪': '6035130900075777681', // leave
+  '📋': '5233658378797994515', // list
+  '🛡': '5348129380474306311', // shield
+  '🎮': '5938413566624272793', // game
+  '🎯': '5782962967716829279', // target
+  '⚠': '6271786398404055377', // warning
+  '🚩': '6070970465130648249', // flag
+  '👋': '6095851644468072524', // wave
+  '➕': '5352996025097267519', // add
+  '⚡': '5809898661840169148', // zap
+  '✅': '6311872470638925629', // ok
+  '❌': '5462998469784393745', // no
+  '🚫': '6086741365998227951', // stop
+  '👉': '6086816966012573204', // point
+  '♾': '6152232006580181837', // unlimited
+  '💜': '6154635934135490300', // heart
+  '✨': '6105048883140760635', // spark
+  '⭐': '5370784581341422520', // star
+  '🚀': '6174505612487954828', // six
+  '📊': '5282950412784117735', '📈': '5282950412784117735', // chart
+  '⚔': '5408935401442267103', // versus
+  '🤝': '6107130683853903534', // handshake / tie
+  '💡': '5472146462362048818', // tip
+  '✈': '6028346797368283073', // plane
+  '🔕': '6021313238665271979', // mute
+};
+const PREMIUM_RE_SRC = Object.keys(PREMIUM_EMOJI)
+  .sort((x, y) => y.length - x.length)
+  .map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\uFE0F?')
+  .join('|');
+function premiumizeHtml(html, max = 45) {
+  let n = 0;
+  const re = new RegExp(
+    `<tg-emoji\\b[^>]*>[\\s\\S]*?<\\/tg-emoji>|<(code|pre)\\b[^>]*>[\\s\\S]*?<\\/\\1>|<[^>]+>|(${PREMIUM_RE_SRC})`,
+    'g'
+  );
+  return String(html).replace(re, (m, _t, emo) => {
+    if (!emo || n >= max) return m;
+    const id = PREMIUM_EMOJI[emo.replace(/\uFE0F/g, '')];
+    if (!id) return m;
+    n++;
+    return `<tg-emoji emoji-id="${id}">${emo}</tg-emoji>`;
+  });
+}
+const stripButtonIcons = (markup) => {
+  if (!markup || !Array.isArray(markup.inline_keyboard)) return markup;
+  return {
+    ...markup,
+    inline_keyboard: markup.inline_keyboard.map((row) =>
+      row.map((b) => {
+        const { icon_custom_emoji_id, style, ...rest } = b;
+        return rest;
+      })
+    ),
+  };
+};
+const TEXT_FIELD = {
+  sendMessage: 'text',
+  editMessageText: 'text',
+  sendPhoto: 'caption',
+  sendAnimation: 'caption',
+  sendVideo: 'caption',
+  sendDocument: 'caption',
+  editMessageCaption: 'caption',
+};
+
+// every message sent through the Telegram API: Markdown dialect → HTML, emojis → premium emojis
 const _callApi = bot.telegram.callApi.bind(bot.telegram);
-bot.telegram.callApi = (method, payload = {}, extra) => {
+bot.telegram.callApi = async (method, payload = {}, extra) => {
   if (!payload) return _callApi(method, payload, extra);
   const p = { ...payload };
-  // Markdown dialect → HTML
+  const field = TEXT_FIELD[method];
   if (p.parse_mode === 'Markdown') {
     p.parse_mode = 'HTML';
     if (typeof p.text === 'string') p.text = md2html(p.text);
     if (typeof p.caption === 'string') p.caption = md2html(p.caption);
   }
-  // Safety: never send raw <tg-emoji> tags (they render as visible code)
-  if (typeof p.text === 'string' && p.text.includes('tg-emoji')) p.text = stripPe(p.text);
-  if (typeof p.caption === 'string' && p.caption.includes('tg-emoji')) p.caption = stripPe(p.caption);
-  return _callApi(method, p, extra);
+  if (!field || typeof p[field] !== 'string' || p.entities || p.caption_entities) return _callApi(method, p, extra);
+
+  // plain text (no parse mode) → HTML so emojis can be swapped
+  let base = p;
+  if (!p.parse_mode && PREMIUM_TEXT) {
+    base = { ...p, parse_mode: 'HTML', [field]: escapeHtml(p[field]) };
+  }
+  if (base.parse_mode !== 'HTML') return _callApi(method, p, extra);
+
+  const clean = { ...base, [field]: stripPe(base[field]) };
+  if (PREMIUM_TEXT) {
+    const prem = premiumizeHtml(clean[field]);
+    if (prem !== clean[field]) {
+      try {
+        return await _callApi(method, { ...clean, [field]: prem }, extra);
+      } catch (e) {
+        const msg = String(e.message || e || '');
+        if (!/parse|entit|emoji|DOCUMENT|custom|BUTTON|icon|style/i.test(msg)) throw e;
+      }
+    }
+  }
+  try {
+    return await _callApi(method, clean, extra);
+  } catch (e) {
+    const msg = String(e.message || e || '');
+    if (clean.reply_markup && /BUTTON|icon|emoji|style/i.test(msg))
+      return _callApi(method, { ...clean, reply_markup: stripButtonIcons(clean.reply_markup) }, extra);
+    throw e;
+  }
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -399,28 +529,37 @@ function line(char = '─', n = 22) {
 }
 
 // ─── Keyboards (premium icon_custom_emoji_id + bold text) ───
-function btn(text, data, peKey) {
+// style: 'primary' (blue) | 'success' (green) | 'danger' (red) - Telegram coloured buttons
+function ubtn(text, url, peKey, style) {
+  const b = Markup.button.url(text, url);
+  const p = peKey && PE[peKey];
+  if (p && p.id) b.icon_custom_emoji_id = p.id;
+  if (style) b.style = style;
+  return b;
+}
+function btn(text, data, peKey, style) {
   const b = Markup.button.callback(text, data);
   const p = peKey && PE[peKey];
   if (p && p.id) b.icon_custom_emoji_id = p.id;
+  if (style) b.style = style;
   return b;
 }
 
 const mainKb = () =>
   Markup.inlineKeyboard([
-    [btn('𝗦𝗢𝗟𝗢', 'm:solo', 'game'), btn('𝗧𝗘𝗔𝗠', 'm:team', 'people')],
-    [btn('𝗣𝗥𝗢𝗙𝗜𝗟𝗘', 'm:profile', 'star'), btn('𝗕𝗢𝗔𝗥𝗗', 'm:lb', 'trophy')],
-    [btn('𝗛𝗘𝗟𝗣', 'm:help', 'spark')],
+    [btn('𝗦𝗢𝗟𝗢', 'm:solo', 'game', 'success'), btn('𝗧𝗘𝗔𝗠', 'm:team', 'people', 'primary')],
+    [btn('𝗣𝗥𝗢𝗙𝗜𝗟𝗘', 'm:profile', 'star', 'primary'), btn('𝗕𝗢𝗔𝗥𝗗', 'm:lb', 'trophy', 'success')],
+    [btn('𝗛𝗘𝗟𝗣', 'm:help', 'bulb')],
   ]);
 
 const tossKb = (id) =>
   Markup.inlineKeyboard([
-    [btn('𝗕𝗔𝗧', `toss:${id}:bat`, 'bat'), btn('𝗕𝗔𝗟𝗟', `toss:${id}:bowl`, 'bowler')],
+    [btn('𝗕𝗔𝗧', `toss:${id}:bat`, 'bat', 'success'), btn('𝗕𝗔𝗟𝗟', `toss:${id}:bowl`, 'bowler', 'danger')],
   ]);
 
 const tossCallKb = (id) =>
   Markup.inlineKeyboard([
-    [btn('𝗛𝗘𝗔𝗗𝗦', `tc:${id}:H`, 'heads'), btn('𝗧𝗔𝗜𝗟𝗦', `tc:${id}:T`, 'tails')],
+    [btn('𝗛𝗘𝗔𝗗𝗦', `tc:${id}:H`, 'heads', 'primary'), btn('𝗧𝗔𝗜𝗟𝗦', `tc:${id}:T`, 'tails', 'danger')],
   ]);
 
 const bowlKb = (token) =>
@@ -440,8 +579,8 @@ const bowlKb = (token) =>
 // captain buttons: only for teams that still have no captain
 const captainKb = (id, needA, needB) => {
   const row = [];
-  if (needA) row.push(btn('𝗖𝗮𝗽𝘁𝗮𝗶𝗻 — 𝗧𝗲𝗮𝗺 𝗔', `cap:${id}:A`, 'crown'));
-  if (needB) row.push(btn('𝗖𝗮𝗽𝘁𝗮𝗶𝗻 — 𝗧𝗲𝗮𝗺 𝗕', `cap:${id}:B`, 'crown'));
+  if (needA) row.push(btn('𝗖𝗮𝗽𝘁𝗮𝗶𝗻 — 𝗧𝗲𝗮𝗺 𝗔', `cap:${id}:A`, 'crown', 'primary'));
+  if (needB) row.push(btn('𝗖𝗮𝗽𝘁𝗮𝗶𝗻 — 𝗧𝗲𝗮𝗺 𝗕', `cap:${id}:B`, 'crown', 'danger'));
   return Markup.inlineKeyboard([row]);
 };
 
@@ -451,7 +590,7 @@ const oversKb = (id) => {
   for (let start = 1; start <= MAX_OVERS; start += 5) {
     const row = [];
     for (let n = start; n < start + 5 && n <= MAX_OVERS; n++) {
-      row.push(btn(String(n), `ov:${id}:${n}`, 'ball'));
+      row.push(btn(String(n), `ov:${id}:${n}`, 'ball', 'primary'));
     }
     rows.push(row);
   }
@@ -897,6 +1036,39 @@ async function soloAutoSetup(match, inn) {
 }
 
 // ─── Scoreboard (designed) ───────────────────────────────
+// ─── tabulate "fancy_grid" style tables (monospace, shown inside ``` blocks) ───
+function fancyGrid(headers, rows) {
+  const all = [headers, ...rows].map((r) => r.map((c) => String(c)));
+  const len = (c) => [...c].length;
+  const w = headers.map((_, i) => Math.max(...all.map((r) => len(r[i]))));
+  const cell = (c, i) => (i === 0 ? ' ' + c + ' '.repeat(w[i] - len(c) + 1) : ' '.repeat(w[i] - len(c) + 1) + c + ' ');
+  const bar = (l, m, r, ch) => l + w.map((n) => ch.repeat(n + 2)).join(m) + r;
+  const row = (r) => '│' + r.map(cell).join('│') + '│';
+  const out = [bar('╒', '╤', '╕', '═'), row(all[0]), bar('╞', '╪', '╡', '═')];
+  all.slice(1).forEach((r, i) => {
+    if (i > 0) out.push(bar('├', '┼', '┤', '─'));
+    out.push(row(r));
+  });
+  out.push(bar('╘', '╧', '╛', '═'));
+  return out.join('\n');
+}
+// full name when it fits; otherwise only the first word (first name); last resort: cut at 11 letters
+const tblName = (p) => {
+  const full = cleanName((p && (p.username || p.first_name)) || '', 'Player').trim() || 'Player';
+  if (full.length <= 11) return full;
+  const first = full.split(/\s+/)[0];
+  return first.length <= 11 ? first : first.slice(0, 11);
+};
+const gridBlock = (headers, rows) => '```\n' + fancyGrid(headers, rows) + '\n```\n';
+
+// PRESSURE bar while chasing (needs runs vs balls left + wickets lost), 20 slots like [IIIIIIIIIIIIIIII.   ]
+function pressureBar(need, ballsLeft, wicketsLost, maxWickets) {
+  const rrr = ballsLeft > 0 ? (need * 6) / ballsLeft : 99;
+  const p = Math.min(1, rrr / 14) * 0.75 + Math.min(1, wicketsLost / Math.max(1, maxWickets)) * 0.25;
+  const k = Math.max(0, Math.min(20, Math.round(p * 20)));
+  return 'I'.repeat(k) + (k < 20 ? '.' + ' '.repeat(19 - k) : '');
+}
+
 async function scoreboard(matchId) {
   const match = await getMatch(matchId);
   if (!match) return '❌ Match not found';
@@ -953,9 +1125,25 @@ async function scoreboard(matchId) {
   const bowler = await getPlayer(inn.current_bowler_id);
 
   t += `\n${line()}\n`;
-  if (striker) t += `${pe('batsman','🏏')} Striker   ${mn(striker)}\n`;
-  if (!isSolo && non) t += `${pe('batsman','🧍')} Non-strike ${mn(non)}\n`;
+  if (striker) t += `${pe('batsman','🏃')} Striker   ${mn(striker)}\n`;
+  if (!isSolo && non) t += `${pe('batsman','🏏')} Non-strike ${mn(non)}\n`;
   if (bowler) t += `${pe('bowler','🎳')} Bowler    ${mn(bowler)}\n`;
+  if (isSolo) {
+    const { rows: bsr } = await q(
+      `SELECT bs.*, mp.username, mp.first_name FROM batting_stats bs JOIN match_players mp ON mp.id = bs.player_id
+        WHERE bs.innings_id=$1 ORDER BY bs.runs DESC, bs.balls_faced ASC LIMIT 12`,
+      [inn.id]
+    );
+    if (bsr.length) {
+      const rowsT = bsr.map((r) => [
+        tblName(r) + (striker && r.player_id === striker.id ? '*' : r.is_out ? '-' : ''),
+        `${r.runs || 0}(${r.balls_faced || 0})`,
+        `${r.fours || 0}/${r.sixes || 0}`,
+        r.balls_faced > 0 ? ((r.runs * 100) / r.balls_faced).toFixed(1) : '0.0',
+      ]);
+      t += `\n*${fancy('PLAYERS')}*\n` + gridBlock(['Name', 'R(B)', '4/6', 'SR'], rowsT) + `\\* on strike   - out\n`;
+    }
+  }
 
   if (!isSolo) {
     // Batting card
@@ -968,8 +1156,8 @@ async function scoreboard(matchId) {
       );
       const s = st[0];
       let icon = '⚪';
-      if (striker && p.id === striker.id) icon = '🏏';
-      else if (non && p.id === non.id) icon = '🧍🏻';
+      if (striker && p.id === striker.id) icon = '🏃';
+      else if (non && p.id === non.id) icon = '🏏';
       else if (s?.is_out) icon = '❌';
       else if (s && (s.balls_faced || 0) > 0) icon = '✅';
 
@@ -1039,18 +1227,13 @@ async function teamScoreboard(match, inn) {
     const wk = i ? i.total_wickets : 0;
     const balls = i ? i.balls_bowled : 0;
     const crr = balls > 0 ? ((runs * 6) / balls).toFixed(2) : '0.0';
-    const icon = label === inn.batting_team ? '🏏' : '🎯';
+    const icon = label === inn.batting_team ? '🏏' : '🎳';
     return `${icon} Team ${label} | *${runs}/${wk}* | ${oversStr(balls)}/${totalOvers} overs\n📈 CRR: ${crr}`;
   };
 
   const quote = (txt) => String(txt).split('\n').map((l) => `> ${l}`).join('\n');
   let t = `🏏 *${fancy('SCORECARD')}*\n`;
   let top = `${teamLine('A')}\n\n${teamLine('B')}`;
-  if (match.target && inn.innings_number === 2) {
-    const need = Math.max(0, match.target - inn.total_runs);
-    const left = Math.max(0, totalOvers * 6 - inn.balls_bowled);
-    top += `\n\n🎯 Target: *${match.target}* — need *${need}* from *${left}* balls`;
-  }
   if (match.penalty_log) {
     top += '\n\n' + String(match.penalty_log).split('\n').filter(Boolean).map((l) => '⚖️ ' + l).join('\n');
   }
@@ -1060,29 +1243,58 @@ async function teamScoreboard(match, inn) {
   const non = await getPlayer(inn.non_striker_player_id);
   const bowler = await getPlayer(inn.current_bowler_id);
 
-  const batLine = async (p, icon) => {
-    const { rows } = await q(`SELECT runs, balls_faced FROM batting_stats WHERE innings_id=$1 AND player_id=$2`, [inn.id, p.id]);
-    const r = rows[0] || { runs: 0, balls_faced: 0 };
-    const sr = r.balls_faced > 0 ? ((r.runs * 100) / r.balls_faced).toFixed(1) : '0.0';
-    return `${icon} ${mn(p)}  ${r.runs || 0}(${r.balls_faced || 0})  SR: ${sr}`;
-  };
+  const batters = await getPlayers(match.id, inn.batting_team);
+  const bowlersAll = await getPlayers(match.id, inn.bowling_team);
+  const { rows: bsRows } = await q(`SELECT * FROM batting_stats WHERE innings_id=$1`, [inn.id]);
+  const { rows: wsRows } = await q(`SELECT * FROM bowling_stats WHERE innings_id=$1`, [inn.id]);
+  const bmap = new Map(bsRows.map((r) => [r.player_id, r]));
+  const wmap = new Map(wsRows.map((r) => [r.player_id, r]));
 
-  let bat = striker ? await batLine(striker, '⚡') : `⏳ waiting for the batting captain: /bat <no.>`;
-  if (non) bat += '\n' + (await batLine(non, '▫️'));
-  t += `\n🏏 *BATTING — Team ${inn.batting_team}*\n${quote(bat)}\n`;
-
-  let bowl;
-  if (bowler) {
-    const { rows } = await q(
-      `SELECT wickets, runs_conceded, balls_bowled FROM bowling_stats WHERE innings_id=$1 AND player_id=$2`,
-      [inn.id, bowler.id]
-    );
-    const r = rows[0];
-    bowl = `🔥 ${mn(bowler)}  ${r && r.balls_bowled > 0 ? `${r.wickets || 0}/${r.runs_conceded || 0} (${oversStr(r.balls_bowled)})` : '(—)'}`;
-  } else {
-    bowl = `⏳ waiting for the bowling captain: /ball <no.>`;
+  const batRows = [];
+  for (const p of batters) {
+    const r = bmap.get(p.id);
+    const isStr = striker && p.id === striker.id;
+    const isNon = non && p.id === non.id;
+    if (!r && !isStr && !isNon) continue;
+    const runs = r?.runs || 0;
+    const balls = r?.balls_faced || 0;
+    batRows.push([
+      tblName(p) + (isStr ? '*' : r?.is_out ? '-' : ''),
+      `${runs}(${balls})`,
+      `${r?.fours || 0}/${r?.sixes || 0}`,
+      balls > 0 ? ((runs * 100) / balls).toFixed(1) : '0.0',
+    ]);
   }
-  t += `\n🎯 *BOWLING — Team ${inn.bowling_team}*\n${quote(bowl)}\n`;
+  t += `\n*${fancy('TEAM ' + inn.batting_team + ' PLAYERS')}*\n`;
+  if (batRows.length) t += gridBlock(['Name', 'R(B)', '4/6', 'SR'], batRows) + `\\* on strike   - out\n`;
+  if (!striker) t += `⏳ waiting for the batting captain: /bat <no.>\n`;
+
+  const bowlRows = [];
+  for (const p of bowlersAll) {
+    const r = wmap.get(p.id);
+    const bb = r?.balls_bowled || 0;
+    const isCur = bowler && p.id === bowler.id;
+    if (bb === 0 && !isCur) continue;
+    bowlRows.push([
+      tblName(p) + (isCur ? '*' : ''),
+      oversStr(bb),
+      r?.runs_conceded || 0,
+      r?.wickets || 0,
+      bb > 0 ? (((r?.runs_conceded || 0) * 6) / bb).toFixed(1) : '0.0',
+    ]);
+  }
+  t += `\n*${fancy('TEAM ' + inn.bowling_team + ' BOWLERS')}*\n`;
+  if (bowlRows.length) t += gridBlock(['Name', 'O', 'R', 'W', 'Eco'], bowlRows);
+  if (!bowler) t += `⏳ waiting for the bowling captain: /ball <no.>\n`;
+
+  // chasing: target line + PRESSURE bar (only in the 2nd innings)
+  if (match.target && inn.innings_number === 2) {
+    const need = Math.max(0, match.target - inn.total_runs);
+    const left = Math.max(0, totalOvers * 6 - inn.balls_bowled);
+    const bar = pressureBar(need, left, inn.total_wickets || 0, Math.max(1, batters.length - 1));
+    t += `\n• Chasing Target *${match.target}* — *${need}* runs need from *${left}* balls\n`;
+    t += `> PRESSURE \`[${bar}]\`\n`;
+  }
 
   t += `\n🎮 Game Host - ${await hostLabel(match)}\n`;
   t += `⏱ ${TURN_SECONDS}s to respond, otherwise -${TURN_PENALTY} runs`;
@@ -1160,7 +1372,7 @@ async function rosterText(match) {
       if (!isSolo && team?.captain_id && Number(p.telegram_id) === Number(team.captain_id)) mark += ' [🧢]';
       if (outSet.has(p.id)) mark += ' ❌';
       if (inn && (p.id === inn.striker_player_id || p.id === inn.non_striker_player_id)) mark += ' 🏃';
-      if (inn && p.id === inn.current_bowler_id) mark += ' 🎯';
+      if (inn && p.id === inn.current_bowler_id) mark += ' 🎳';
       return mark;
     };
     t += rosterBlock(pl, markOf);
@@ -1282,7 +1494,7 @@ async function sendMatchBanner(telegram, groupId, m, extraCaption = '') {
   const caption =
     `⚙ Overs — *${m.total_overs}*  |  Innings — *${inningsWord(m.current_innings || 1)}*\n` +
     `🏏 Batting — *Team ${m.current_batting_team}*\n` +
-    `🎯 Bowling — *Team ${m.current_bowling_team}*` +
+    `🎳 Bowling — *Team ${m.current_bowling_team}*` +
     extraCaption;
   try {
     const [hostDp, dpA, dpB] = await Promise.all([
@@ -2134,7 +2346,7 @@ async function beginSoloFromLobby(matchId, chatId, telegram) {
       `🎳 First Bowler: *${mn(bowler)}*  (#2)\n\n` +
       `♾ Unlimited overs — every player bats until OUT\n` +
       `🎳 Bowler changes every *${Number(m.solo_balls) === 6 ? 6 : 3}* balls (next player by number)\n` +
-      `${pe('ball','🎯')} Same number = OUT\n` +
+      `${pe('target','🎯')} Same number = OUT\n` +
       `📩 The bowler sends a number in the bot's DM first, then *${mn(batter)}* types *0–6* in the group!`,
     { parse_mode: 'Markdown' }
   );
@@ -2232,7 +2444,7 @@ async function createSoloLobby(ctx) {
         `> /extend30 — +30s\n` +
         `> /endmatch — cancel`,
       Markup.inlineKeyboard([
-        [Markup.button.callback('🎳 3 balls', `sb:${m.id}:3`), Markup.button.callback('🎳 6 balls', `sb:${m.id}:6`)],
+        [btn('𝟯 𝗕𝗔𝗟𝗟𝗦', `sb:${m.id}:3`, 'bowler', 'primary'), btn('𝟲 𝗕𝗔𝗟𝗟𝗦', `sb:${m.id}:6`, 'bowler', 'success')],
       ])
     );
     await ctx.telegram.sendMessage(
@@ -2699,8 +2911,8 @@ async function addPlayers(ctx, label, viaAdd = false) {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([
             [
-              btn(`𝗬𝗲𝘀, 𝗷𝗼𝗶𝗻${m.mode === 'solo' ? '' : ' Team ' + label}`, `inv:Y:${token}`, 'ok'),
-              btn('𝗡𝗼', `inv:N:${token}`, 'no'),
+              btn(`𝗬𝗲𝘀, 𝗷𝗼𝗶𝗻${m.mode === 'solo' ? '' : ' Team ' + label}`, `inv:Y:${token}`, 'ok', 'success'),
+              btn('𝗡𝗼', `inv:N:${token}`, 'no', 'danger'),
             ],
           ]),
         }
@@ -3377,11 +3589,11 @@ bot.command('bat', async (ctx) => {
         ctx.chat.id,
         'opener',
         `🏏 <b>OPENERS READY!</b>\n` +
-          `🟢 Striker: ${htag(striker)}\n` +
-          `🟡 Non-striker: ${htag(p)}\n` +
+          `🏃 Striker: ${htag(striker)}\n` +
+          `🏏 Non-striker: ${htag(p)}\n` +
           (inn.current_bowler_id
             ? `🔥 Game on!`
-            : `🎯 Bowling captain ${cap ? htag(cap) : ''}, choose your opening bowler:\n<code>/ball &lt;no.&gt;</code>`)
+            : `🎳 Bowling captain ${cap ? htag(cap) : ''}, choose your opening bowler:\n<code>/ball &lt;no.&gt;</code>`)
       );
     }
     await ensureTurnClock(m.id);
@@ -3652,7 +3864,7 @@ function groupMsgLink(chatId, msgId) {
 
 const openBotDmKb = () =>
   BOT_USERNAME
-    ? Markup.inlineKeyboard([[Markup.button.url('🤖 Open bot DM', `https://t.me/${BOT_USERNAME}`)]])
+    ? Markup.inlineKeyboard([[ubtn('𝗢𝗽𝗲𝗻 𝗯𝗼𝘁 𝗗𝗠', `https://t.me/${BOT_USERNAME}`, 'plane', 'primary')]])
     : {};
 
 // DM to the bowler: "send your number"
@@ -4025,7 +4237,7 @@ bot.command(['changehost', 'votehost'], async (ctx) => {
     };
     const sent = await ctx.reply(await voteText(m, v), {
       parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([[Markup.button.callback('🗳 Vote to change host', `hv:${m.id}`)]]),
+      ...Markup.inlineKeyboard([[btn('𝗩𝗼𝘁𝗲 𝘁𝗼 𝗰𝗵𝗮𝗻𝗴𝗲 𝗵𝗼𝘀𝘁', `hv:${m.id}`, 'people', 'primary')]]),
     });
     v.msgId = sent.message_id;
     v.timer = setTimeout(async () => {
@@ -4066,13 +4278,13 @@ bot.action(/^hv:(.+)$/, async (ctx) => {
       v.phase = 'claim';
       await ctx.editMessageText(await voteText(m, v), {
         parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([[Markup.button.callback('👑 Become Host', `hc:${m.id}`)]]),
+        ...Markup.inlineKeyboard([[btn('𝗕𝗲𝗰𝗼𝗺𝗲 𝗛𝗼𝘀𝘁', `hc:${m.id}`, 'crown', 'success')]]),
       });
     } else {
       await ctx
         .editMessageText(await voteText(m, v), {
           parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([[Markup.button.callback('🗳 Vote to change host', `hv:${m.id}`)]]),
+          ...Markup.inlineKeyboard([[btn('𝗩𝗼𝘁𝗲 𝘁𝗼 𝗰𝗵𝗮𝗻𝗴𝗲 𝗵𝗼𝘀𝘁', `hv:${m.id}`, 'people', 'primary')]]),
         })
         .catch(() => {});
     }
@@ -4240,7 +4452,7 @@ async function bowlerLocksNumber(ctx, n) {
   await ctx.reply(`✅ Number *${n}* locked!\n📍 Back to the game: ${mdEsc(m.group_title || 'group')}`, {
     parse_mode: 'Markdown',
     reply_to_message_id: ctx.message.message_id,
-    ...(url ? Markup.inlineKeyboard([[Markup.button.url('↩️ Back to group', url)]]) : {}),
+    ...(url ? Markup.inlineKeyboard([[ubtn('𝗕𝗮𝗰𝗸 𝘁𝗼 𝗴𝗿𝗼𝘂𝗽', url, 'people')]]) : {}),
   });
   await ensureTurnClock(m.id); // now the batsman is on the clock
 }
@@ -5216,7 +5428,7 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
     ? `${pe('no','💥')} <b>WICKET!</b>`
     : runs === 0
     ? `${pe('ball','⚪')} <b>DOT BALL</b>`
-    : `${runs === 6 ? pe('six','🚀') : runs === 4 ? pe('fire','🔥') : pe('bat','🏏')} <b>${runs} RUN${runs === 1 ? '' : 'S'}!</b>`;
+    : `${runs === 6 ? pe('six','🚀') : runs === 4 ? pe('bat','🏏') : pe('bat','🏏')} <b>${runs} RUN${runs === 1 ? '' : 'S'}!</b>`;
   const cmt = pick(COMMENT[isWicket ? 'out' : String(runs)] || COMMENT['0'] || ['Nice ball.']);
 
   // milestones (each has its own /pgif GIF; the normal result GIF is the fallback)
@@ -5268,7 +5480,7 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
     } else if (bowlWk === 3) {
       gifKeys.push('3w');
       notes.push(
-        `${pe('fire','🔥')} <b>${fancy('3 WICKETS')}!</b>\n` +
+        `${pe('bat','🏏')} <b>${fancy('3 WICKETS')}!</b>\n` +
           `${pe('ok','🎊')} Congratulations ${disp(bowlerP)} — <b>3 wickets</b> and still hungry!`
       );
     }
