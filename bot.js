@@ -31,7 +31,7 @@ const pool = new Pool({
   max: 8,
 });
 
-const BOT_VERSION = 'r36-2026-10-27'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r37-2026-10-27'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -1067,6 +1067,153 @@ function pressureBar(need, ballsLeft, wicketsLost, maxWickets) {
   const p = Math.min(1, rrr / 14) * 0.75 + Math.min(1, wicketsLost / Math.max(1, maxWickets)) * 0.25;
   const k = Math.max(0, Math.min(20, Math.round(p * 20)));
   return 'I'.repeat(k) + (k < 20 ? '.' + ' '.repeat(19 - k) : '');
+}
+
+// ═════════════════ NATIVE TABLE SCOREBOARD (Bot API 10.1 sendRichMessage) ═════════════════
+const RICH_TABLES = process.env.RICH_TABLES !== '0'; // RICH_TABLES=0 -> always use the old text scoreboard
+let richWarned = false;
+const hEsc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const richName = (p) => hEsc([p?.first_name, p?.last_name].filter(Boolean).join(' ').trim() || p?.username || 'Player');
+
+async function sendRich(telegram, chatId, html, extra = {}) {
+  const tries = [];
+  if (PREMIUM_TEXT) tries.push(premiumizeHtml(html, 60));
+  tries.push(stripPe(html));
+  let last;
+  for (const h of tries) {
+    try {
+      return await telegram.callApi('sendRichMessage', { chat_id: chatId, rich_message: { html: h }, ...extra });
+    } catch (e) {
+      last = e;
+    }
+  }
+  throw last;
+}
+
+const batCell = (runs, balls, fours, sixes) =>
+  `${runs} runs | ${balls} ball | ${sixes} six | ${fours} four | ${balls > 0 ? ((runs * 100) / balls).toFixed(1) : '0.0'} strike rate`;
+const richTable = (headers, rows) =>
+  `<table bordered striped><tr>${headers.map((h) => `<th>${h}</th>`).join('')}</tr>` +
+  rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join('')}</tr>`).join('') +
+  `</table>`;
+
+// returns html, or null when there is nothing to show as a table (not started / finished)
+async function scoreboardRich(matchId) {
+  const match = await getMatch(matchId);
+  if (!match || ['completed', 'cancelled'].includes(match.status)) return null;
+  const inn = await getInnings(matchId);
+  if (!inn) return null;
+  const isSolo = match.mode === 'solo';
+  const totalOvers = match.total_overs || DEFAULT_OVERS;
+
+  const striker = await getPlayer(inn.striker_player_id);
+  const non = await getPlayer(inn.non_striker_player_id);
+  const bowler = await getPlayer(inn.current_bowler_id);
+  const { rows: bsRows } = await q(`SELECT * FROM batting_stats WHERE innings_id=$1`, [inn.id]);
+  const { rows: wsRows } = await q(`SELECT * FROM bowling_stats WHERE innings_id=$1`, [inn.id]);
+  const bmap = new Map(bsRows.map((r) => [r.player_id, r]));
+  const wmap = new Map(wsRows.map((r) => [r.player_id, r]));
+
+  let h = `<p><b>🏏 ${hEsc(fancy('SCORECARD'))}</b>  ·  Innings ${inn.innings_number}</p>`;
+
+  // summary quote
+  const pen = match.penalty_log ? String(match.penalty_log).split('\n').filter(Boolean) : [];
+  if (isSolo) {
+    const crr = inn.balls_bowled > 0 ? ((inn.total_runs * 6) / inn.balls_bowled).toFixed(2) : '0.00';
+    h += `<blockquote><p>🏏 Score: <b>${inn.total_runs}/${inn.total_wickets}</b></p><p>⏱ Balls: <b>${inn.balls_bowled}</b></p><p>📈 RR: <b>${crr}</b></p>` +
+      pen.map((l) => `<p>⚖️ ${hEsc(l)}</p>`).join('') + `</blockquote>`;
+  } else {
+    const { rows: all } = await q(`SELECT * FROM innings WHERE match_id=$1 ORDER BY innings_number`, [match.id]);
+    const line = (label) => {
+      const i = all.find((x) => x.batting_team === label);
+      const runs = i ? i.total_runs : 0;
+      const wk = i ? i.total_wickets : 0;
+      const balls = i ? i.balls_bowled : 0;
+      const crr = balls > 0 ? ((runs * 6) / balls).toFixed(2) : '0.0';
+      const icon = label === inn.batting_team ? '🏏' : '🎳';
+      return `<p>${icon} Team ${label} | <b>${runs}/${wk}</b> | ${oversStr(balls)}/${totalOvers} overs</p><p>📈 CRR: ${crr}</p>`;
+    };
+    h += `<blockquote>${line('A')}${line('B')}` + pen.map((l) => `<p>⚖️ ${hEsc(l)}</p>`).join('') + `</blockquote>`;
+  }
+
+  // batting table
+  if (isSolo) {
+    const players = await getPlayers(match.id, 'A');
+    const rows = players
+      .map((p) => ({ p, r: bmap.get(p.id) }))
+      .filter((x) => x.r || (striker && x.p.id === striker.id))
+      .sort((a, b) => (b.r?.runs || 0) - (a.r?.runs || 0))
+      .slice(0, 12)
+      .map(({ p, r }) => {
+        const mark = striker && p.id === striker.id ? '🏃 ' : r?.is_out ? '❌ ' : '';
+        return [mark + richName(p), batCell(r?.runs || 0, r?.balls_faced || 0, r?.fours || 0, r?.sixes || 0)];
+      });
+    h += `<p><b>PLAYERS</b></p>`;
+    if (rows.length) h += richTable(['Name', 'Score'], rows);
+    if (bowler) h += `<p>🎳 Bowler: <b>${richName(bowler)}</b></p>`;
+  } else {
+    const batters = await getPlayers(match.id, inn.batting_team);
+    const bowlers = await getPlayers(match.id, inn.bowling_team);
+    const batRows = [];
+    for (const p of batters) {
+      const r = bmap.get(p.id);
+      const isStr = striker && p.id === striker.id;
+      const isNon = non && p.id === non.id;
+      if (!r && !isStr && !isNon) continue;
+      const mark = isStr ? '🏃 ' : isNon ? '🏏 ' : r?.is_out ? '❌ ' : '';
+      batRows.push([mark + richName(p), batCell(r?.runs || 0, r?.balls_faced || 0, r?.fours || 0, r?.sixes || 0)]);
+    }
+    h += `<p><b>TEAM ${inn.batting_team} PLAYERS</b></p>`;
+    if (batRows.length) h += richTable(['Name', 'Score'], batRows);
+    if (!striker) h += `<p>⏳ waiting for the batting captain: /bat &lt;no.&gt;</p>`;
+
+    const bowlRows = [];
+    for (const p of bowlers) {
+      const r = wmap.get(p.id);
+      const bb = r?.balls_bowled || 0;
+      const isCur = bowler && p.id === bowler.id;
+      if (bb === 0 && !isCur) continue;
+      const conc = r?.runs_conceded || 0;
+      bowlRows.push([
+        (isCur ? '🎳 ' : '') + richName(p),
+        `${oversStr(bb)} overs | ${conc} runs | ${r?.wickets || 0} wkt | ${bb > 0 ? ((conc * 6) / bb).toFixed(1) : '0.0'} econ`,
+      ]);
+    }
+    h += `<p><b>TEAM ${inn.bowling_team} BOWLERS</b></p>`;
+    if (bowlRows.length) h += richTable(['Name', 'Overs'], bowlRows);
+    if (!bowler) h += `<p>⏳ waiting for the bowling captain: /ball &lt;no.&gt;</p>`;
+
+    if (match.target && inn.innings_number === 2) {
+      const need = Math.max(0, match.target - inn.total_runs);
+      const left = Math.max(0, totalOvers * 6 - inn.balls_bowled);
+      const bar = pressureBar(need, left, inn.total_wickets || 0, Math.max(1, batters.length - 1));
+      h += `<p>• Chasing Target <b>${match.target}</b> — <b>${need}</b> runs need from <b>${left}</b> balls</p>`;
+      h += `<blockquote><p>PRESSURE <code>[${bar}]</code></p></blockquote>`;
+    }
+  }
+
+  h += `<p>💡 Bowler: 1–6 in bot DM · Batsman: 0–6 in group (0 = dot)</p>`;
+  h += `<p>⏱ ${TURN_SECONDS}s to respond, otherwise -${TURN_PENALTY} runs</p>`;
+  return h;
+}
+
+// native table scoreboard; falls back to the old text scoreboard if Telegram refuses it
+async function sendScoreboard(telegram, chatId, matchId) {
+  if (RICH_TABLES) {
+    try {
+      const html = await scoreboardRich(matchId);
+      if (html) {
+        await sendRich(telegram, chatId, html);
+        return;
+      }
+    } catch (e) {
+      if (!richWarned) {
+        richWarned = true;
+        console.error('rich scoreboard failed, using the text scoreboard:', e.message);
+      }
+    }
+  }
+  await telegram.sendMessage(chatId, await scoreboard(matchId), { parse_mode: 'Markdown' });
 }
 
 async function scoreboard(matchId) {
@@ -2350,9 +2497,7 @@ async function beginSoloFromLobby(matchId, chatId, telegram) {
       `📩 The bowler sends a number in the bot's DM first, then *${mn(batter)}* types *0–6* in the group!`,
     { parse_mode: 'Markdown' }
   );
-  await telegram.sendMessage(chatId, await scoreboard(matchId), {
-    parse_mode: 'Markdown',
-  });
+  await sendScoreboard(telegram, chatId, matchId);
   await ensureTurnClock(matchId);
 }
 
@@ -3740,7 +3885,7 @@ bot.command('score', async (ctx) => {
   if (!isGroup(ctx)) return;
   const m = await getActiveMatch(ctx.chat.id);
   if (!m) return ctx.reply(`${pe('no','❌')} No active match`);
-  await ctx.reply(await scoreboard(m.id), { parse_mode: 'Markdown' });
+  await sendScoreboard(ctx.telegram, ctx.chat.id, m.id);
 });
 
 // ═════════════════ DISCIPLINE: 60s turn clock, penalties, warnings ═════════════════
@@ -3993,6 +4138,34 @@ async function onTurnTimeout(matchId, key) {
   else await bowlTimeout(st);
 }
 
+// Solo: when nobody answers (all players are away) the match ends by itself
+const soloIdle = new Map(); // matchId -> timeouts in a row without any ball being played
+const soloIdleReset = (matchId) => soloIdle.delete(mkey(matchId));
+async function soloIdleHit(m, inn) {
+  if (m.mode !== 'solo') return false;
+  const c = (soloIdle.get(mkey(m.id)) || 0) + 1;
+  soloIdle.set(mkey(m.id), c);
+  const players = await getPlayers(m.id, 'A');
+  const limit = players.length <= 2 ? 2 : 3;
+  if (c < limit) return false;
+  soloIdle.delete(mkey(m.id));
+  const groupId = Number(m.group_chat_id);
+  clearTurnClock(m.id);
+  await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE innings_id=$1 AND is_resolved=FALSE`, [inn.id]);
+  await bot.telegram.sendMessage(
+    groupId,
+    `😴 *${fancy('MATCH ENDED')}*\n> Nobody is playing — ${limit} turns in a row timed out.\n> The match is closed automatically.`,
+    { parse_mode: 'Markdown' }
+  );
+  const fresh = (await q(`SELECT * FROM innings WHERE id=$1`, [inn.id])).rows[0] || inn;
+  await finishSolo(bot.telegram, groupId, m, fresh);
+  clearTurnClock(m.id);
+  clearWarns(m.id);
+  stopIdleWatch(m.id);
+  endVote(m.id);
+  return true;
+}
+
 // Bowler locked his number but the batsman did not type 0-6 in time
 async function batTimeout({ m, inn, pend }) {
   touchMatch(m.id);
@@ -4017,6 +4190,7 @@ async function batTimeout({ m, inn, pend }) {
         : `> 👉 Type *0–6* now (${TURN_SECONDS}s)`),
     { parse_mode: 'Markdown' }
   );
+  if (isSolo && (await soloIdleHit(m, inn))) return;
 
   if (!retire) return ensureTurnClock(m.id); // same locked bowler number, fresh clock
 
@@ -4075,6 +4249,7 @@ async function bowlTimeout({ m, inn, pend }) {
       `> 🔁 This ball is cancelled.`,
     { parse_mode: 'Markdown' }
   );
+  if (isSolo && (await soloIdleHit(m, inn))) return;
 
   if (warn >= limit) {
     resetWarn(m.id, bowler.id, 'bowl');
@@ -4085,7 +4260,7 @@ async function bowlTimeout({ m, inn, pend }) {
           parse_mode: 'Markdown',
         });
         await sendResultGif(tg, groupId, 'bowlentry', undefined, newBowlerCaption(nb));
-        await tg.sendMessage(groupId, await scoreboard(m.id), { parse_mode: 'Markdown' }); // solo: new bowler → scoreboard
+        await sendScoreboard(tg, groupId, m.id); // solo: new bowler → scoreboard
       }
     } else {
       // team: nobody is bowling until the captain chooses
@@ -4395,6 +4570,10 @@ bot.hears(/^[0-6]$/, async (ctx) => {
 
 // Bowler sends his number in the bot's DM → it is linked to the game he is playing in
 async function bowlerLocksNumber(ctx, n) {
+  try {
+    const { rows: pm } = await q(`SELECT match_id FROM pending_balls WHERE bowler_telegram_id=$1 AND is_resolved=FALSE LIMIT 1`, [ctx.from.id]);
+    if (pm[0]) soloIdleReset(pm[0].match_id);
+  } catch (_) {}
   // Bowlers bowl 1–6 only. 0 is a batsman-only choice (dot ball).
   if (n === 0) {
     return ctx.reply(
@@ -4852,7 +5031,7 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
     stopIdleWatch(m.id);
     endVote(m.id);
   } else {
-    if (showBoard) await telegram.sendMessage(groupId, await scoreboard(m.id), { parse_mode: 'Markdown' });
+    if (showBoard) await sendScoreboard(telegram, groupId, m.id);
     await ensureTurnClock(m.id);
   }
 }
@@ -5280,6 +5459,7 @@ const pick = (a) => a[Math.floor(Math.random() * a.length)];
 // ─── Resolve a ball: bowler number (locked) vs batsman number ───────────
 async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
   touchMatch(m.id);
+  soloIdleReset(m.id);
   const bowlNum = Number(pend.bowl_number);
   const isWicket = Number(batNum) === bowlNum;
   const runs = isWicket ? 0 : Number(batNum) || 0;
