@@ -19,6 +19,7 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+
         run: |
           set -eu
 
@@ -28,17 +29,27 @@ jobs:
           printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
-          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -p 20031 -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
           ssh -i ~/.ssh/deploy_key \
+            -p 20031 \
             -o StrictHostKeyChecking=yes \
             "$VPS_USER@$VPS_HOST" '
               set -eu
               cd /root/Sunny-hijra
+
+              echo "Pulling latest code..."
               git pull --ff-only origin main
+
+              echo "Installing dependencies..."
               npm install
+
+              echo "Restarting CricMonster..."
               pm2 restart cricmonster --update-env
               pm2 save
+
               sleep 3
+
+              echo "Checking bot status..."
               pm2 status
             '
