@@ -28,10 +28,15 @@ if (!BOT_TOKEN || !DATABASE_URL) {
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: DATABASE_URL.includes('supabase') ? { rejectUnauthorized: false } : undefined,
-  max: 8,
+  max: 10,
+  idleTimeoutMillis: 5 * 60 * 1000, // default is 10s -> every quiet moment closed the connection and the next move paid a new SSL handshake
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
+  connectionTimeoutMillis: 15000,
 });
+pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r37-2026-10-27'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r41-2026-10-28'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -410,8 +415,25 @@ function clearLobby(matchId) {
 }
 
 // ─── DB ──────────────────────────────────────────────────
+const SLOW_Q_MS = Number(process.env.SLOW_Q_MS || 400); // set SLOW_Q_MS=0 to silence
 async function q(sql, params = []) {
-  return pool.query(sql, params);
+  const t0 = Date.now();
+  const res = await pool.query(sql, params);
+  const ms = Date.now() - t0;
+  if (SLOW_Q_MS && ms >= SLOW_Q_MS) console.warn(`[slow-db] ${ms}ms  ${String(sql).replace(/\s+/g, ' ').slice(0, 90)}`);
+  if (/^\s*(INSERT|UPDATE|DELETE)/i.test(sql) && /pgif_settings|bot_media/.test(sql)) pgifCache.clear();
+  return res;
+}
+const pgifCache = new Map(); // key -> { v, at }  (saved GIFs almost never change)
+const PGIF_TTL_MS = 5 * 60 * 1000;
+async function dbLatency(n = 3) {
+  const t = [];
+  for (let i = 0; i < n; i++) {
+    const t0 = Date.now();
+    await pool.query('SELECT 1');
+    t.push(Date.now() - t0);
+  }
+  return Math.round(t.reduce((a, b) => a + b, 0) / t.length);
 }
 
 async function getActiveMatch(chatId) {
@@ -922,7 +944,7 @@ async function renderPlayersBanner() {
 async function assetReport() {
   const fs = require('fs');
   const out = [];
-  for (const f of ['host.jpg', 'solo_final.jpg', 'team_final.jpg', 'team_banner.jpg', 'players_list.jpg', 'default_dp.png']) {
+  for (const f of ['host.jpg', 'solo_final.jpg', 'team_final.jpg', 'team_banner.jpg', 'players_list.jpg', 'userinfo.jpg', 'default_dp.png']) {
     const file = path.join(ASSET_DIR, f);
     if (!fs.existsSync(file)) {
       out.push(`${f} — MISSING${f === 'default_dp.png' ? ' (a built-in avatar is used)' : ''}`);
@@ -945,6 +967,109 @@ async function assetReport() {
   return out;
 }
 
+// ═══ /userinfo PROFILE CARD ═══
+// userinfo.jpg (1469x1071): the empty CRIC MONSTER stats template (the printed "@" is already removed)
+const USERCARD_LAYOUT = {
+  file: 'userinfo.jpg',
+  circle: { cx: 733, cy: 498, r: 121 },
+  name: { cx: 734, cy: 651, maxW: 304, px: 46 },
+  handle: { cx: 735, cy: 711, maxW: 250, px: 36 },
+  level: { cx: 733, cy: 925, maxW: 200, px: 78 },
+  px: 46,
+  bat: {
+    r1: { cy: 596, xs: [108, 238, 368, 497], w: 100 }, // TOTAL RUNS, BALLS, MATCH PLAYED, DUCK
+    r2: { cy: 724, xs: [108, 238, 368, 497], w: 100 }, // FOURS, SIXES, STRIKE RATE, 50s / 100s
+  },
+  bowl: {
+    r1: { cy: 596, xs: [970, 1094, 1228, 1366], w: 100 }, // WICKETS, HAT-TRICK, MATCH PLAYED, TOTAL BALLS
+    r2: { cy: 724, xs: [994, 1167, 1344], w: 124 }, // 3W, 5W, ECONOMY
+  },
+};
+
+// condensed, gold-gradient text with a dark outline (like the example card)
+async function goldText(text, px, maxW, o = {}) {
+  needSharp();
+  const top = o.top || [255, 244, 204];
+  const bottom = o.bottom || [232, 168, 58];
+  const outline = o.outline || [40, 20, 0];
+  const squeeze = o.squeeze || 0.8;
+  const minPx = o.minPx || 16;
+  const make = async (size) => {
+    const base = await renderText(String(text), size, '#ffffff');
+    const w = Math.max(1, Math.round(base.info.width * squeeze));
+    return sharp(base.data).resize(w, base.info.height, { fit: 'fill' }).png().toBuffer({ resolveWithObject: true });
+  };
+  let size = px;
+  let t = await make(size);
+  while (t.info.width + 8 > maxW && size > minPx) {
+    size -= 2;
+    t = await make(size);
+  }
+  const { data, info } = await sharp(t.data).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const recolor = (fn) => {
+    const out = Buffer.alloc(data.length);
+    for (let y = 0; y < info.height; y++) {
+      const f = info.height > 1 ? y / (info.height - 1) : 0;
+      for (let x = 0; x < info.width; x++) {
+        const i = (y * info.width + x) * 4;
+        const c = fn(f);
+        out[i] = c[0];
+        out[i + 1] = c[1];
+        out[i + 2] = c[2];
+        out[i + 3] = data[i + 3];
+      }
+    }
+    return sharp(out, { raw: { width: info.width, height: info.height, channels: 4 } }).png().toBuffer();
+  };
+  const gold = await recolor((f) => [0, 1, 2].map((k) => Math.round(top[k] * (1 - f) + bottom[k] * f)));
+  const dark = await recolor(() => outline);
+  const pad = 4;
+  const layers = [];
+  for (let dx = -2; dx <= 2; dx++)
+    for (let dy = -2; dy <= 2; dy++) if ((dx || dy) && dx * dx + dy * dy <= 5) layers.push({ input: dark, left: pad + dx, top: pad + dy });
+  layers.push({ input: dark, left: pad + 1, top: pad + 3 }); // soft drop shadow
+  layers.push({ input: gold, left: pad, top: pad });
+  return sharp({
+    create: { width: info.width + pad * 2, height: info.height + pad * 2, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+  })
+    .composite(layers)
+    .png()
+    .toBuffer({ resolveWithObject: true });
+}
+
+// p = { dp, name, handle, level, bat: {runs, balls, matches, ducks, fours, sixes, sr, fifties, hundreds},
+//       bowl: {wkts, hattricks, matches, balls, w3, w5, eco} }
+async function renderUserCard(p) {
+  needSharp();
+  const L = USERCARD_LAYOUT;
+  const layers = [await dpLayer(p.dp, L.circle)];
+  const put = async (txt, cx, cy, maxW, px, opts) => {
+    if (txt === undefined || txt === null || txt === '') return;
+    layers.push(centered(await goldText(String(txt), px, maxW, opts), cx, cy, 0));
+  };
+  await put(String(p.name || 'PLAYER').toUpperCase(), L.name.cx, L.name.cy, L.name.maxW, L.name.px);
+  await put(p.handle, L.handle.cx, L.handle.cy, L.handle.maxW, L.handle.px, {
+    top: [255, 250, 235], bottom: [240, 226, 190], outline: [10, 6, 2], squeeze: 0.84,
+  });
+  await put(p.level, L.level.cx, L.level.cy, L.level.maxW, L.level.px);
+
+  const n = (v) => Number(v || 0).toLocaleString('en-US');
+  const b = p.bat || {};
+  const w = p.bowl || {};
+  const batVals1 = [n(b.runs), n(b.balls), n(b.matches), n(b.ducks)];
+  const batVals2 = [n(b.fours), n(b.sixes), (b.sr || 0).toFixed(2), `${b.fifties || 0} / ${b.hundreds || 0}`];
+  const bowlVals1 = [n(w.wkts), n(w.hattricks), n(w.matches), n(w.balls)];
+  const bowlVals2 = [n(w.w3), n(w.w5), (w.eco || 0).toFixed(2)];
+  for (let i = 0; i < 4; i++) {
+    await put(batVals1[i], L.bat.r1.xs[i], L.bat.r1.cy, L.bat.r1.w, L.px);
+    await put(batVals2[i], L.bat.r2.xs[i], L.bat.r2.cy, L.bat.r2.w, L.px);
+    await put(bowlVals1[i], L.bowl.r1.xs[i], L.bowl.r1.cy, L.bowl.r1.w, L.px);
+  }
+  for (let i = 0; i < 3; i++) await put(bowlVals2[i], L.bowl.r2.xs[i], L.bowl.r2.cy, L.bowl.r2.w, L.px);
+
+  return sharp(path.join(ASSET_DIR, L.file)).composite(layers).jpeg({ quality: 90 }).toBuffer();
+}
+
 // ═══ Telegram profile photo download ═══
 function downloadBuf(url) {
   return new Promise((resolve, reject) => {
@@ -963,8 +1088,18 @@ function downloadBuf(url) {
 }
 
 // returns Buffer or null (no photo / hidden / error)
+const dpCache = new Map(); // userId -> { buf, at }
+const DP_TTL_MS = 30 * 60 * 1000;
 async function getUserDp(telegram, userId) {
   if (Number(userId) <= -1001) return null; // bot players have no photo
+  const hit = dpCache.get(String(userId));
+  if (hit && Date.now() - hit.at < (hit.buf ? DP_TTL_MS : 5 * 60 * 1000)) return hit.buf;
+  const buf = await getUserDpFresh(telegram, userId);
+  dpCache.set(String(userId), { buf, at: Date.now() });
+  if (dpCache.size > 300) dpCache.delete(dpCache.keys().next().value);
+  return buf;
+}
+async function getUserDpFresh(telegram, userId) {
   try {
     const res = await telegram.getUserProfilePhotos(Number(userId), 0, 1);
     if (!res || !res.total_count) return null;
@@ -1825,6 +1960,14 @@ bot.command('pgif', async (ctx) => {
 
 // key can be one key or a list (first key with a saved GIF wins)
 async function getPgif(key) {
+  const ck = Array.isArray(key) ? key.join('|') : String(key);
+  const hit = pgifCache.get(ck);
+  if (hit && Date.now() - hit.at < PGIF_TTL_MS) return hit.v;
+  const v = await getPgifUncached(key);
+  pgifCache.set(ck, { v, at: Date.now() });
+  return v;
+}
+async function getPgifUncached(key) {
   for (const k of Array.isArray(key) ? key : [key]) {
     const legacy = PGIF_LEGACY[k] || k;
     const { rows } = await q(
@@ -1833,10 +1976,23 @@ async function getPgif(key) {
     );
     if (rows[0]) return rows[0];
   }
+  // media saved with /setmedia <key> (photo, video, GIF ... that can carry a caption)
+  try {
+    for (const k of Array.isArray(key) ? key : [key]) {
+      const { rows } = await q(
+        `SELECT file_id, media_type FROM bot_media WHERE media_key=$1 AND media_type IN ('animation','video','document','photo','audio','voice')`,
+        [String(k)]
+      );
+      if (rows[0]) return rows[0];
+    }
+  } catch (_) {}
   return null;
 }
 
 async function sendGifFile(telegram, chatId, gif, opts) {
+  if (gif.media_type === 'photo') return telegram.sendPhoto(chatId, gif.file_id, opts);
+  if (gif.media_type === 'audio') return telegram.sendAudio(chatId, gif.file_id, opts);
+  if (gif.media_type === 'voice') return telegram.sendVoice(chatId, gif.file_id, opts);
   if (gif.media_type === 'document') return telegram.sendDocument(chatId, gif.file_id, opts);
   if (gif.media_type === 'video') return telegram.sendVideo(chatId, gif.file_id, opts);
   return telegram.sendAnimation(chatId, gif.file_id, opts);
@@ -2046,6 +2202,9 @@ bot.command('help', async (ctx) => {
       `/extend30 — +30s\n` +
       `/soloball 3 or 6 — bowler changes every 3 or 6 balls (next player by number)\n` +
       `Then just type 0-6 when it is your turn to bat\n\n` +
+      `*PROFILE*\n` +
+      `/setmedia <key> — reply to any media to save it under a key (admin)\n` +
+      `/userinfo — your stats card (or reply to / tag someone, or /userinfo <id>)\n\n` +
       `*PRACTICE vs BOT*\n` +
       `/vsbotsolo [3|6] — 1v1 against the bot\n` +
       `/botteam 5 or /botteam 10 — your team vs a bot team\n\n` +
@@ -2450,7 +2609,7 @@ async function beginSoloFromLobby(matchId, chatId, telegram) {
   if (players.length < 2) {
     await telegram.sendMessage(
       chatId,
-      `${pe('clock','⏰')} *Lobby time is up!*\n${pe('people','👥')} Players: ${players.length}\n${pe('no','❌')} *Can't play with a single player.* Match cancelled — try /startsolo again when friends join.`,
+      `❌ *Lobby closed* — can't play solo with one player.`,
       { parse_mode: 'Markdown' }
     );
     await q(`UPDATE matches SET status='cancelled' WHERE id=$1`, [matchId]);
@@ -2479,22 +2638,13 @@ async function beginSoloFromLobby(matchId, chatId, telegram) {
   const batter = await getPlayer(inn.striker_player_id);
   const bowler = await getPlayer(inn.current_bowler_id);
 
-  let list = `👥 Players (${players.length}):\n`;
-  players.forEach((p, i) => {
-    list += `  *#${i + 1}* ${mn(p)}\n`;
-  });
-
   await telegram.sendMessage(
     chatId,
-    `⚡ *SOLO CRICKET BEGINS!*\n` +
-      `${line('═')}\n` +
-      list +
-      `\n🏏 First Batter: *${mn(batter)}*  (#1)\n` +
-      `🎳 First Bowler: *${mn(bowler)}*  (#2)\n\n` +
-      `♾ Unlimited overs — every player bats until OUT\n` +
-      `🎳 Bowler changes every *${Number(m.solo_balls) === 6 ? 6 : 3}* balls (next player by number)\n` +
-      `${pe('target','🎯')} Same number = OUT\n` +
-      `📩 The bowler sends a number in the bot's DM first, then *${mn(batter)}* types *0–6* in the group!`,
+    `⚡ *${fancy('SOLO MATCH STARTED')}*\n` +
+      `${line('─')}\n` +
+      `👥 Players: *${players.length}*\n` +
+      `🏏 Batting: *${mn(batter)}*\n` +
+      `🎳 Bowling: *${mn(bowler)}*`,
     { parse_mode: 'Markdown' }
   );
   await sendScoreboard(telegram, chatId, matchId);
@@ -2521,7 +2671,7 @@ function startLobbyTimer(matchId, chatId, hostId, telegram, seconds = LOBBY_SECO
         const pl = await getPlayers(matchId);
         await telegram.sendMessage(
           chatId,
-          `${pe('clock','⏳')} *${left}s* left to join!\n${pe('people','👥')} Players: *${pl.length}*\n${pe('crown','👑')} Host: /forcestart`,
+          `⏳ *${left}s* left  ·  ${pl.length} player${pl.length === 1 ? '' : 's'}  ·  /joinsolo`,
           { parse_mode: 'Markdown' }
         );
       } catch (_) {}
@@ -2573,29 +2723,16 @@ async function createSoloLobby(ctx) {
 
     await sendHostBanner(
       ctx,
-      `${pe('game','🎮')} *${fancy('SOLO MODE')}*\n` +
-        `> ${pe('crown','👑')} Host: *${mn(ctx.from)}*\n` +
-        `> ${pe('people','👥')} Players: *1*  ·  max ${MAX_SOLO_PLAYERS}\n` +
-        `> ${pe('clock','⏱')} Lobby: *${LOBBY_SECONDS}s*\n` +
-        `> ${pe('target','🎯')} Same number = OUT  ·  numbers 0–6\n` +
-        `> ${pe('zap','⚡')} Mode: *Spam* (host: /spam to switch)\n` +
-        `> 🎳 Bowler changes every *${soloBalls}* balls — host: /soloball 3 or 6\n\n` +
-        `${pe('mega','📢')} /join\\_solo — join (#1 bats, #2 bowls…)\n` +
-        `${pe('door','🚪')} /leavesolo — leave\n` +
-        `${pe('list','📋')} /members — player list\n\n` +
-        `${pe('zap','⚡')} *Host*\n` +
-        `> /add — add players (@user, id or reply)\n` +
-        `> /forcestart — start (min 2)\n` +
-        `> /extend30 — +30s\n` +
-        `> /endmatch — cancel`,
+      `🎮 *${fancy('SOLO LOBBY IS OPEN')}*\n` +
+        `${line('─')}\n` +
+        `👑 Host: *${mn(ctx.from)}*\n` +
+        `Join with /joinsolo\n` +
+        `⏳ Closes in *${LOBBY_SECONDS}s*  ·  min 2 players\n` +
+        `${line('─')}\n` +
+        `Host: /forcestart to begin now`,
       Markup.inlineKeyboard([
         [btn('𝟯 𝗕𝗔𝗟𝗟𝗦', `sb:${m.id}:3`, 'bowler', 'primary'), btn('𝟲 𝗕𝗔𝗟𝗟𝗦', `sb:${m.id}:6`, 'bowler', 'success')],
       ])
-    );
-    await ctx.telegram.sendMessage(
-      ctx.chat.id,
-      `🎮 *Solo lobby is open!* (${LOBBY_SECONDS}s)\n👉 Tap to join: /joinsolo`,
-      { parse_mode: 'Markdown' }
     );
   } catch (e) {
     console.error(e);
@@ -2630,18 +2767,8 @@ async function joinSolo(ctx) {
       ? Math.max(0, Math.ceil((lobbies.get(m.id).endsAt - Date.now()) / 1000))
       : 0;
 
-    let role = '';
-    if (pos === 1) role = ' → 🏏 first bat';
-    else if (pos === 2) role = ' → 🎳 first bowl';
-    else role = ` → #${pos} in queue`;
-
     await ctx.reply(
-      `✅ *${mn(ctx.from)}* joined as *#${pos}*${role}\n` +
-        `${pe('people','👥')} Players: *${total}*\n` +
-        (left ? `${pe('clock','⏳')} Lobby: ${left}s left\n` : '') +
-        (total >= 2
-          ? `\n${pe('zap','⚡')} Host: /startgame or wait for the timer`
-          : `\n⏳ At least 2 players are needed`),
+      `✅ *${mn(ctx.from)}* joined  ·  #${pos}  ·  ${total} player${total > 1 ? 's' : ''}` + (left ? `  ·  ${left}s left` : ''),
       { parse_mode: 'Markdown' }
     );
   } catch (e) {
@@ -5950,12 +6077,14 @@ async function botCount(matchId) {
   return rows[0].c;
 }
 
+const botMatchIds = new Set(); // ids of /vsbotsolo and /botteam matches - normal matches skip every bot check
 const botBusy = new Set();
 const pickOf = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
 // Called from ensureTurnClock: when the bot is the one on the clock, it plays after a short "thinking" delay
 async function botKick(st) {
   if (!st || st.repair || !st.pend) return;
+  if (!botMatchIds.has(String(st.m && st.m.id))) return;
   const { inn, pend, kind } = st;
   const tok = `${kind}:${pend.callback_token}`;
   if (botBusy.has(tok)) return;
@@ -6056,6 +6185,7 @@ async function botPlayBat(token) {
 
 // Bot captain duties in /botteam matches: openers, next batsman, bowler for every over
 async function botTeamAssist(matchId) {
+  if (!botMatchIds.has(String(matchId))) return;
   try {
     const m = await getMatch(matchId);
     if (!m || m.mode === 'solo' || !m.vs_bot || !['innings1', 'innings2'].includes(m.status)) return;
@@ -6163,6 +6293,7 @@ async function createVsBotSolo(ctx) {
     );
     const m = rows[0];
     await q(`UPDATE matches SET spam_free=FALSE, solo_balls=$2, vs_bot=TRUE WHERE id=$1`, [m.id, balls]);
+    botMatchIds.add(String(m.id));
     for (const L of ['A', 'B']) await q(`INSERT INTO match_teams (match_id, team_label) VALUES ($1,$2)`, [m.id, L]);
     await q(
       `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name, is_captain)
@@ -6208,6 +6339,7 @@ async function createBotTeam(ctx) {
     );
     const m = rows[0];
     await q(`UPDATE matches SET spam_free=TRUE, vs_bot=TRUE WHERE id=$1`, [m.id]);
+    botMatchIds.add(String(m.id));
     for (const L of ['A', 'B']) await q(`INSERT INTO match_teams (match_id, team_label) VALUES ($1,$2)`, [m.id, L]);
     await upsertUser(ctx.from);
     // host is player #1 of Team A, Team B is the bot team
@@ -6312,6 +6444,325 @@ bot.on('text', async (ctx, next) => {
   }
 });
 
+// ─── /userinfo : career stats card (yours, or of the replied / tagged / id given player) ───
+async function userCareer(tgId) {
+  const id = Number(tgId);
+  const { rows: bt } = await q(
+    `SELECT COALESCE(SUM(bs.runs),0)::int AS runs, COALESCE(SUM(bs.balls_faced),0)::int AS balls,
+            COALESCE(SUM(bs.fours),0)::int AS fours, COALESCE(SUM(bs.sixes),0)::int AS sixes,
+            COUNT(*) FILTER (WHERE bs.is_out AND COALESCE(bs.runs,0)=0)::int AS ducks,
+            COUNT(*) FILTER (WHERE bs.runs>=50 AND bs.runs<100)::int AS fifties,
+            COUNT(*) FILTER (WHERE bs.runs>=100)::int AS hundreds
+       FROM batting_stats bs
+       JOIN match_players mp ON mp.id = bs.player_id
+       JOIN innings i ON i.id = bs.innings_id
+       JOIN matches m ON m.id = i.match_id
+      WHERE mp.telegram_id=$1 AND m.status='completed'`,
+    [id]
+  );
+  const { rows: bw } = await q(
+    `SELECT COALESCE(SUM(w.wickets),0)::int AS wkts, COALESCE(SUM(w.balls_bowled),0)::int AS balls,
+            COALESCE(SUM(w.runs_conceded),0)::int AS conceded,
+            COUNT(*) FILTER (WHERE w.wickets>=3 AND w.wickets<5)::int AS w3,
+            COUNT(*) FILTER (WHERE w.wickets>=5)::int AS w5
+       FROM bowling_stats w
+       JOIN match_players mp ON mp.id = w.player_id
+       JOIN innings i ON i.id = w.innings_id
+       JOIN matches m ON m.id = i.match_id
+      WHERE mp.telegram_id=$1 AND m.status='completed'`,
+    [id]
+  );
+  const { rows: mc } = await q(
+    `SELECT COUNT(DISTINCT m.id)::int AS c FROM match_players mp JOIN matches m ON m.id = mp.match_id
+      WHERE mp.telegram_id=$1 AND m.status='completed'`,
+    [id]
+  );
+  // hat-tricks: 3 wickets in 3 consecutive balls by the same bowler
+  const { rows: dl } = await q(
+    `SELECT d.innings_id, d.bowler_id, d.is_wicket FROM deliveries d
+       JOIN innings i ON i.id = d.innings_id JOIN matches m ON m.id = i.match_id
+      WHERE m.status='completed'
+        AND d.innings_id IN (SELECT d2.innings_id FROM deliveries d2 JOIN match_players mp ON mp.id = d2.bowler_id WHERE mp.telegram_id=$1)
+      ORDER BY d.innings_id, d.over_number, d.ball_number`,
+    [id]
+  );
+  const { rows: mine } = await q(`SELECT id FROM match_players WHERE telegram_id=$1`, [id]);
+  const myIds = new Set(mine.map((r) => r.id));
+  let hat = 0;
+  let streak = 0;
+  let curInn = null;
+  for (const r of dl) {
+    if (r.innings_id !== curInn) {
+      curInn = r.innings_id;
+      streak = 0;
+    }
+    const wk = r.is_wicket === true || r.is_wicket === 1 || r.is_wicket === 't';
+    if (myIds.has(r.bowler_id) && wk) {
+      streak++;
+      if (streak === 3) {
+        hat++;
+        streak = 0;
+      }
+    } else streak = 0;
+  }
+  const { rows: hsr } = await q(
+    `SELECT bs.runs, bs.balls_faced FROM batting_stats bs
+       JOIN match_players mp ON mp.id = bs.player_id JOIN innings i ON i.id = bs.innings_id JOIN matches m ON m.id = i.match_id
+      WHERE mp.telegram_id=$1 AND m.status='completed' ORDER BY bs.runs DESC, bs.balls_faced ASC LIMIT 1`,
+    [id]
+  );
+  const { rows: bbr } = await q(
+    `SELECT w.wickets, w.runs_conceded FROM bowling_stats w
+       JOIN match_players mp ON mp.id = w.player_id JOIN innings i ON i.id = w.innings_id JOIN matches m ON m.id = i.match_id
+      WHERE mp.telegram_id=$1 AND m.status='completed' AND w.balls_bowled>0 ORDER BY w.wickets DESC, w.runs_conceded ASC LIMIT 1`,
+    [id]
+  );
+  const { rows: hostR } = await q(`SELECT COUNT(*)::int AS c FROM matches WHERE host_telegram_id=$1 AND status='completed'`, [id]);
+  const b = bt[0] || {};
+  const w = bw[0] || {};
+  const matches = mc[0]?.c || 0;
+  const runs = Number(b.runs || 0);
+  const wkts = Number(w.wkts || 0);
+  const level = Math.min(99, 1 + Math.floor((runs + wkts * 25 + matches * 10) / 100));
+  return {
+    level,
+    hs: hsr[0] ? { runs: Number(hsr[0].runs || 0), balls: Number(hsr[0].balls_faced || 0) } : { runs: 0, balls: 0 },
+    bestBowl: bbr[0] ? { wkts: Number(bbr[0].wickets || 0), runs: Number(bbr[0].runs_conceded || 0) } : { wkts: 0, runs: 0 },
+    hosted: hostR[0]?.c || 0,
+    bat: {
+      runs,
+      balls: Number(b.balls || 0),
+      matches,
+      ducks: Number(b.ducks || 0),
+      fours: Number(b.fours || 0),
+      sixes: Number(b.sixes || 0),
+      sr: b.balls > 0 ? (runs * 100) / b.balls : 0,
+      fifties: Number(b.fifties || 0),
+      hundreds: Number(b.hundreds || 0),
+    },
+    bowl: {
+      wkts,
+      hattricks: hat,
+      matches,
+      balls: Number(w.balls || 0),
+      w3: Number(w.w3 || 0),
+      w5: Number(w.w5 || 0),
+      eco: w.balls > 0 ? (Number(w.conceded || 0) * 6) / w.balls : 0,
+    },
+  };
+}
+
+// who is the card for? replied user > tagged user (@username / text mention) > numeric id > the sender
+async function resolveInfoTarget(ctx) {
+  const msg = ctx.message;
+  const fromRow = (u) => ({ id: Number(u.id ?? u.telegram_id), username: u.username || null, first_name: u.first_name || null, last_name: u.last_name || null });
+  const byUsername = async (uname) => {
+    const { rows } = await q(`SELECT telegram_id, username, first_name, last_name FROM users WHERE LOWER(username)=LOWER($1) LIMIT 1`, [uname]);
+    if (rows[0]) return fromRow(rows[0]);
+    const { rows: r2 } = await q(
+      `SELECT telegram_id, username, first_name, last_name FROM match_players WHERE LOWER(username)=LOWER($1) ORDER BY id DESC LIMIT 1`,
+      [uname]
+    );
+    return r2[0] ? fromRow(r2[0]) : null;
+  };
+  const byId = async (id) => {
+    const { rows } = await q(`SELECT telegram_id, username, first_name, last_name FROM users WHERE telegram_id=$1`, [id]);
+    return rows[0] ? fromRow(rows[0]) : { id, username: null, first_name: null, last_name: null };
+  };
+  const rep = msg.reply_to_message?.from;
+  if (rep && !rep.is_bot) return fromRow(rep);
+  const text = msg.text || '';
+  for (const e of msg.entities || []) {
+    if (e.type === 'text_mention' && e.user && !e.user.is_bot) return fromRow(e.user);
+    if (e.type === 'mention') {
+      const found = await byUsername(text.substr(e.offset + 1, e.length - 1));
+      return found || { notFound: text.substr(e.offset, e.length) };
+    }
+  }
+  const arg = text.split(/\s+/)[1] || '';
+  if (/^\d{5,}$/.test(arg)) return byId(Number(arg));
+  if (/^[A-Za-z0-9_]{4,}$/.test(arg)) {
+    const found = await byUsername(arg);
+    return found || { notFound: arg };
+  }
+  return fromRow(ctx.from);
+}
+
+// caption under the profile card: "Stats Summary" design
+function userCaption(t, name, career) {
+  const line = '─────⊱◈◈◈⊰─────';
+  const b = career.bat;
+  const w = career.bowl;
+  const n = (v) => Number(v || 0).toLocaleString('en-US');
+  const shown = mdEsc([t.first_name, t.last_name].filter(Boolean).join(' ').trim() || t.username || name);
+  const who = isBotId(t.id) ? `*${shown}*` : `[${shown}](tg://user?id=${t.id})`;
+  const tz = process.env.CARD_TZ || 'Asia/Kolkata';
+  const date = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date()); // 2026-10-27
+  return (
+    `🏏 *Stats Summary*\n` +
+    `👤 *User:* ${who}\n` +
+    `🆔 *User ID:* \`${t.id}\`\n` +
+    `📅 *Date:* ${date}\n` +
+    `${line}\n` +
+    `🏆 *Highest Score:* ${career.hs.runs}(${career.hs.balls} Balls)\n` +
+    `🎮 *Matches Hosted:* ${n(career.hosted)}\n` +
+    `📊 *Runs:* ${n(b.runs)} (${n(b.balls)})\n` +
+    `🎳 *Wickets:* ${n(w.wkts)}\n` +
+    `💥 *Sixes:* ${n(b.sixes)}\n` +
+    `✨ *Fours:* ${n(b.fours)}\n` +
+    `🔥 *Centuries:* ${n(b.hundreds)}\n` +
+    `⭐ *Fifties:* ${n(b.fifties)}\n` +
+    `🦆 *Ducks:* ${n(b.ducks)}\n` +
+    `🎩 *Hat-Tricks:* ${n(w.hattricks)}\n` +
+    `⚡ *Strike Rate:* ${b.sr.toFixed(2)}\n` +
+    `🎳 *Economy Rate:* ${w.eco.toFixed(2)}\n` +
+    `${line}\n` +
+    `🎯 *Best Bowling:* ${career.bestBowl.wkts}/${career.bestBowl.runs}\n` +
+    `🏅 *Matches Played:* ${n(b.matches)}\n` +
+    `⭐ *Level:* ${career.level}`
+  );
+}
+
+bot.command(['userinfo', 'myinfo'], async (ctx) => {
+  try {
+    const t = await resolveInfoTarget(ctx);
+    if (t.notFound) return ctx.reply(`❌ I don't know ${t.notFound} yet — they need to play or use the bot once.`);
+    const [career, dp] = await Promise.all([userCareer(t.id), getUserDp(ctx.telegram, t.id)]);
+    const full = [t.first_name, t.last_name].filter(Boolean).join(' ').trim();
+    const name = cleanName(full || t.username || '', '').trim() || cleanName(t.username || '', '').trim() || 'PLAYER';
+    // no username -> the name is used as the username
+    const handle = '@' + (t.username ? cleanName(t.username, '') : name.replace(/\s+/g, '')) ;
+    const img = await renderUserCard({ dp, name, handle, level: career.level, bat: career.bat, bowl: career.bowl });
+    await ctx.telegram.sendPhoto(ctx.chat.id, { source: img }, {
+      caption: userCaption(t, name, career),
+      parse_mode: 'Markdown',
+      reply_to_message_id: ctx.message.message_id,
+      allow_sending_without_reply: true,
+    });
+  } catch (e) {
+    await reportCardError('Userinfo card', e);
+    await ctx.reply('❌ Could not build the profile card right now.');
+  }
+});
+
+// ─── /setmedia <key> : reply to ANY media (photo, video, GIF, sticker, voice, file...) to save it under a key ───
+// /setmedia 1 run  ->  key "1": if it is a game key (0-6, out, 50 ...) the saved media is also used by the game
+const MEDIA_CAPTION_TYPES = ['animation', 'video', 'document', 'photo', 'audio', 'voice'];
+function pickMedia(msg) {
+  if (!msg) return null;
+  if (msg.animation) return { type: 'animation', id: msg.animation.file_id, uid: msg.animation.file_unique_id };
+  if (msg.video) return { type: 'video', id: msg.video.file_id, uid: msg.video.file_unique_id };
+  if (msg.photo && msg.photo.length) {
+    const ph = msg.photo[msg.photo.length - 1];
+    return { type: 'photo', id: ph.file_id, uid: ph.file_unique_id };
+  }
+  if (msg.sticker) return { type: 'sticker', id: msg.sticker.file_id, uid: msg.sticker.file_unique_id };
+  if (msg.video_note) return { type: 'video_note', id: msg.video_note.file_id, uid: msg.video_note.file_unique_id };
+  if (msg.voice) return { type: 'voice', id: msg.voice.file_id, uid: msg.voice.file_unique_id };
+  if (msg.audio) return { type: 'audio', id: msg.audio.file_id, uid: msg.audio.file_unique_id };
+  if (msg.document) return { type: 'document', id: msg.document.file_id, uid: msg.document.file_unique_id };
+  return null;
+}
+function mediaKeyFrom(ctx) {
+  let k = String(ctx.message?.text || '').replace(/^\/\w+(@\w+)?\s*/, '').trim().toLowerCase().replace(/\s+/g, ' ');
+  k = k.replace(/\s+runs?$/, ''); // "1 run" -> "1"
+  return PGIF_ALIASES[k] || k;
+}
+async function sendAnyMedia(telegram, chatId, m, opts = {}) {
+  const t = m.media_type;
+  if (t === 'photo') return telegram.sendPhoto(chatId, m.file_id, opts);
+  if (t === 'video') return telegram.sendVideo(chatId, m.file_id, opts);
+  if (t === 'sticker') return telegram.sendSticker(chatId, m.file_id, opts);
+  if (t === 'video_note') return telegram.sendVideoNote(chatId, m.file_id, opts);
+  if (t === 'voice') return telegram.sendVoice(chatId, m.file_id, opts);
+  if (t === 'audio') return telegram.sendAudio(chatId, m.file_id, opts);
+  if (t === 'document') return telegram.sendDocument(chatId, m.file_id, opts);
+  return telegram.sendAnimation(chatId, m.file_id, opts);
+}
+
+bot.command('setmedia', async (ctx) => {
+  try {
+    if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only a group admin or the bot owner can save media.');
+    const key = mediaKeyFrom(ctx);
+    if (!key)
+      return ctx.reply('Reply to any media (photo, video, GIF, sticker, voice, file) with:\n/setmedia <key>\nExample: /setmedia 1 run  ·  /setmedia welcome\n\nOther: /getmedia <key> · /medialist · /delmedia <key>');
+    if (key.length > 60) return ctx.reply('❌ The key is too long (max 60 characters).');
+    const media = pickMedia(ctx.message?.reply_to_message);
+    if (!media) return ctx.reply('❌ Reply to a message that has media, then send /setmedia ' + key);
+    await q(
+      `INSERT INTO bot_media (media_key, file_id, file_unique_id, media_type, updated_by, updated_at)
+       VALUES ($1,$2,$3,$4,$5,NOW())
+       ON CONFLICT (media_key) DO UPDATE SET file_id=EXCLUDED.file_id, file_unique_id=EXCLUDED.file_unique_id,
+         media_type=EXCLUDED.media_type, updated_by=EXCLUDED.updated_by, updated_at=NOW()`,
+      [key, media.id, media.uid || null, media.type, String(ctx.from.id)]
+    );
+    const forGame = PGIF_KEYS.has(key) && MEDIA_CAPTION_TYPES.includes(media.type);
+    await ctx.reply(
+      `✅ *Media saved*\n> 🔑 Key: \`${key}\`\n> 📎 Type: *${media.type}*\n> 🆔 File ID: \`${media.id}\`` +
+        (forGame ? `\n> 🎮 The game uses it for *${key}*` : ''),
+      { parse_mode: 'Markdown', reply_to_message_id: ctx.message.message_id }
+    );
+  } catch (e) {
+    console.error('setmedia:', e);
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
+bot.command('getmedia', async (ctx) => {
+  try {
+    if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only a group admin or the bot owner can use this.');
+    const key = mediaKeyFrom(ctx);
+    if (!key) return ctx.reply('Usage: /getmedia <key>');
+    const { rows } = await q(`SELECT file_id, media_type FROM bot_media WHERE media_key=$1`, [key]);
+    if (!rows[0]) return ctx.reply(`❌ No media saved for key "${key}". See /medialist`);
+    await sendAnyMedia(ctx.telegram, ctx.chat.id, rows[0], { reply_to_message_id: ctx.message.message_id });
+  } catch (e) {
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
+bot.command('medialist', async (ctx) => {
+  try {
+    if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only a group admin or the bot owner can use this.');
+    const { rows } = await q(`SELECT media_key, media_type FROM bot_media ORDER BY media_key`);
+    if (!rows.length) return ctx.reply('No media saved yet. Reply to a media with /setmedia <key>');
+    await ctx.reply('🗂 *Saved media*\n' + rows.map((r) => `> \`${r.media_key}\` — ${r.media_type}`).join('\n'), { parse_mode: 'Markdown' });
+  } catch (e) {
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
+bot.command('delmedia', async (ctx) => {
+  try {
+    if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only a group admin or the bot owner can use this.');
+    const key = mediaKeyFrom(ctx);
+    if (!key) return ctx.reply('Usage: /delmedia <key>');
+    const { rowCount } = await q(`DELETE FROM bot_media WHERE media_key=$1`, [key]);
+    await ctx.reply(rowCount ? `🗑 Removed media for key \`${key}\`` : `❌ No media saved for key "${key}"`, { parse_mode: 'Markdown' });
+  } catch (e) {
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
+// /ping : how fast are the database and Telegram right now?
+bot.command('ping', async (ctx) => {
+  try {
+    const t0 = Date.now();
+    const sent = await ctx.reply('🏓 …');
+    const tg = Date.now() - t0;
+    const db = await dbLatency(5);
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      sent.message_id,
+      undefined,
+      `🏓 Pong\n> 🗄 Database: ${db} ms per query` + (db > 80 ? ' (slow)' : ' (good)') + `\n> ✈️ Telegram: ${tg} ms\n> 🏷 ${BOT_VERSION}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (e) {
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
 // ─── Launch ──────────────────────────────────────────────
 async function main() {
   await q('SELECT 1');
@@ -6332,8 +6783,24 @@ async function main() {
     updated_by TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await q(`CREATE TABLE IF NOT EXISTS bot_media (
+    media_key TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    file_unique_id TEXT,
+    media_type TEXT NOT NULL,
+    updated_by TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   await relaxNegativeRunConstraints();
+  try {
+    const { rows } = await q(`SELECT id FROM matches WHERE vs_bot=TRUE AND status NOT IN ('completed','cancelled')`);
+    rows.forEach((r) => botMatchIds.add(String(r.id)));
+  } catch (_) {}
   console.log('DB OK');
+  try {
+    const ms = await dbLatency(5);
+    console.log(`DB latency: ${ms} ms per query` + (ms > 80 ? '  <-- SLOW: put the database in the same region as the bot host' : ''));
+  } catch (_) {}
   await rearmAfterRestart();
   const me = await bot.telegram.getMe();
   BOT_USERNAME = me.username;
