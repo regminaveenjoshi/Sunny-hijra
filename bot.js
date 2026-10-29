@@ -36,7 +36,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r43-2026-10-29'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r45-2026-10-29'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -1220,6 +1220,33 @@ async function sendRich(telegram, chatId, html, extra = {}) {
       return await telegram.callApi('sendRichMessage', { chat_id: chatId, rich_message: { html: h }, ...extra });
     } catch (e) {
       last = e;
+    }
+  }
+  throw last;
+}
+
+// rich message with an uploaded photo INSIDE it (title + photo + table in one message)
+async function sendRichPhoto(chatId, html, imgBuf, replyTo) {
+  const media = [{ id: 'card', media: { type: 'photo', media: 'attach://cardfile' } }];
+  const tries = [];
+  if (PREMIUM_TEXT) tries.push(premiumizeHtml(html, 60));
+  tries.push(stripPe(html));
+  let last = new Error('sendRichMessage failed');
+  for (const h of tries) {
+    for (const withReply of replyTo ? [true, false] : [false]) {
+      try {
+        const fd = new FormData();
+        fd.append('chat_id', String(chatId));
+        fd.append('rich_message', JSON.stringify({ html: h, media }));
+        if (withReply) fd.append('reply_parameters', JSON.stringify({ message_id: replyTo, allow_sending_without_reply: true }));
+        fd.append('cardfile', new Blob([imgBuf], { type: 'image/jpeg' }), 'card.jpg');
+        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendRichMessage`, { method: 'POST', body: fd });
+        const j = await res.json();
+        if (j.ok) return j.result;
+        last = new Error(j.description || 'sendRichMessage failed');
+      } catch (e) {
+        last = e;
+      }
     }
   }
   throw last;
@@ -4200,15 +4227,13 @@ async function startBall(matchId) {
   const hat = await isHatTrickBall({ ...inn, current_bowler_id: bowler.id });
   const html =
     `🎳 <b>${fancy('RUN-UP')}</b>  <i>(Over ${overNum}.${ballNum})</i>\n` +
-    `<blockquote>${htag(bowler)} to ${escapeHtml(name(striker))}\n` +
     (bowlerIsBot
-      ? `🤖 ${htag(bowler)} is choosing the number…`
+      ? `🤖 <b>${htag(bowler)} is choosing the number…</b>`
       : dmOk
-      ? `📩 ${htag(bowler)}, send your bowling number <b>1–6</b> in the bot's DM (${TURN_SECONDS}s)`
-      : `⚠️ ${htag(bowler)}, open the bot's DM and press /start — then send <b>1–6</b> (${TURN_SECONDS}s)`) +
+      ? `🎳 <b>${htag(bowler)}</b> — <b>send your bowling number 1–6 in the bot's DM (${TURN_SECONDS}s)</b>`
+      : `⚠️ <b>${htag(bowler)}</b> — <b>open the bot's DM and press /start, then send 1–6 (${TURN_SECONDS}s)</b>`) +
     (hat ? `\n🎩 <b>HAT-TRICK BALL!</b>` : '') +
-    (spamFreeOn(m) ? `\n🛡 ${pe('ok','🛡')} Spam-free mode: no number 3 times in a row` : '') +
-    `</blockquote>`;
+    (spamFreeOn(m) ? `\n🛡 <b>Spam-free: no number 3 times in a row</b>` : '');
   const w = await sendCaptionedGif(tg, groupId, 'runup', html, bowlerIsBot ? {} : openBotDmKb());
   await q(`UPDATE pending_balls SET batting_message_id=$2 WHERE callback_token=$1`, [token, w.message_id]);
   return true;
@@ -4746,10 +4771,8 @@ async function bowlerLocksNumber(ctx, n) {
 
   const html =
     `🔒 <b>${fancy('NUMBER LOCKED')}</b>\n` +
-    `<blockquote>${bowler ? `<b>${escapeHtml(name(bowler))}</b>` : 'Bowler'} has locked the number!\n` +
-    `🏏 ${striker ? htag(striker) : 'Batsman'} takes the stance — send your number <b>${hat ? '1–6' : '0–6'}</b> in the group (${TURN_SECONDS}s)` +
-    (hat ? `\n🎩 <b>HAT-TRICK BALL!</b> 0 is not allowed.` : '') +
-    `</blockquote>`;
+    `🏏 <b>${striker ? htag(striker) : 'Batsman'}</b> — <b>send your number ${hat ? '1–6' : '0–6'} in the group (${TURN_SECONDS}s)</b>` +
+    (hat ? `\n🎩 <b>HAT-TRICK BALL! 0 is not allowed.</b>` : '');
   const lock = await sendCaptionedGif(ctx.telegram, groupId, 'stance', html);
   lockMsgs.set(pend.callback_token, lock.message_id);
 
@@ -6135,10 +6158,8 @@ async function botLockNumber(token) {
   const hat = await isHatTrickBall(inn);
   const html =
     `🔒 <b>${fancy('NUMBER LOCKED')}</b>\n` +
-    `<blockquote>${bowler ? `<b>${escapeHtml(name(bowler))}</b>` : 'Bowler'} has locked the number!\n` +
-    `🏏 ${striker ? htag(striker) : 'Batsman'} takes the stance — send your number <b>${hat ? '1–6' : '0–6'}</b> in the group (${TURN_SECONDS}s)` +
-    (hat ? `\n🎩 <b>HAT-TRICK BALL!</b> 0 is not allowed.` : '') +
-    `</blockquote>`;
+    `🏏 <b>${striker ? htag(striker) : 'Batsman'}</b> — <b>send your number ${hat ? '1–6' : '0–6'} in the group (${TURN_SECONDS}s)</b>` +
+    (hat ? `\n🎩 <b>HAT-TRICK BALL! 0 is not allowed.</b>` : '');
   const lock = await sendCaptionedGif(bot.telegram, groupId, 'stance', html);
   lockMsgs.set(token, lock.message_id);
   await ensureTurnClock(m.id);
@@ -6736,7 +6757,7 @@ async function backfillAwards() {
 }
 
 // ─── native table (Rich Message) for /userinfo ───
-function userRichHtml(t, shownName, c) {
+function userRichHtml(t, shownName, c, withPhoto = false) {
   const n = (v) => Number(v || 0).toLocaleString('en-US');
   const b = c.bat;
   const w = c.bowl;
@@ -6752,7 +6773,7 @@ function userRichHtml(t, shownName, c) {
   const who = isBotId(t.id) ? `<b>${hEsc(shownName)}</b>` : `<a href="tg://user?id=${t.id}">${hEsc(shownName)}</a>`;
   const date = new Intl.DateTimeFormat('en-CA', { timeZone: process.env.CARD_TZ || 'Asia/Kolkata' }).format(new Date());
 
-  let h = `<p><b>🏏 STATS SUMMARY</b></p>`;
+  let h = withPhoto ? `<h1>${hEsc(shownName)}</h1><img src="tg://photo?id=card"/>` : `<p><b>🏏 STATS SUMMARY</b></p>`;
   h += `<p>👤 ${who}  ·  🆔 <code>${t.id}</code>  ·  📅 ${date}</p>`;
   h += tbl([
     ['⭐ Level', c.level],
@@ -6837,9 +6858,18 @@ bot.command(['userinfo', 'myinfo'], async (ctx) => {
     const handle = '@' + (t.username ? cleanName(t.username, '') : name.replace(/\s+/g, '')) ;
     const img = await renderUserCard({ dp, name, handle, level: career.level, bat: career.bat, bowl: career.bowl });
     const shown = [t.first_name, t.last_name].filter(Boolean).join(' ').trim() || t.username || name;
+    let done = false;
+    if (RICH_TABLES) {
+      try {
+        await sendRichPhoto(ctx.chat.id, userRichHtml(t, shown, career, true), img, ctx.message.message_id);
+        done = true;
+      } catch (e) {
+        console.error('userinfo: photo-in-table failed, sending photo and table separately:', e.message);
+      }
+    }
     let photoSent = false;
     let tableOk = false;
-    if (RICH_TABLES) {
+    if (RICH_TABLES && !done) {
       try {
         await ctx.telegram.sendPhoto(ctx.chat.id, { source: img }, {
           caption: `📊 *${mdEsc(shown)}*  ·  Level ${career.level}`,
@@ -6862,7 +6892,7 @@ bot.command(['userinfo', 'myinfo'], async (ctx) => {
         }
       }
     }
-    if (!tableOk) {
+    if (!done && !tableOk) {
       await ctx.telegram.sendPhoto(ctx.chat.id, { source: img }, {
         caption: userCaption(t, name, career),
         parse_mode: 'Markdown',
