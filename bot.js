@@ -36,7 +36,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r45-2026-10-29'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r46-2026-10-29'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -944,10 +944,14 @@ async function renderPlayersBanner() {
 async function assetReport() {
   const fs = require('fs');
   const out = [];
-  for (const f of ['host.jpg', 'solo_final.jpg', 'team_final.jpg', 'team_banner.jpg', 'players_list.jpg', 'userinfo.jpg', 'default_dp.png']) {
+  for (const f of ['host.jpg', 'solo_final.jpg', 'team_final.jpg', 'team_banner.jpg', 'players_list.jpg', 'userinfo.jpg', 'win_team.mp4', 'fifty.mp4', 'Poppins-Bold.ttf', 'Poppins-Medium.ttf', 'default_dp.png']) {
     const file = path.join(ASSET_DIR, f);
     if (!fs.existsSync(file)) {
       out.push(`${f} — MISSING${f === 'default_dp.png' ? ' (a built-in avatar is used)' : ''}`);
+      continue;
+    }
+    if (/\.(mp4|ttf)$/i.test(f)) {
+      out.push(`${f} — OK ${(fs.statSync(file).size / 1048576).toFixed(1)} MB`);
       continue;
     }
     try {
@@ -958,6 +962,7 @@ async function assetReport() {
       out.push(`${f} — INVALID (${e.message}) — re-upload the original file`);
     }
   }
+  out.push(typeof ffmpegBin === 'function' && ffmpegBin() ? 'ffmpeg — OK (videos get names on them)' : 'ffmpeg — NOT FOUND (videos are sent without names; install ffmpeg or `npm i ffmpeg-static`)');
   try {
     await renderText('Aa', 20);
     out.push('font — OK');
@@ -965,6 +970,118 @@ async function assetReport() {
     out.push(`font — PROBLEM (${e.message})`);
   }
   return out;
+}
+
+// ═══ VIDEO OVERLAYS (winning team + fifty) ═══
+const POP_BOLD = path.join(ASSET_DIR, 'Poppins-Bold.ttf');
+const POP_MED = path.join(ASSET_DIR, 'Poppins-Medium.ttf');
+async function popText(text, px, color = '#ffffff', bold = true) {
+  needSharp();
+  return sharp({
+    text: {
+      text: `<span foreground="${color}">${xmlEsc(String(text))}</span>`,
+      font: `Poppins ${bold ? 'Bold' : 'Medium'} ${px}`,
+      fontfile: bold ? POP_BOLD : POP_MED,
+      rgba: true,
+      dpi: 72,
+    },
+  })
+    .png()
+    .toBuffer({ resolveWithObject: true });
+}
+async function popFit(text, px, maxW, color = '#ffffff', bold = true, minPx = 14) {
+  let size = px;
+  let img = await popText(text, size, color, bold);
+  while (img.info.width > maxW && size > minPx) {
+    size -= 2;
+    img = await popText(text, size, color, bold);
+  }
+  return img;
+}
+// first + last name, else the username, else "Player" (English letters only - the font has no other scripts)
+function videoName(p) {
+  const full = cleanName([p && p.first_name, p && p.last_name].filter(Boolean).join(' '), '').trim();
+  return full || cleanName((p && p.username) || '', '').trim() || 'Player';
+}
+
+// 1280x720 transparent overlay for the "WINNING TEAM" video: captain in the CAP box, players line by line in the PLAYER LIST box
+async function buildWinOverlay(capName, names) {
+  needSharp();
+  const layers = [];
+  if (capName) layers.push(centered(await goldText(capName, 38, 372, { pop: true, squeeze: 1, outline: [60, 0, 0] }), 917, 346, 0));
+
+  let list = names.slice();
+  if (list.length > 21) list = list.slice(0, 20).concat([`+${names.length - 20} more`]);
+  const n = list.length;
+  if (n) {
+    const X0 = 590, X1 = 1238, Y0 = 440, Y1 = 686;
+    const cols = n <= 7 ? 1 : n <= 14 ? 2 : 3;
+    const rows = Math.ceil(n / cols);
+    const lineH = Math.min(40, Math.floor((Y1 - Y0) / rows));
+    const px = Math.max(14, Math.min(26, Math.round(lineH * 0.62)));
+    const colW = (X1 - X0) / cols;
+    const top = Y0 + ((Y1 - Y0) - rows * lineH) / 2;
+    const items = [];
+    for (let i = 0; i < n; i++) {
+      const col = Math.floor(i / rows);
+      const row = i % rows;
+      const label = list[i].startsWith('+') ? null : String(i + 1).padStart(2, '0');
+      const name = await popFit(list[i], px, colW - 70, '#ffffff', true, 12);
+      items.push({ col, row, label, name });
+    }
+    for (let c = 0; c < cols; c++) {
+      const colItems = items.filter((x) => x.col === c);
+      if (!colItems.length) continue;
+      const w = Math.max(...colItems.map((x) => x.name.info.width)) + 38;
+      const left = X0 + c * colW + (colW - w) / 2;
+      for (const it of colItems) {
+        const cy = top + it.row * lineH + lineH / 2;
+        if (it.label) {
+          const num = await popText(it.label, Math.max(12, px - 4), '#ffc53d', true);
+          layers.push({ input: num.data, left: Math.round(left), top: Math.round(cy - num.info.height / 2) });
+        }
+        layers.push({ input: it.name.data, left: Math.round(left + 38), top: Math.round(cy - it.name.info.height / 2) });
+      }
+    }
+  }
+  return sharp({ create: { width: 1280, height: 720, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+    .composite(layers)
+    .png()
+    .toBuffer();
+}
+
+// 1280x720 transparent overlay for the FIFTY video (shown while the video is paused)
+async function buildFiftyOverlay({ name, runs, balls }) {
+  needSharp();
+  const sr = balls > 0 ? ((runs * 100) / balls).toFixed(2) : '0.00';
+  const PX = 240, PY = 140, PW = 800, PH = 340;
+  const panel = Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${PW}" height="${PH}">
+       <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+         <stop offset="0" stop-color="#ffe08a"/><stop offset="0.5" stop-color="#d9a233"/><stop offset="1" stop-color="#ffe08a"/>
+       </linearGradient></defs>
+       <rect x="3" y="3" rx="30" ry="30" width="${PW - 6}" height="${PH - 6}" fill="#07070c" fill-opacity="0.72" stroke="url(#g)" stroke-width="4"/>
+       <rect x="14" y="14" rx="22" ry="22" width="${PW - 28}" height="${PH - 28}" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="1.5"/>
+       <line x1="90" y1="176" x2="${PW - 90}" y2="176" stroke="url(#g)" stroke-opacity="0.7" stroke-width="2"/>
+     </svg>`
+  );
+  const layers = [{ input: panel, left: PX, top: PY }];
+  const cx = PX + PW / 2;
+  layers.push(centered(await goldText('HALF CENTURY', 32, 640, { pop: true, squeeze: 1, outline: [30, 15, 0] }), cx, PY + 44, 0));
+  layers.push(centered(await popFit(name, 60, 720, '#ffffff', true, 24), cx, PY + 118, 0));
+  const cols = [
+    [cx - 250, String(runs), 'RUNS'],
+    [cx, String(balls), 'BALLS'],
+    [cx + 250, sr, 'STRIKE RATE'],
+  ];
+  for (const [x, val, label] of cols) {
+    layers.push(centered(await goldText(val, 70, 220, { pop: true, squeeze: 1, outline: [30, 15, 0] }), x, PY + 232, 0));
+    layers.push(centered(await popText(label, 22, '#cfcfcf', false), x, PY + 296, 0));
+  }
+  return sharp({ create: { width: 1280, height: 720, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+    .composite(layers)
+    .png()
+    .toBuffer();
 }
 
 // ═══ /userinfo PROFILE CARD ═══
@@ -992,10 +1109,10 @@ async function goldText(text, px, maxW, o = {}) {
   const top = o.top || [255, 244, 204];
   const bottom = o.bottom || [232, 168, 58];
   const outline = o.outline || [40, 20, 0];
-  const squeeze = o.squeeze || 0.8;
+  const squeeze = o.squeeze !== undefined ? o.squeeze : 0.8;
   const minPx = o.minPx || 16;
   const make = async (size) => {
-    const base = await renderText(String(text), size, '#ffffff');
+    const base = o.pop ? await popText(String(text), size, '#ffffff', true) : await renderText(String(text), size, '#ffffff');
     const w = Math.max(1, Math.round(base.info.width * squeeze));
     return sharp(base.data).resize(w, base.info.height, { fit: 'fill' }).png().toBuffer({ resolveWithObject: true });
   };
@@ -5024,6 +5141,8 @@ async function finishTeam(telegram, groupId, m, inn2) {
   saveAwards(m.id, aw).catch((e) => console.error('saveAwards:', e.message));
   caption += `${awardsText(aw)}`;
   await sendTeamFinal(telegram, groupId, m, caption, { inns, winner, motm: aw.motm });
+  // after the result: winning team video (captain + players)
+  sendWinVideo(telegram, groupId, m, winner).catch((e) => console.error('win video:', e.message));
   await sendMotmGif(telegram, groupId, aw.motm);
   await sendLong(telegram, groupId, await fullScorecard(m.id));
   await sendMatchDataFile(telegram, groupId, m.id);
@@ -5765,8 +5884,9 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
   // milestones (each has its own /pgif GIF; the normal result GIF is the fallback)
   const strikerP = await getPlayer(strikerId);
   const nonP = nonId ? await getPlayer(nonId) : null;
-  const { rows: bsr } = await q(`SELECT runs FROM batting_stats WHERE innings_id=$1 AND player_id=$2`, [inn.id, strikerId]);
+  const { rows: bsr } = await q(`SELECT runs, balls_faced FROM batting_stats WHERE innings_id=$1 AND player_id=$2`, [inn.id, strikerId]);
   const afterRuns = Number(bsr[0]?.runs ?? 0);
+  const afterBalls = Number(bsr[0]?.balls_faced ?? 0);
   const beforeRuns = afterRuns - runs;
   const { rows: bwr } = await q(`SELECT wickets FROM bowling_stats WHERE innings_id=$1 AND player_id=$2`, [inn.id, bowlerId]);
   const bowlWk = Number(bwr[0]?.wickets ?? 0);
@@ -5845,6 +5965,8 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
         `${pe('spark','🌟')} <b>${fancy('FIFTY')}!</b>\n` +
           `${pe('ok','🎊')} Congratulations ${disp(strikerP)} — hit the <b>50!</b>`
       );
+      // FIFTY video (pauses for 3s with the batsman's numbers) - rendered in the background, the game does not wait
+      sendFiftyVideo(telegram, groupId, strikerP, afterRuns, afterBalls).catch((e) => console.error('fifty video:', e.message));
     }
     if (runs === 0) gifKeys.push('0', 'dot');
     else gifKeys.push(String(runs));
@@ -7022,6 +7144,139 @@ bot.command('ping', async (ctx) => {
     await ctx.reply('❌ ' + e.message);
   }
 });
+
+// ═══ MATCH VIDEOS: "winning team" (after the result) and "FIFTY" (when a batsman crosses 50) ═══
+const { spawn, spawnSync } = require('child_process');
+const os = require('os');
+const MATCH_VIDEOS = process.env.MATCH_VIDEOS !== '0'; // MATCH_VIDEOS=0 switches both videos off
+const WIN_VIDEO = path.join(ASSET_DIR, 'win_team.mp4');
+const FIFTY_VIDEO = path.join(ASSET_DIR, 'fifty.mp4');
+const FIFTY_FREEZE_AT = 11.0; // the video pauses here ...
+const FIFTY_FREEZE_SEC = 3; // ... for 3 seconds while the stats card is shown
+const FIFTY_LEN = 22.07;
+
+let ffmpegCache;
+function ffmpegBin() {
+  if (ffmpegCache !== undefined) return ffmpegCache;
+  const cands = [process.env.FFMPEG_PATH];
+  try {
+    cands.push(require('ffmpeg-static'));
+  } catch (_) {}
+  cands.push('ffmpeg');
+  for (const c of cands.filter(Boolean)) {
+    try {
+      const r = spawnSync(c, ['-version'], { timeout: 8000 });
+      if (r.status === 0) return (ffmpegCache = c);
+    } catch (_) {}
+  }
+  return (ffmpegCache = null);
+}
+function runFfmpeg(args, timeoutMs = 300000) {
+  return new Promise((resolve, reject) => {
+    const bin = ffmpegBin();
+    if (!bin) return reject(new Error('ffmpeg not found'));
+    const pr = spawn(bin, ['-y', '-loglevel', 'error', '-threads', '2', ...args]);
+    let err = '';
+    const timer = setTimeout(() => {
+      pr.kill('SIGKILL');
+      reject(new Error('ffmpeg timeout'));
+    }, timeoutMs);
+    pr.stderr.on('data', (d) => (err += d));
+    pr.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    pr.on('close', (code) => {
+      clearTimeout(timer);
+      code === 0 ? resolve() : reject(new Error('ffmpeg failed: ' + err.slice(-300)));
+    });
+  });
+}
+// one video render at a time (they are CPU heavy) - the game itself never waits for them
+let videoChain = Promise.resolve();
+const queueVideo = (fn) => {
+  const run = videoChain.then(fn, fn);
+  videoChain = run.catch(() => {});
+  return run;
+};
+const encodeArgs = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '27', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart'];
+
+async function renderWinVideo(capName, names) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmv-'));
+  try {
+    const ov = path.join(dir, 'ov.png');
+    const out = path.join(dir, 'out.mp4');
+    fs.writeFileSync(ov, await buildWinOverlay(capName, names));
+    await runFfmpeg(['-i', WIN_VIDEO, '-framerate', '30', '-loop', '1', '-i', ov, '-filter_complex', '[0:v][1:v]overlay=0:0:shortest=1[v]', '-map', '[v]', '-map', '0:a?', ...encodeArgs, '-shortest', out]);
+    return fs.readFileSync(out);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function renderFiftyVideo(card) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmv-'));
+  try {
+    const ov = path.join(dir, 'ov.png');
+    const out = path.join(dir, 'out.mp4');
+    fs.writeFileSync(ov, await buildFiftyOverlay(card));
+    const T = FIFTY_FREEZE_AT;
+    const D = FIFTY_FREEZE_SEC;
+    const filter =
+      `[0:v]trim=0:${T},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration=${D}[v1];` +
+      `[0:v]trim=start=${T},setpts=PTS-STARTPTS[v2];` +
+      `[v1][v2]concat=n=2:v=1:a=0[vc];` +
+      `[vc]eq=brightness=-0.14:enable='between(t,${T},${T + D})'[vd];` +
+      `[1:v]format=rgba,fade=t=in:st=${T}:d=0.35:alpha=1,fade=t=out:st=${T + D - 0.35}:d=0.35:alpha=1[ovf];` +
+      `[vd][ovf]overlay=0:0:enable='between(t,${T},${T + D})'[v];` +
+      `[0:a]atrim=0:${T},asetpts=PTS-STARTPTS,apad=pad_dur=${D}[a1];` +
+      `[0:a]atrim=start=${T},asetpts=PTS-STARTPTS[a2];` +
+      `[a1][a2]concat=n=2:v=0:a=1[a]`;
+    await runFfmpeg(['-i', FIFTY_VIDEO, '-framerate', '30', '-loop', '1', '-i', ov, '-filter_complex', filter, '-map', '[v]', '-map', '[a]', ...encodeArgs, '-t', String(FIFTY_LEN + D), out]);
+    return fs.readFileSync(out);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const sendVideoBuf = (telegram, chatId, buf, caption) =>
+  telegram.sendVideo(chatId, { source: buf, filename: 'cricmonster.mp4' }, { caption, parse_mode: 'Markdown', supports_streaming: true, width: 1280, height: 720 });
+const sendVideoFile = (telegram, chatId, file, caption) =>
+  telegram.sendVideo(chatId, { source: fs.createReadStream(file) }, { caption, parse_mode: 'Markdown', supports_streaming: true, width: 1280, height: 720 });
+
+// after the result: video with the winning captain + players
+async function sendWinVideo(telegram, groupId, m, label) {
+  if (!MATCH_VIDEOS || !label || label === 'tie' || !fs.existsSync(WIN_VIDEO)) return;
+  const players = await getPlayers(m.id, label);
+  const team = await getTeam(m.id, label);
+  const capP = team && team.captain_id ? players.find((p) => Number(p.telegram_id) === Number(team.captain_id)) : null;
+  const capName = capP ? videoName(capP) : '';
+  const names = players.filter((p) => !capP || p.id !== capP.id).map(videoName);
+  const caption = `🏆 *Congratulations Team ${label}!*`;
+  try {
+    const buf = await queueVideo(() => renderWinVideo(capName, names));
+    await sendVideoBuf(telegram, groupId, buf, caption);
+  } catch (e) {
+    console.error('win video failed, sending the plain video:', e.message);
+    const lines = (capName ? `👑 *${mdEsc(capName)}*\n` : '') + names.map((n, i) => `${i + 1}. ${mdEsc(n)}`).join('\n');
+    await sendVideoFile(telegram, groupId, WIN_VIDEO, `${caption}\n${lines}`.slice(0, 1000)).catch((e2) => console.error('plain win video failed:', e2.message));
+  }
+}
+
+// batsman crossed 50: the video pauses in the middle for 3 seconds and shows his numbers
+async function sendFiftyVideo(telegram, groupId, p, runs, balls) {
+  if (!MATCH_VIDEOS || !p || isBotId(p.telegram_id) || !fs.existsSync(FIFTY_VIDEO)) return;
+  const name = videoName(p);
+  const sr = balls > 0 ? ((runs * 100) / balls).toFixed(2) : '0.00';
+  const caption = `🏏 *${mdEsc(name)}* — *${runs}* (${balls})  ·  SR ${sr}`;
+  try {
+    const buf = await queueVideo(() => renderFiftyVideo({ name, runs, balls }));
+    await sendVideoBuf(telegram, groupId, buf, caption);
+  } catch (e) {
+    console.error('fifty video failed, sending the plain video:', e.message);
+    await sendVideoFile(telegram, groupId, FIFTY_VIDEO, caption).catch((e2) => console.error('plain fifty video failed:', e2.message));
+  }
+}
 
 // ─── Launch ──────────────────────────────────────────────
 async function main() {
