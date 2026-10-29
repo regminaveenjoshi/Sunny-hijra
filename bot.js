@@ -362,11 +362,12 @@ const TEAM_JOIN_WARN_LAST = 10; // send warning this many seconds before end
 const MAX_SOLO_PLAYERS = 100; // effectively unlimited
 
 // ── Discipline rules ──
-const TURN_SECONDS = 60; // batsman / bowler must respond within this time
+const TURN_SECONDS = 30; // batsman / bowler must respond within this time
+const TURN_WARN_SECONDS = 10; // English warning this many seconds before timeout
 const TURN_PENALTY = 6; // runs lost for every missed turn
 const SOLO_BOWLER_WARN_LIMIT = 3; // solo: bowling auto-changes after this many missed turns
 const TEAM_BOWLER_WARN_LIMIT = 2; // team: captain is tagged to choose the next bowler after this many
-const BAT_RETIRE_LIMIT = 3; // batsman is retired OUT after this many missed turns
+const BAT_RETIRE_LIMIT = 2; // batsman is retired OUT after this many missed turns
 const IDLE_WARN_SECONDS = 60; // host warning interval while the lobby / setup does not progress
 const IDLE_WARN_LIMIT = 10; // game is ended after this many host warnings
 const STUCK_MINUTES = 6; // active game with no response → auto-cancel so others can play
@@ -3421,7 +3422,10 @@ async function removePlayers(ctx) {
     }
     const targets = parseAddTargets(ctx);
     if (!targets.length)
-      return ctx.reply('Usage:\n/remove @user\n/remove 167282\n…or reply to a player’s message with /remove');
+      return ctx.reply(
+        'Usage:\n/remove @user\n/remove 167282\n…or reply to a player’s message with /remove\n\n' +
+          'By roster number:\n/remove_a1  /remove_b2  /rm_b3'
+      );
     const removed = [];
     const problems = [];
     for (const t of targets) {
@@ -3474,6 +3478,56 @@ async function removePlayers(ctx) {
   }
 }
 bot.command(['remove', 'kick', 'rmplayer'], removePlayers);
+
+// /remove_b2  /remove_a1  /rm_b3  — remove Team X player at roster position N (no request)
+bot.hears(/^\/(?:remove|rm|kick)_([ab])(\d+)(?:@\w+)?(?:\s|$)/i, async (ctx) => {
+  if (!isGroup(ctx)) return;
+  try {
+    const label = String(ctx.match[1]).toUpperCase();
+    const pos = parseInt(ctx.match[2], 10);
+    if (!pos || pos < 1) return ctx.reply('Usage: /remove_b2  (Team B, roster #2)');
+
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m) return ctx.reply(`${pe('no','❌')} No active match`);
+    if (!['waiting', 'captains', 'toss', 'innings1', 'innings2'].includes(m.status))
+      return ctx.reply('⚠️ Match is already finished');
+    if (m.mode === 'solo' && label !== 'A')
+      return ctx.reply('ℹ️ Solo has only one list — use /remove_a1 etc.');
+
+    const isHost = Number(m.host_telegram_id) === ctx.from.id;
+    if (!isHost && !isAdmin(ctx.from.id)) {
+      const team = await getTeam(m.id, label);
+      if (!team || Number(team.captain_id) !== ctx.from.id)
+        return ctx.reply(`❌ Only the host or Team ${label} captain can remove from Team ${label}`);
+    }
+
+    const pl = await getPlayerByPos(m.id, label, pos);
+    if (!pl) return ctx.reply(`❌ No player at Team ${label} #${pos}`);
+    if (Number(pl.telegram_id) === Number(m.host_telegram_id))
+      return ctx.reply('❌ Cannot remove the host');
+
+    const inn = await getInnings(m.id);
+    if (inn) {
+      if (inn.striker_player_id === pl.id) await q(`UPDATE innings SET striker_player_id=NULL WHERE id=$1`, [inn.id]);
+      if (inn.non_striker_player_id === pl.id) await q(`UPDATE innings SET non_striker_player_id=NULL WHERE id=$1`, [inn.id]);
+      if (inn.current_bowler_id === pl.id) await q(`UPDATE innings SET current_bowler_id=NULL WHERE id=$1`, [inn.id]);
+    }
+    await q(`DELETE FROM match_players WHERE id=$1`, [pl.id]);
+    await q(`UPDATE match_teams SET captain_id=NULL WHERE match_id=$1 AND captain_id=$2`, [m.id, pl.telegram_id]);
+
+    const display = pl.username ? '@' + pl.username : name(pl);
+    await ctx.reply(
+      `🗑 Removed *Team ${label} #${pos}* — ${mdEsc(display)}`,
+      { parse_mode: 'Markdown' }
+    );
+    if (['innings1', 'innings2'].includes(m.status)) {
+      try { await ensureTurnClock(m.id); } catch (_) {}
+    }
+  } catch (e) {
+    console.error(e);
+    await ctx.reply('❌ ' + e.message);
+  }
+});
 
 // ─── /lang /setlang en|hi : choose default commentary language for this group ───
 bot.command(['lang', 'setlang', 'commentary'], async (ctx) => {
@@ -4068,7 +4122,10 @@ bot.command('bat', async (ctx) => {
     if (!inn || !['idle', 'waiting_bat'].includes(inn.ball_state))
       return ctx.reply('⏳ A ball is pending');
     const team = await getTeam(m.id, inn.batting_team);
-    if (Number(team?.captain_id) !== ctx.from.id) return ctx.reply('❌ Only the batting captain can do this');
+    const isHost = Number(m.host_telegram_id) === ctx.from.id;
+    const isCap = Number(team?.captain_id) === ctx.from.id;
+    if (!isCap && !isHost && !isAdmin(ctx.from.id))
+      return ctx.reply('❌ Only the batting captain or the host can do this');
 
     const p = await getPlayerByPos(m.id, inn.batting_team, pos);
     if (!p) return ctx.reply('❌ Invalid player number');
@@ -4140,7 +4197,10 @@ bot.command(['ball', 'bowling'], async (ctx) => {
       return ctx.reply('❌ First pick 2 batsmen with /bat');
 
     const team = await getTeam(m.id, inn.bowling_team);
-    if (Number(team?.captain_id) !== ctx.from.id) return ctx.reply('❌ Only the bowling captain can do this');
+    const isHost = Number(m.host_telegram_id) === ctx.from.id;
+    const isCap = Number(team?.captain_id) === ctx.from.id;
+    if (!isCap && !isHost && !isAdmin(ctx.from.id))
+      return ctx.reply('❌ Only the bowling captain or the host can do this');
 
     const p = await getPlayerByPos(m.id, inn.bowling_team, pos);
     if (!p) return ctx.reply('❌ Invalid player number');
@@ -4265,13 +4325,14 @@ bot.command('score', async (ctx) => {
   await sendScoreboard(ctx.telegram, ctx.chat.id, m.id);
 });
 
-// ═════════════════ DISCIPLINE: 60s turn clock, penalties, warnings ═════════════════
+// ═════════════════ DISCIPLINE: 30s turn clock, 10s warning, penalties ═════════════════
 // Rules
-//  • Batsman must type 0-6 within 60s, bowler must pick his number within 60s.
+//  • Batsman must type 0-6 within 30s, bowler must pick his number within 30s.
+//  • English warning at 10s remaining.
 //  • Miss = -6 runs. Team mode: -6 from the player's TEAM score. Solo: -6 from the player's own runs
 //    (even if he has no runs yet — his score simply starts from -6).
 //  • Bowler warnings: solo → bowling auto-changes after 3, team → captain is tagged after 2 to choose a new bowler.
-//  • Batsman: after 3 missed turns he is retired OUT.
+//  • Batsman: after 2 missed turns he is retired OUT (solo: also removed from the match).
 
 const mkey = (id) => String(id);
 const warnCounts = new Map(); // `${matchId}:${playerId}:${kind}` -> count
@@ -4368,12 +4429,13 @@ async function soloRotateBowler(m, inn) {
 // Every ball: 1) the bowler gets a DM and sends his number (0-6) as a message,
 //             2) the group is told the number is locked, 3) the batsman types 1-6 in the group.
 // ball_state 'waiting_bowl' covers both steps; pending_balls.bowl_number tells which step we are in.
-const turnClocks = new Map(); // matchId -> { key, timer }
+const turnClocks = new Map(); // matchId -> { key, timer, warnTimer }
 const lockMsgs = new Map(); // callback_token -> group message id of the "locked" notice
 
 function clearTurnClock(matchId) {
   const c = turnClocks.get(mkey(matchId));
   if (c?.timer) clearTimeout(c.timer);
+  if (c?.warnTimer) clearTimeout(c.warnTimer);
   turnClocks.delete(mkey(matchId));
 }
 
@@ -4477,7 +4539,7 @@ async function turnState(matchId) {
   return { m, inn, pend, kind, key };
 }
 
-// Start the ball if it is time, and (re)arm the 60s clock for whoever is due. Safe to call any time.
+// Start the ball if it is time, and (re)arm the turn clock for whoever is due. Safe to call any time.
 async function ensureTurnClock(matchId) {
   try {
     await botTeamAssist(matchId);
@@ -4497,7 +4559,37 @@ async function ensureTurnClock(matchId) {
       () => onTurnTimeout(matchId, st.key).catch((e) => console.error('turn timeout error:', e)),
       TURN_SECONDS * 1000
     );
-    turnClocks.set(mkey(matchId), { key: st.key, timer });
+    // English warning at 10s remaining
+    const warnMs = Math.max(0, (TURN_SECONDS - TURN_WARN_SECONDS) * 1000);
+    const warnTimer = setTimeout(async () => {
+      try {
+        const still = turnClocks.get(mkey(matchId));
+        if (!still || still.key !== st.key) return;
+        const now = await turnState(matchId);
+        if (!now || now.key !== st.key) return;
+        const groupId = Number(st.m.group_chat_id);
+        if (st.kind === 'bat') {
+          const striker = await getPlayer(st.inn.striker_player_id);
+          if (striker)
+            await bot.telegram.sendMessage(
+              groupId,
+              `⚠️ *${TURN_WARN_SECONDS}s left!*\n> ${mtag(striker)} — type *0–6* now or you will be timed out.`,
+              { parse_mode: 'Markdown' }
+            );
+        } else {
+          const bowler = await getPlayer(st.inn.current_bowler_id);
+          if (bowler)
+            await bot.telegram.sendMessage(
+              groupId,
+              `⚠️ *${TURN_WARN_SECONDS}s left!*\n> ${mtag(bowler)} — send *1–6* in the bot DM now or this ball is cancelled.`,
+              { parse_mode: 'Markdown' }
+            );
+        }
+      } catch (e) {
+        console.error('turn warn failed:', e.message);
+      }
+    }, warnMs);
+    turnClocks.set(mkey(matchId), { key: st.key, timer, warnTimer });
   } catch (e) {
     console.error('ensureTurnClock failed:', e.message);
   }
@@ -4506,6 +4598,7 @@ async function ensureTurnClock(matchId) {
 async function onTurnTimeout(matchId, key) {
   const cur = turnClocks.get(mkey(matchId));
   if (!cur || cur.key !== key) return;
+  if (cur.warnTimer) clearTimeout(cur.warnTimer);
   turnClocks.delete(mkey(matchId));
   const st = await turnState(matchId);
   if (!st || st.repair || st.key !== key) return; // something happened in the meantime
@@ -4576,6 +4669,28 @@ async function batTimeout({ m, inn, pend }) {
     `UPDATE innings SET total_wickets=total_wickets+1, striker_player_id=NULL, ball_state='idle' WHERE id=$1`,
     [inn.id]
   );
+
+  if (isSolo) {
+    // Solo: remove the timed-out player from the match entirely (no more game for them)
+    await q(`DELETE FROM match_players WHERE id=$1`, [striker.id]);
+    await tg.sendMessage(
+      groupId,
+      `🚪 ${mtag(striker)} timed out *${BAT_RETIRE_LIMIT}* times and is *removed from this solo match*.\n` +
+        `> Next batsman will come in automatically.`,
+      { parse_mode: 'Markdown' }
+    );
+  } else {
+    // Team: tag batting captain to send the next batsman
+    const team = await getTeam(m.id, inn.batting_team);
+    const cap = team?.captain_id ? await getPlayerByTg(m.id, team.captain_id) : null;
+    await tg.sendMessage(
+      groupId,
+      `👑 ${cap ? mtag(cap) : 'Captain'} — ${mtag(striker)} is *retired OUT* after ${BAT_RETIRE_LIMIT} timeouts.\n` +
+        `> Send the next batsman: */bat <no.>*`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
   // OUT gif + tag the retired batsman
   await sendResultGif(
     tg,
