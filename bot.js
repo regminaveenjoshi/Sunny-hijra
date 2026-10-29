@@ -3276,8 +3276,9 @@ async function addPlayers(ctx, label, viaAdd = false) {
   try {
     const m = await getActiveMatch(ctx.chat.id);
     if (!m) return ctx.reply(`${pe('no','❌')} No active match`);
-    if (!['waiting', 'captains', 'toss'].includes(m.status))
-      return ctx.reply('⚠️ Players can only be added before the match starts');
+    // Allow add in lobby AND during live innings (request still goes to the player)
+    if (!['waiting', 'captains', 'toss', 'innings1', 'innings2'].includes(m.status))
+      return ctx.reply('⚠️ Players can only be added while the match is active');
     if (m.mode !== 'solo' && viaAdd) return ctx.reply('Use /add_a or /add_b to choose the team.');
     if (m.mode === 'solo') label = 'A';
     if (m.vs_bot && label === 'B') return ctx.reply('🤖 Team B is the bot team');
@@ -3371,8 +3372,8 @@ bot.action(/^inv:(Y|N):(.+)$/, async (ctx) => {
       await ctx.answerCbQuery('Declined');
       return editCard(ctx, `❌ ${mdEsc(display)} declined the invite.`);
     }
-    if (!m || !['waiting', 'captains', 'toss'].includes(m.status))
-      return ctx.answerCbQuery('Too late — the match has already started', { show_alert: true });
+    if (!m || !['waiting', 'captains', 'toss', 'innings1', 'innings2'].includes(m.status))
+      return ctx.answerCbQuery('Too late — the match is over', { show_alert: true });
     if (await getPlayerByTg(m.id, inv.user.id)) return ctx.answerCbQuery('You are already in the match');
     const pl = await getPlayers(m.id, inv.label);
     if (pl.length >= m.team_size) return ctx.answerCbQuery('The team is full', { show_alert: true });
@@ -3399,6 +3400,112 @@ bot.action(/^inv:(Y|N):(.+)$/, async (ctx) => {
 bot.command('add_a', (ctx) => addPlayers(ctx, 'A'));
 bot.command('add_b', (ctx) => addPlayers(ctx, 'B'));
 bot.command('add', (ctx) => addPlayers(ctx, 'A', true));
+
+// ─── /remove /kick : host (or captain) removes a player instantly (no request) ───
+// Works in lobby and during live innings for both solo & team.
+async function removePlayers(ctx) {
+  if (!isGroup(ctx)) return;
+  try {
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m) return ctx.reply(`${pe('no','❌')} No active match`);
+    if (!['waiting', 'captains', 'toss', 'innings1', 'innings2'].includes(m.status))
+      return ctx.reply('⚠️ Match is already finished');
+    const isHost = Number(m.host_telegram_id) === ctx.from.id;
+    if (!isHost && !isAdmin(ctx.from.id)) {
+      // captains can only remove from their own team
+      const tA = await getTeam(m.id, 'A');
+      const tB = await getTeam(m.id, 'B');
+      const isCapA = tA && Number(tA.captain_id) === ctx.from.id;
+      const isCapB = tB && Number(tB.captain_id) === ctx.from.id;
+      if (!isCapA && !isCapB) return ctx.reply('❌ Only the host or a captain can remove players');
+    }
+    const targets = parseAddTargets(ctx);
+    if (!targets.length)
+      return ctx.reply('Usage:\n/remove @user\n/remove 167282\n…or reply to a player’s message with /remove');
+    const removed = [];
+    const problems = [];
+    for (const t of targets) {
+      const info = await resolveTarget(ctx, t);
+      if (!info) {
+        problems.push(`@${t.username || t.id} — not found`);
+        continue;
+      }
+      if (Number(info.id) === Number(m.host_telegram_id)) {
+        problems.push(`${info.username ? '@' + info.username : info.first_name || info.id} — cannot remove the host`);
+        continue;
+      }
+      const pl = await getPlayerByTg(m.id, info.id);
+      if (!pl) {
+        problems.push(`${info.username ? '@' + info.username : info.first_name || info.id} — not in this match`);
+        continue;
+      }
+      // captain restriction
+      if (!isHost && !isAdmin(ctx.from.id)) {
+        const team = await getTeam(m.id, pl.team_label);
+        if (!team || Number(team.captain_id) !== ctx.from.id) {
+          problems.push(`${info.username ? '@' + info.username : info.first_name || info.id} — only their captain or host can remove`);
+          continue;
+        }
+      }
+      // if currently batting / bowling, clear from innings so game can continue
+      const inn = await getInnings(m.id);
+      if (inn) {
+        if (inn.striker_player_id === pl.id) await q(`UPDATE innings SET striker_player_id=NULL WHERE id=$1`, [inn.id]);
+        if (inn.non_striker_player_id === pl.id) await q(`UPDATE innings SET non_striker_player_id=NULL WHERE id=$1`, [inn.id]);
+        if (inn.current_bowler_id === pl.id) await q(`UPDATE innings SET current_bowler_id=NULL WHERE id=$1`, [inn.id]);
+      }
+      await q(`DELETE FROM match_players WHERE id=$1`, [pl.id]);
+      // if they were captain, clear captain
+      await q(`UPDATE match_teams SET captain_id=NULL WHERE match_id=$1 AND captain_id=$2`, [m.id, info.id]);
+      const display = info.username ? '@' + info.username : info.first_name || String(info.id);
+      removed.push(display);
+    }
+    let msg = '';
+    if (removed.length) msg += `🗑 Removed: ${removed.map(mdEsc).join(', ')}\n`;
+    if (problems.length) msg += `⚠️ Skipped:\n${problems.map(mdEsc).join('\n')}`;
+    await ctx.reply(msg || 'Nothing changed', { parse_mode: 'Markdown' });
+    if (removed.length && ['innings1', 'innings2'].includes(m.status)) {
+      // re-arm turn so the game does not stay stuck without striker/bowler
+      try { await ensureTurnClock(m.id); } catch (_) {}
+    }
+  } catch (e) {
+    console.error(e);
+    await ctx.reply('❌ ' + e.message);
+  }
+}
+bot.command(['remove', 'kick', 'rmplayer'], removePlayers);
+
+// ─── /lang /setlang en|hi : choose default commentary language for this group ───
+bot.command(['lang', 'setlang', 'commentary'], async (ctx) => {
+  if (!isGroup(ctx)) return ctx.reply('Use this in a group.');
+  try {
+    const arg = String(ctx.message?.text || '').split(/\s+/)[1]?.toLowerCase() || '';
+    if (!arg || !['en', 'english', 'hi', 'hindi', 'हिं', 'हिंदी'].includes(arg)) {
+      const cur = await getGroupLang(ctx.chat.id);
+      return ctx.reply(
+        `🎙️ *Commentary language*\n` +
+          `> Current: *${cur === 'hi' ? 'Hindi' : 'English'}*\n\n` +
+          `Change with:\n` +
+          `/lang en  — English commentary\n` +
+          `/lang hi  — Hindi commentary`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+    const isHost = (await getActiveMatch(ctx.chat.id))?.host_telegram_id == ctx.from.id;
+    if (!isHost && !(await isGroupAdmin(ctx.chat.id, ctx.from.id)) && !isAdmin(ctx.from.id))
+      return ctx.reply('❌ Only the host or a group admin can change commentary language.');
+    const lang = ['hi', 'hindi', 'हिं', 'हिंदी'].includes(arg) ? 'hi' : 'en';
+    await setGroupLang(ctx.chat.id, lang);
+    await ctx.reply(
+      lang === 'hi'
+        ? '🎙️ कमेंट्री अब *हिंदी* में चलेगी।'
+        : '🎙️ Commentary language set to *English*.',
+      { parse_mode: 'Markdown' }
+    );
+  } catch (e) {
+    await ctx.reply('❌ ' + e.message);
+  }
+});
 
 // /spam (host): Spam-free (same number max 2 times in a row) <-> Spam (no limit)
 bot.command('spam', async (ctx) => {
@@ -5306,6 +5413,83 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
   }
 }
 
+// ─── Commentary language (group setting) ─────────────────
+const langCache = new Map(); // chatId -> 'en'|'hi'
+async function getGroupLang(chatId) {
+  const k = String(chatId);
+  if (langCache.has(k)) return langCache.get(k);
+  try {
+    const { rows } = await q(`SELECT commentary_lang FROM group_settings WHERE chat_id=$1`, [chatId]);
+    const lang = rows[0]?.commentary_lang === 'hi' ? 'hi' : 'en';
+    langCache.set(k, lang);
+    return lang;
+  } catch (_) {
+    return 'en';
+  }
+}
+async function setGroupLang(chatId, lang) {
+  const l = lang === 'hi' ? 'hi' : 'en';
+  await q(
+    `INSERT INTO group_settings (chat_id, commentary_lang, updated_at) VALUES ($1,$2,NOW())
+     ON CONFLICT (chat_id) DO UPDATE SET commentary_lang=$2, updated_at=NOW()`,
+    [chatId, l]
+  );
+  langCache.set(String(chatId), l);
+  return l;
+}
+
+// Hindi commentary (fallback to English when a key is missing)
+const COMMENT_HI = {
+  '0': [
+    'डॉट बॉल! दबाव बढ़ रहा है।',
+    'मजबूत डिफेंस, कोई रन नहीं।',
+    'टाइट लाइन — जीरो रन्स।',
+    'ब्लॉक किया। स्कोरबोर्ड वहीं।',
+    'डॉट! बॉलर जीता यह द्वंद्व।',
+    'कोई रन नहीं — शुद्ध धैर्य।',
+    'डॉट बॉल। दबाव जारी है।',
+    'अच्छा बचाव, कुछ नहीं मिला।',
+  ],
+  '1': [
+    'एक रन! स्मार्ट क्रिकेट।',
+    'क्विक सिंगल लिया।',
+    'एक रन, स्ट्राइक घुमाया।',
+    'सॉफ्ट हैंड्स से एक रन।',
+  ],
+  '2': [
+    'दो रन! अच्छी प्लेसमेंट।',
+    'वे दो के लिए वापस आए।',
+    'दो रन बोर्ड पर।',
+  ],
+  '3': [
+    'तीन रन! शानदार रनिंग।',
+    'तीन! उत्कृष्ट हसल।',
+  ],
+  '4': [
+    'चार! बाउंड्री पर पहुंचा।',
+    'FOUR! कवर के पार।',
+    'चार रन! परफेक्ट टाइमिंग।',
+    'बाउंड्री! कोई मौका नहीं।',
+  ],
+  '5': [
+    'पांच रन! ओवरथ्रो का कहर।',
+    'पांच! मिसफील्ड ने गिफ्ट दिया।',
+  ],
+  '6': [
+    'छक्का! भीड़ में गया!',
+    'मैक्सिमम! ग्राउंड से बाहर!',
+    'छह रन! बिल्कुल रॉकेट।',
+    'SIX! बॉलर सिर्फ देख सकता है।',
+  ],
+  'out': [
+    'एक ही नंबर — OUT! बॉलर जीता।',
+    'OUT! नंबर्स परफेक्ट मैच।',
+    'विकेट! माइंड गेम खत्म।',
+    'बोल्ड — एक ही नंबर!',
+    'OUT! वापस जाना होगा।',
+  ],
+};
+
 const COMMENT = {
   '0': [
     'Dot ball! The pressure builds.',
@@ -5879,7 +6063,12 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
     : runs === 0
     ? `${pe('ball','⚪')} <b>DOT BALL</b>`
     : `${runs === 6 ? pe('six','🚀') : runs === 4 ? pe('bat','🏏') : pe('bat','🏏')} <b>${runs} RUN${runs === 1 ? '' : 'S'}!</b>`;
-  const cmt = pick(COMMENT[isWicket ? 'out' : String(runs)] || COMMENT['0'] || ['Nice ball.']);
+  const lang = await getGroupLang(groupId);
+  const cmtPool = (lang === 'hi' ? COMMENT_HI : COMMENT)[isWicket ? 'out' : String(runs)]
+    || COMMENT[isWicket ? 'out' : String(runs)]
+    || COMMENT['0']
+    || ['Nice ball.'];
+  const cmt = pick(cmtPool);
 
   // milestones (each has its own /pgif GIF; the normal result GIF is the fallback)
   const strikerP = await getPlayer(strikerId);
@@ -6668,7 +6857,15 @@ async function userCareer(tgId) {
   const matches = mc[0]?.c || 0;
   const runs = Number(b.runs || 0);
   const wkts = Number(w.wkts || 0);
-  const level = Math.min(99, 1 + Math.floor((runs + wkts * 25 + matches * 10) / 100));
+  // Level formula kept similar; titles map to ranges. ~600 runs ≈ Club, ~5k ≈ International zone
+  const level = Math.min(120, 1 + Math.floor((runs + wkts * 25 + matches * 10) / 100));
+  const title =
+    level >= 100 ? 'Legendary Cricketer' :
+    level >= 50  ? 'Marquee Cricketer' :
+    level >= 25  ? 'International Cricketer' :
+    level >= 15  ? 'Domestic Cricketer' :
+    level >= 6   ? 'Club Cricketer' :
+                   'Street Cricketer';
   const [res, part, awards] = await Promise.all([
     userResults(id).catch(() => ({ w: 0, l: 0, d: 0, total: 0, streakType: '', streak: 0, bestStreak: 0, cap: { matches: 0, w: 0, l: 0 } })),
     userPartnership(id).catch(() => ({ runs: 0, partner: null })),
@@ -6676,6 +6873,7 @@ async function userCareer(tgId) {
   ]);
   return {
     level,
+    title,
     res,
     part,
     awards,
@@ -6898,7 +7096,7 @@ function userRichHtml(t, shownName, c, withPhoto = false) {
   let h = withPhoto ? `<h1>${hEsc(shownName)}</h1><img src="tg://photo?id=card"/>` : `<p><b>🏏 STATS SUMMARY</b></p>`;
   h += `<p>👤 ${who}  ·  🆔 <code>${t.id}</code>  ·  📅 ${date}</p>`;
   h += tbl([
-    ['⭐ Level', c.level],
+    ['⭐ Rank', `${c.title || 'Street Cricketer'} (Lv ${c.level})`],
     ['🏅 Matches Played', n(b.matches)],
     ['🎮 Matches Hosted', n(c.hosted)],
     ['✅ Win / Lose', `${r.w} W · ${r.l} L` + (r.d ? ` · ${r.d} D` : '')],
@@ -6965,7 +7163,7 @@ function userCaption(t, name, career) {
     `${line}\n` +
     `🎯 *Best Bowling:* ${career.bestBowl.wkts}/${career.bestBowl.runs}\n` +
     `🏅 *Matches Played:* ${n(b.matches)}\n` +
-    `⭐ *Level:* ${career.level}`
+    `⭐ *Rank:* ${career.title || 'Street Cricketer'} (Lv ${career.level})`
   );
 }
 
@@ -6994,7 +7192,7 @@ bot.command(['userinfo', 'myinfo'], async (ctx) => {
     if (RICH_TABLES && !done) {
       try {
         await ctx.telegram.sendPhoto(ctx.chat.id, { source: img }, {
-          caption: `📊 *${mdEsc(shown)}*  ·  Level ${career.level}`,
+          caption: `📊 *${mdEsc(shown)}*  ·  ${mdEsc(career.title || 'Street Cricketer')} (Lv ${career.level})`,
           parse_mode: 'Markdown',
           reply_to_message_id: ctx.message.message_id,
           allow_sending_without_reply: true,
@@ -7311,6 +7509,11 @@ async function main() {
     telegram_id BIGINT NOT NULL,
     kind TEXT NOT NULL,
     PRIMARY KEY (match_id, telegram_id, kind)
+  )`);
+  await q(`CREATE TABLE IF NOT EXISTS group_settings (
+    chat_id BIGINT PRIMARY KEY,
+    commentary_lang TEXT NOT NULL DEFAULT 'en',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
   await relaxNegativeRunConstraints();
   try {
