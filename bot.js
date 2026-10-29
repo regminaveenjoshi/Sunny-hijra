@@ -779,21 +779,37 @@ async function defaultAvatar(d) {
   return sharp(defaultAvatarSvg(d)).png().toBuffer();
 }
 
-// Round, size-adjusted DP (square crop of the photo, scaled to the circle)
+// Round, size-adjusted DP — centre square crop then circle mask (stable face ratio, no stretch)
 async function circleImage(dpBuf, d) {
   if (!dpBuf) return defaultAvatar(d);
   const mask = Buffer.from(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${d}" height="${d}"><circle cx="${d / 2}" cy="${d / 2}" r="${d / 2}" fill="#fff"/></svg>`
   );
   try {
+    const meta = await sharp(dpBuf).metadata();
+    const w = meta.width || d;
+    const h = meta.height || d;
+    const side = Math.max(1, Math.min(w, h));
+    const left = Math.max(0, Math.floor((w - side) / 2));
+    const top = Math.max(0, Math.floor((h - side) / 2));
     return await sharp(dpBuf)
-      .resize(d, d, { fit: 'cover', position: 'attention' })
+      .extract({ left, top, width: side, height: side })
+      .resize(d, d, { fit: 'fill' }) // already square — no aspect distortion
       .ensureAlpha()
       .composite([{ input: mask, blend: 'dest-in' }])
       .png()
       .toBuffer();
   } catch (_) {
-    return defaultAvatar(d);
+    try {
+      return await sharp(dpBuf)
+        .resize(d, d, { fit: 'cover', position: 'centre' })
+        .ensureAlpha()
+        .composite([{ input: mask, blend: 'dest-in' }])
+        .png()
+        .toBuffer();
+    } catch (_) {
+      return defaultAvatar(d);
+    }
   }
 }
 
@@ -976,19 +992,34 @@ async function assetReport() {
 // ═══ VIDEO OVERLAYS (winning team + fifty) ═══
 const POP_BOLD = path.join(ASSET_DIR, 'Poppins-Bold.ttf');
 const POP_MED = path.join(ASSET_DIR, 'Poppins-Medium.ttf');
+// Prefer Poppins; fall back to DejaVu so win/fifty overlays never go blank when Poppins is missing
 async function popText(text, px, color = '#ffffff', bold = true) {
   needSharp();
-  return sharp({
-    text: {
-      text: `<span foreground="${color}">${xmlEsc(String(text))}</span>`,
-      font: `Poppins ${bold ? 'Bold' : 'Medium'} ${px}`,
-      fontfile: bold ? POP_BOLD : POP_MED,
-      rgba: true,
-      dpi: 72,
-    },
-  })
-    .png()
-    .toBuffer({ resolveWithObject: true });
+  const tries = [];
+  const popFile = bold ? POP_BOLD : POP_MED;
+  if (fs.existsSync(popFile)) {
+    tries.push({ font: `Poppins ${bold ? 'Bold' : 'Medium'} ${px}`, fontfile: popFile });
+  }
+  tries.push({ font: `${FONT_FAMILY} ${px}`, fontfile: FONT_FILE });
+  let lastErr;
+  for (const f of tries) {
+    try {
+      return await sharp({
+        text: {
+          text: `<span foreground="${color}">${xmlEsc(String(text))}</span>`,
+          font: f.font,
+          fontfile: f.fontfile,
+          rgba: true,
+          dpi: 72,
+        },
+      })
+        .png()
+        .toBuffer({ resolveWithObject: true });
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('popText failed');
 }
 async function popFit(text, px, maxW, color = '#ffffff', bold = true, minPx = 14) {
   let size = px;
@@ -999,19 +1030,36 @@ async function popFit(text, px, maxW, color = '#ffffff', bold = true, minPx = 14
   }
   return img;
 }
-// first + last name, else the username, else "Player" (English letters only - the font has no other scripts)
+// first + last name, else username, else "Player" (ASCII only — card fonts lack other scripts)
 function videoName(p) {
-  const full = cleanName([p && p.first_name, p && p.last_name].filter(Boolean).join(' '), '').trim();
-  return full || cleanName((p && p.username) || '', '').trim() || 'Player';
+  if (!p) return 'Player';
+  const full = cleanName([p.first_name, p.last_name].filter(Boolean).join(' '), '').trim();
+  if (full) return full;
+  const un = cleanName(p.username || '', '').trim();
+  if (un) return un;
+  const id = p.telegram_id ?? p.id;
+  return id != null && Number(id) > 0 ? `P${String(id).slice(-4)}` : 'Player';
 }
 
 // 1280x720 transparent overlay for the "WINNING TEAM" video: captain in the CAP box, players line by line in the PLAYER LIST box
 async function buildWinOverlay(capName, names) {
   needSharp();
   const layers = [];
-  if (capName) layers.push(centered(await goldText(capName, 38, 372, { pop: true, squeeze: 1, outline: [60, 0, 0] }), 917, 346, 0));
+  // CAP box — try gold Poppins, fall back to plain text so name always shows
+  if (capName) {
+    try {
+      layers.push(centered(await goldText(capName, 38, 372, { pop: true, squeeze: 1, outline: [60, 0, 0] }), 917, 346, 0));
+    } catch (e) {
+      console.error('win overlay cap goldText failed, plain fallback:', e.message);
+      try {
+        layers.push(centered(await popFit(capName, 36, 372, '#ffe08a', true, 18), 917, 346, 0));
+      } catch (e2) {
+        console.error('win overlay cap plain failed:', e2.message);
+      }
+    }
+  }
 
-  let list = names.slice();
+  let list = (names || []).map((n) => String(n || '').trim()).filter(Boolean);
   if (list.length > 21) list = list.slice(0, 20).concat([`+${names.length - 20} more`]);
   const n = list.length;
   if (n) {
@@ -1027,8 +1075,12 @@ async function buildWinOverlay(capName, names) {
       const col = Math.floor(i / rows);
       const row = i % rows;
       const label = list[i].startsWith('+') ? null : String(i + 1).padStart(2, '0');
-      const name = await popFit(list[i], px, colW - 70, '#ffffff', true, 12);
-      items.push({ col, row, label, name });
+      try {
+        const name = await popFit(list[i], px, Math.max(40, colW - 70), '#ffffff', true, 12);
+        items.push({ col, row, label, name });
+      } catch (e) {
+        console.error('win overlay player name failed:', list[i], e.message);
+      }
     }
     for (let c = 0; c < cols; c++) {
       const colItems = items.filter((x) => x.col === c);
@@ -1038,8 +1090,10 @@ async function buildWinOverlay(capName, names) {
       for (const it of colItems) {
         const cy = top + it.row * lineH + lineH / 2;
         if (it.label) {
-          const num = await popText(it.label, Math.max(12, px - 4), '#ffc53d', true);
-          layers.push({ input: num.data, left: Math.round(left), top: Math.round(cy - num.info.height / 2) });
+          try {
+            const num = await popText(it.label, Math.max(12, px - 4), '#ffc53d', true);
+            layers.push({ input: num.data, left: Math.round(left), top: Math.round(cy - num.info.height / 2) });
+          } catch (_) {}
         }
         layers.push({ input: it.name.data, left: Math.round(left + 38), top: Math.round(cy - it.name.info.height / 2) });
       }
@@ -1752,8 +1806,42 @@ function rosterBlock(players, markOf = () => '') {
   return t;
 }
 
+// ─── Auto-pin: members list + match-start; unpin when match ends ───
+// Bot must be group admin with "Pin Messages" permission.
+const matchPins = new Map(); // matchId -> Set of message_id
+function trackPin(matchId, msgId) {
+  if (!matchId || !msgId) return;
+  const k = String(matchId);
+  if (!matchPins.has(k)) matchPins.set(k, new Set());
+  matchPins.get(k).add(Number(msgId));
+}
+async function pinMsg(telegram, chatId, matchId, msgId) {
+  if (!msgId) return;
+  try {
+    await telegram.pinChatMessage(chatId, Number(msgId), { disable_notification: true });
+    trackPin(matchId, msgId);
+  } catch (e) {
+    console.error('pin failed:', e.message);
+  }
+}
+async function unpinMatchPins(telegram, chatId, matchId) {
+  const k = String(matchId);
+  const set = matchPins.get(k);
+  if (!set || !set.size) {
+    matchPins.delete(k);
+    return;
+  }
+  for (const id of set) {
+    try {
+      await telegram.unpinChatMessage(chatId, id);
+    } catch (_) {}
+  }
+  matchPins.delete(k);
+}
+
 // Players-list banner ("Let's Begin") with the text as caption. Telegram captions stop at 1024
 // characters, so whatever does not fit goes into a follow-up message.
+// Returns the photo message (for pinning) or null.
 async function sendPlayersListPhoto(telegram, chatId, text) {
   const lines = String(text).split('\n');
   let cap = '';
@@ -1763,15 +1851,17 @@ async function sendPlayersListPhoto(telegram, chatId, text) {
     cap += lines[i] + '\n';
   }
   const rest = lines.slice(i).join('\n');
+  let sent = null;
   try {
     const img = await renderPlayersBanner();
-    await telegram.sendPhoto(chatId, { source: img }, { caption: cap.trim() || '📋', parse_mode: 'Markdown' });
+    sent = await telegram.sendPhoto(chatId, { source: img }, { caption: cap.trim() || '📋', parse_mode: 'Markdown' });
   } catch (e) {
     await reportCardError('Players banner', e);
     await sendLong(telegram, chatId, text);
-    return;
+    return null;
   }
   if (rest.trim()) await sendLong(telegram, chatId, rest);
+  return sent;
 }
 
 async function rosterText(match) {
@@ -1817,14 +1907,17 @@ function statusLabel(m) {
   return 'Cancelled';
 }
 
-// /members and /team: MATCH OVERVIEW with a generated PLAYERS LIST banner
+// /members and /team: MATCH OVERVIEW with a generated PLAYERS LIST banner (auto-pinned while match is live)
 async function sendMembers(ctx, m) {
   const started = ['innings1', 'innings2', 'completed'].includes(m.status);
   const caption =
     `📊 *${fancy('MATCH OVERVIEW')}*\n` +
     `> ${pe('crown','👑')} Host: ${await hostLabel(m)}\n` +
     `> ⏳ Overs: *${started ? m.total_overs : 'None'}* | 🔄 *${statusLabel(m)}*`;
-  await sendPlayersListPhoto(ctx.telegram, ctx.chat.id, caption + '\n\n' + (await rosterText(m)));
+  const sent = await sendPlayersListPhoto(ctx.telegram, ctx.chat.id, caption + '\n\n' + (await rosterText(m)));
+  if (sent?.message_id && m && !['completed', 'cancelled'].includes(m.status)) {
+    await pinMsg(ctx.telegram, ctx.chat.id, m.id, sent.message_id);
+  }
 }
 
 // Telegram limit is 4096 chars: split long texts at line breaks
@@ -1911,6 +2004,7 @@ async function fullScorecard(matchId) {
 }
 
 // Match start banner: host + Team A captain + Team B captain (default avatar when someone has no DP)
+// Auto-pins so the group always sees who is batting/bowling.
 async function sendMatchBanner(telegram, groupId, m, extraCaption = '') {
   const tA = await getTeam(m.id, 'A');
   const tB = await getTeam(m.id, 'B');
@@ -1923,6 +2017,7 @@ async function sendMatchBanner(telegram, groupId, m, extraCaption = '') {
     `🏏 Batting — *Team ${m.current_batting_team}*\n` +
     `🎳 Bowling — *Team ${m.current_bowling_team}*` +
     extraCaption;
+  let sent = null;
   try {
     const [hostDp, dpA, dpB] = await Promise.all([
       getUserDp(telegram, m.host_telegram_id),
@@ -1935,11 +2030,13 @@ async function sendMatchBanner(telegram, groupId, m, extraCaption = '') {
       capA: capA ? { dp: dpA, name: capA.username || capA.first_name } : null,
       capB: capB ? { dp: dpB, name: capB.username || capB.first_name } : null,
     });
-    await telegram.sendPhoto(groupId, { source: img }, { caption, parse_mode: 'Markdown' });
+    sent = await telegram.sendPhoto(groupId, { source: img }, { caption, parse_mode: 'Markdown' });
   } catch (e) {
     await reportCardError('Match banner', e);
-    await telegram.sendMessage(groupId, caption, { parse_mode: 'Markdown' });
+    sent = await telegram.sendMessage(groupId, caption, { parse_mode: 'Markdown' });
   }
+  if (sent?.message_id) await pinMsg(telegram, groupId, m.id, sent.message_id);
+  return sent;
 }
 
 // ─── /start ──────────────────────────────────────────────
@@ -3631,6 +3728,7 @@ async function cancelMatchNow(m, telegram = null) {
   const tg = telegram || bot.telegram;
   const groupId = Number(m.group_chat_id);
   if (groupId) {
+    await unpinMatchPins(tg, groupId, m.id);
     try {
       await sendMatchDataFile(tg, groupId, m.id);
     } catch (e) {
@@ -4083,12 +4181,26 @@ bot.action(/^ov:(.+):(\d+)$/, async (ctx) => {
 
     const groupId = Number(m.group_chat_id);
     await sendMatchBanner(ctx.telegram, groupId, mm, `\n⏱ max ${perBowler} per bowler`);
-    await sendLong(ctx.telegram, groupId, await rosterText(mm));
+    // Pin members/roster list at match start
+    try {
+      const rosterMsg = await sendPlayersListPhoto(
+        ctx.telegram,
+        groupId,
+        `📊 *${fancy('MATCH OVERVIEW')}*\n` +
+          `> ${pe('crown','👑')} Host: ${await hostLabel(mm)}\n` +
+          `> ⏳ Overs: *${mm.total_overs}* | 🔄 *${statusLabel(mm)}*\n\n` +
+          (await rosterText(mm))
+      );
+      if (rosterMsg?.message_id) await pinMsg(ctx.telegram, groupId, mm.id, rosterMsg.message_id);
+    } catch (e) {
+      console.error('start roster pin:', e.message);
+      await sendLong(ctx.telegram, groupId, await rosterText(mm));
+    }
     const bowlTeam = await getTeam(m.id, mm.current_bowling_team);
     const batTeam = await getTeam(m.id, mm.current_batting_team);
     const bowlCap = bowlTeam?.captain_id ? await getPlayerByTg(m.id, bowlTeam.captain_id) : null;
     const batCap = batTeam?.captain_id ? await getPlayerByTg(m.id, batTeam.captain_id) : null;
-    await sendCaptionedGif(
+    const startMsg = await sendCaptionedGif(
       ctx.telegram,
       groupId,
       'starter',
@@ -4099,6 +4211,7 @@ bot.action(/^ov:(.+):(\d+)$/, async (ctx) => {
         `🏏 <b>Team ${mm.current_batting_team} is batting</b>\n` +
         `<blockquote>${batCap ? htag(batCap) : 'Captain'}, send your openers → <code>/bat &lt;no.&gt;</code> (twice)</blockquote>`
     );
+    if (startMsg?.message_id) await pinMsg(ctx.telegram, groupId, mm.id, startMsg.message_id);
     await botTeamAssist(m.id);
     await ensureTurnClock(m.id);
   } catch (e) {
@@ -5307,6 +5420,7 @@ async function sendMatchDataFile(telegram, chatId, matchId) {
 // Solo: single innings finished (everyone is out)
 async function finishSolo(telegram, groupId, m, inn) {
   await q(`UPDATE matches SET status='completed', winner_team='A', completed_at=NOW() WHERE id=$1`, [m.id]);
+  await unpinMatchPins(telegram, groupId, m.id);
   const [bat, bowl, aw] = await Promise.all([bestBatter(m.id), bestBowler(m.id), matchAwards(m.id)]);
   saveAwards(m.id, aw).catch((e) => console.error('saveAwards:', e.message));
   const players = await getPlayers(m.id, 'A');
@@ -5352,6 +5466,7 @@ async function finishTeam(telegram, groupId, m, inn2) {
     m.id,
     winner,
   ]);
+  await unpinMatchPins(telegram, groupId, m.id);
 
   const { rows: inns } = await q(`SELECT * FROM innings WHERE match_id=$1 ORDER BY innings_number`, [m.id]);
   let caption = `🏁 *${fancy('MATCH OVER')}*\n${resultLine}\n`;
@@ -6457,6 +6572,7 @@ async function cancelStuckMatch(m, reason) {
       [m.id]
     );
     const groupId = Number(m.group_chat_id);
+    await unpinMatchPins(bot.telegram, groupId, m.id);
     await bot.telegram.sendMessage(
       groupId,
       `🛑 *GAME AUTO-CANCELLED*\n` +
@@ -7519,8 +7635,25 @@ async function renderWinVideo(capName, names) {
   try {
     const ov = path.join(dir, 'ov.png');
     const out = path.join(dir, 'out.mp4');
-    fs.writeFileSync(ov, await buildWinOverlay(capName, names));
-    await runFfmpeg(['-i', WIN_VIDEO, '-framerate', '30', '-loop', '1', '-i', ov, '-filter_complex', '[0:v][1:v]overlay=0:0:shortest=1[v]', '-map', '[v]', '-map', '0:a?', ...encodeArgs, '-shortest', out]);
+    const overlayBuf = await buildWinOverlay(capName, names);
+    fs.writeFileSync(ov, overlayBuf);
+    // Force both streams to 1280x720 so CAP/player text always lands on the template boxes
+    const filter =
+      '[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1[base];' +
+      '[1:v]format=rgba,scale=1280:720[ov];' +
+      '[base][ov]overlay=0:0:shortest=1[v]';
+    await runFfmpeg([
+      '-i', WIN_VIDEO,
+      '-framerate', '30',
+      '-loop', '1',
+      '-i', ov,
+      '-filter_complex', filter,
+      '-map', '[v]',
+      '-map', '0:a?',
+      ...encodeArgs,
+      '-shortest',
+      out,
+    ]);
     return fs.readFileSync(out);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -7564,15 +7697,20 @@ async function sendWinVideo(telegram, groupId, m, label) {
   const team = await getTeam(m.id, label);
   const capP = team && team.captain_id ? players.find((p) => Number(p.telegram_id) === Number(team.captain_id)) : null;
   const capName = capP ? videoName(capP) : '';
-  const names = players.filter((p) => !capP || p.id !== capP.id).map(videoName);
+  let listNames = players.filter((p) => !capP || p.id !== capP.id).map(videoName);
+  if (!listNames.length) listNames = players.map(videoName);
   const caption = `🏆 *Congratulations Team ${label}!*`;
   try {
-    const buf = await queueVideo(() => renderWinVideo(capName, names));
+    const buf = await queueVideo(() => renderWinVideo(capName || listNames[0] || '', listNames));
     await sendVideoBuf(telegram, groupId, buf, caption);
   } catch (e) {
     console.error('win video failed, sending the plain video:', e.message);
-    const lines = (capName ? `👑 *${mdEsc(capName)}*\n` : '') + names.map((n, i) => `${i + 1}. ${mdEsc(n)}`).join('\n');
-    await sendVideoFile(telegram, groupId, WIN_VIDEO, `${caption}\n${lines}`.slice(0, 1000)).catch((e2) => console.error('plain win video failed:', e2.message));
+    const lines =
+      (capName ? `👑 *${mdEsc(capName)}*\n` : '') +
+      listNames.map((n, i) => `${i + 1}. ${mdEsc(n)}`).join('\n');
+    await sendVideoFile(telegram, groupId, WIN_VIDEO, `${caption}\n${lines}`.slice(0, 1000)).catch((e2) =>
+      console.error('plain win video failed:', e2.message)
+    );
   }
 }
 
