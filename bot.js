@@ -36,7 +36,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r41-2026-10-28'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r43-2026-10-29'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -3003,9 +3003,8 @@ async function createTeamMatch(ctx) {
     // Idle host-warnings start only after /startgame (captains/toss), not during join timers
     await q(`UPDATE matches SET spam_free=$2 WHERE id=$1`, [m.id, true]); // team: spam-free by default
 
-    await sendHtmlMessage(
-      ctx.telegram,
-      ctx.chat.id,
+    await sendHostBanner(
+      ctx,
       `${pe('people','👥')} *${fancy('TEAM MATCH')}*\n` +
         `> ${pe('crown','👑')} Host: *${mn(ctx.from)}*\n` +
         `> ${pe('people','👤')} Players: *unlimited* per team\n` +
@@ -4747,7 +4746,7 @@ async function bowlerLocksNumber(ctx, n) {
 
   const html =
     `🔒 <b>${fancy('NUMBER LOCKED')}</b>\n` +
-    `<blockquote>${bowler ? htag(bowler) : 'Bowler'} has locked the number!\n` +
+    `<blockquote>${bowler ? `<b>${escapeHtml(name(bowler))}</b>` : 'Bowler'} has locked the number!\n` +
     `🏏 ${striker ? htag(striker) : 'Batsman'} takes the stance — send your number <b>${hat ? '1–6' : '0–6'}</b> in the group (${TURN_SECONDS}s)` +
     (hat ? `\n🎩 <b>HAT-TRICK BALL!</b> 0 is not allowed.` : '') +
     `</blockquote>`;
@@ -4947,6 +4946,7 @@ async function sendMatchDataFile(telegram, chatId, matchId) {
 async function finishSolo(telegram, groupId, m, inn) {
   await q(`UPDATE matches SET status='completed', winner_team='A', completed_at=NOW() WHERE id=$1`, [m.id]);
   const [bat, bowl, aw] = await Promise.all([bestBatter(m.id), bestBowler(m.id), matchAwards(m.id)]);
+  saveAwards(m.id, aw).catch((e) => console.error('saveAwards:', e.message));
   const players = await getPlayers(m.id, 'A');
   let vsLine = '';
   if (players.length === 2 && players.some((p) => isBotId(p.telegram_id))) {
@@ -4998,6 +4998,7 @@ async function finishTeam(telegram, groupId, m, inn2) {
   }
   caption += `\n`;
   const aw = await matchAwards(m.id, winner);
+  saveAwards(m.id, aw).catch((e) => console.error('saveAwards:', e.message));
   caption += `${awardsText(aw)}`;
   await sendTeamFinal(telegram, groupId, m, caption, { inns, winner, motm: aw.motm });
   await sendMotmGif(telegram, groupId, aw.motm);
@@ -6134,7 +6135,7 @@ async function botLockNumber(token) {
   const hat = await isHatTrickBall(inn);
   const html =
     `🔒 <b>${fancy('NUMBER LOCKED')}</b>\n` +
-    `<blockquote>${bowler ? htag(bowler) : 'Bowler'} has locked the number!\n` +
+    `<blockquote>${bowler ? `<b>${escapeHtml(name(bowler))}</b>` : 'Bowler'} has locked the number!\n` +
     `🏏 ${striker ? htag(striker) : 'Batsman'} takes the stance — send your number <b>${hat ? '1–6' : '0–6'}</b> in the group (${TURN_SECONDS}s)` +
     (hat ? `\n🎩 <b>HAT-TRICK BALL!</b> 0 is not allowed.` : '') +
     `</blockquote>`;
@@ -6450,6 +6451,7 @@ async function userCareer(tgId) {
   const { rows: bt } = await q(
     `SELECT COALESCE(SUM(bs.runs),0)::int AS runs, COALESCE(SUM(bs.balls_faced),0)::int AS balls,
             COALESCE(SUM(bs.fours),0)::int AS fours, COALESCE(SUM(bs.sixes),0)::int AS sixes,
+            COUNT(*) FILTER (WHERE bs.is_out)::int AS outs,
             COUNT(*) FILTER (WHERE bs.is_out AND COALESCE(bs.runs,0)=0)::int AS ducks,
             COUNT(*) FILTER (WHERE bs.runs>=50 AND bs.runs<100)::int AS fifties,
             COUNT(*) FILTER (WHERE bs.runs>=100)::int AS hundreds
@@ -6524,8 +6526,16 @@ async function userCareer(tgId) {
   const runs = Number(b.runs || 0);
   const wkts = Number(w.wkts || 0);
   const level = Math.min(99, 1 + Math.floor((runs + wkts * 25 + matches * 10) / 100));
+  const [res, part, awards] = await Promise.all([
+    userResults(id).catch(() => ({ w: 0, l: 0, d: 0, total: 0, streakType: '', streak: 0, bestStreak: 0, cap: { matches: 0, w: 0, l: 0 } })),
+    userPartnership(id).catch(() => ({ runs: 0, partner: null })),
+    userAwardCounts(id).catch(() => ({ orange: 0, purple: 0, motm: 0 })),
+  ]);
   return {
     level,
+    res,
+    part,
+    awards,
     hs: hsr[0] ? { runs: Number(hsr[0].runs || 0), balls: Number(hsr[0].balls_faced || 0) } : { runs: 0, balls: 0 },
     bestBowl: bbr[0] ? { wkts: Number(bbr[0].wickets || 0), runs: Number(bbr[0].runs_conceded || 0) } : { wkts: 0, runs: 0 },
     hosted: hostR[0]?.c || 0,
@@ -6533,6 +6543,7 @@ async function userCareer(tgId) {
       runs,
       balls: Number(b.balls || 0),
       matches,
+      outs: Number(b.outs || 0),
       ducks: Number(b.ducks || 0),
       fours: Number(b.fours || 0),
       sixes: Number(b.sixes || 0),
@@ -6588,7 +6599,199 @@ async function resolveInfoTarget(ctx) {
   return fromRow(ctx.from);
 }
 
-// caption under the profile card: "Stats Summary" design
+// ─── win / lose / streak / captaincy / best partnership / award counts ───
+async function userResults(id) {
+  const { rows: tm } = await q(
+    `SELECT m.id, mp.team_label,
+            (SELECT COALESCE(SUM(i.total_runs),0) FROM innings i WHERE i.match_id=m.id AND i.batting_team=mp.team_label)::int AS my_runs,
+            (SELECT COALESCE(SUM(i.total_runs),0) FROM innings i WHERE i.match_id=m.id AND i.batting_team<>mp.team_label)::int AS opp_runs,
+            EXISTS (SELECT 1 FROM match_teams t WHERE t.match_id=m.id AND t.team_label=mp.team_label AND t.captain_id=$1) AS cap
+       FROM match_players mp JOIN matches m ON m.id = mp.match_id
+      WHERE mp.telegram_id=$1 AND m.status='completed' AND m.mode<>'solo'`,
+    [id]
+  );
+  const { rows: so } = await q(
+    `SELECT m.id,
+            COALESCE((SELECT SUM(bs.runs) FROM batting_stats bs WHERE bs.player_id=mp.id),0)::int AS my_runs,
+            COALESCE((SELECT MAX(x.r) FROM (SELECT SUM(bs2.runs) AS r FROM batting_stats bs2
+                        JOIN match_players mp2 ON mp2.id = bs2.player_id
+                       WHERE mp2.match_id=m.id AND mp2.id<>mp.id GROUP BY mp2.id) x),0)::int AS best_other
+       FROM match_players mp JOIN matches m ON m.id = mp.match_id
+      WHERE mp.telegram_id=$1 AND m.status='completed' AND m.mode='solo'`,
+    [id]
+  );
+  const all = [];
+  for (const r of tm) all.push({ id: r.id, res: r.my_runs > r.opp_runs ? 'W' : r.my_runs < r.opp_runs ? 'L' : 'D', cap: !!r.cap });
+  for (const r of so) all.push({ id: r.id, res: r.my_runs > r.best_other ? 'W' : r.my_runs < r.best_other ? 'L' : 'D', cap: false });
+  all.sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0)); // newest first
+  const cnt = { W: 0, L: 0, D: 0 };
+  all.forEach((x) => cnt[x.res]++);
+  // current streak (from the newest match) and best win streak
+  let cur = 0;
+  let curType = '';
+  for (const x of all) {
+    if (!curType) {
+      if (x.res === 'D') break;
+      curType = x.res;
+    }
+    if (x.res === curType) cur++;
+    else break;
+  }
+  let best = 0;
+  let run = 0;
+  for (const x of [...all].reverse()) {
+    if (x.res === 'W') best = Math.max(best, ++run);
+    else run = 0;
+  }
+  const caps = all.filter((x) => x.cap);
+  return {
+    w: cnt.W, l: cnt.L, d: cnt.D, total: all.length,
+    streakType: curType, streak: cur, bestStreak: best,
+    cap: { matches: caps.length, w: caps.filter((x) => x.res === 'W').length, l: caps.filter((x) => x.res === 'L').length },
+  };
+}
+
+// best batting partnership: runs added between two wickets while the player was batting (team matches)
+async function userPartnership(id) {
+  const { rows: mine } = await q(`SELECT id FROM match_players WHERE telegram_id=$1`, [id]);
+  const myIds = new Set(mine.map((r) => r.id));
+  const { rows } = await q(
+    `SELECT d.innings_id, d.batsman_id, d.runs_scored, d.is_wicket
+       FROM deliveries d
+      WHERE d.innings_id IN (SELECT DISTINCT d2.innings_id FROM deliveries d2
+                               JOIN match_players mp ON mp.id = d2.batsman_id
+                               JOIN innings i ON i.id = d2.innings_id JOIN matches m ON m.id = i.match_id
+                              WHERE mp.telegram_id=$1 AND m.mode<>'solo' AND m.status='completed')
+      ORDER BY d.innings_id, d.over_number, d.ball_number`,
+    [id]
+  );
+  let best = { runs: 0, partner: null };
+  let cur = null;
+  let innId = null;
+  const close = () => {
+    if (cur && [...cur.set].some((x) => myIds.has(x)) && cur.runs > best.runs) {
+      const other = [...cur.set].filter((x) => !myIds.has(x));
+      best = { runs: cur.runs, partner: other.length === 1 ? other[0] : null };
+    }
+    cur = null;
+  };
+  for (const r of rows) {
+    if (r.innings_id !== innId) {
+      close();
+      innId = r.innings_id;
+    }
+    if (!cur) cur = { runs: 0, set: new Set() };
+    cur.runs += Number(r.runs_scored || 0);
+    cur.set.add(r.batsman_id);
+    const wk = r.is_wicket === true || r.is_wicket === 1 || r.is_wicket === 't';
+    if (wk) close();
+  }
+  close();
+  let partnerName = null;
+  if (best.partner) {
+    const { rows: pr } = await q(`SELECT first_name, last_name, username FROM match_players WHERE id=$1`, [best.partner]);
+    if (pr[0]) partnerName = [pr[0].first_name, pr[0].last_name].filter(Boolean).join(' ').trim() || pr[0].username || null;
+  }
+  return { runs: best.runs, partner: partnerName };
+}
+
+async function userAwardCounts(id) {
+  const { rows } = await q(`SELECT kind, COUNT(*)::int AS c FROM match_awards WHERE telegram_id=$1 AND kind<>'done' GROUP BY kind`, [id]);
+  const m = { orange: 0, purple: 0, motm: 0 };
+  rows.forEach((r) => (m[r.kind] = r.c));
+  return m;
+}
+
+// ─── Orange cap / Purple cap / MOTM are remembered per match (and filled in for old matches in the background) ───
+async function saveAwards(matchId, aw) {
+  const mid = String(matchId);
+  for (const [kind, p] of [['orange', aw.orange], ['purple', aw.purple], ['motm', aw.motm]]) {
+    if (!p || isBotId(p.telegram_id)) continue;
+    await q(`INSERT INTO match_awards (match_id, telegram_id, kind) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [mid, Number(p.telegram_id), kind]);
+  }
+  await q(`INSERT INTO match_awards (match_id, telegram_id, kind) VALUES ($1,0,'done') ON CONFLICT DO NOTHING`, [mid]);
+}
+async function backfillAwards() {
+  const { rows } = await q(
+    `SELECT m.id, m.mode FROM matches m
+      WHERE m.status='completed' AND m.id::text NOT IN (SELECT match_id FROM match_awards WHERE kind='done')
+      ORDER BY m.id DESC LIMIT 300`
+  );
+  if (rows.length) console.log(`awards backfill: ${rows.length} old matches`);
+  for (const m of rows) {
+    try {
+      let winner = null;
+      if (m.mode !== 'solo') {
+        const { rows: t } = await q(`SELECT batting_team, SUM(total_runs)::int AS r FROM innings WHERE match_id=$1 GROUP BY batting_team`, [m.id]);
+        const a = t.find((x) => x.batting_team === 'A')?.r || 0;
+        const b = t.find((x) => x.batting_team === 'B')?.r || 0;
+        winner = a === b ? 'tie' : a > b ? 'A' : 'B';
+      }
+      await saveAwards(m.id, await matchAwards(m.id, winner));
+    } catch (e) {
+      console.error('awards backfill failed for', m.id, e.message);
+    }
+    await sleep(600); // gentle: never compete with a running game
+  }
+}
+
+// ─── native table (Rich Message) for /userinfo ───
+function userRichHtml(t, shownName, c) {
+  const n = (v) => Number(v || 0).toLocaleString('en-US');
+  const b = c.bat;
+  const w = c.bowl;
+  const r = c.res;
+  const a = c.awards;
+  const played = r.w + r.l + r.d;
+  const rate = played > 0 ? ((r.w * 100) / played).toFixed(1) + '%' : '—';
+  const streak = r.streakType ? `${r.streakType}${r.streak}` : '—';
+  const capPlayed = r.cap.matches;
+  const capRate = capPlayed > 0 ? ((r.cap.w * 100) / capPlayed).toFixed(1) + '%' : '—';
+  const avg = b.outs > 0 ? (b.runs / b.outs).toFixed(2) : b.runs > 0 ? `${b.runs} (not out)` : '—';
+  const tbl = (rows) => richTable(['Stat', 'Value'], rows);
+  const who = isBotId(t.id) ? `<b>${hEsc(shownName)}</b>` : `<a href="tg://user?id=${t.id}">${hEsc(shownName)}</a>`;
+  const date = new Intl.DateTimeFormat('en-CA', { timeZone: process.env.CARD_TZ || 'Asia/Kolkata' }).format(new Date());
+
+  let h = `<p><b>🏏 STATS SUMMARY</b></p>`;
+  h += `<p>👤 ${who}  ·  🆔 <code>${t.id}</code>  ·  📅 ${date}</p>`;
+  h += tbl([
+    ['⭐ Level', c.level],
+    ['🏅 Matches Played', n(b.matches)],
+    ['🎮 Matches Hosted', n(c.hosted)],
+    ['✅ Win / Lose', `${r.w} W · ${r.l} L` + (r.d ? ` · ${r.d} D` : '')],
+    ['📊 Win Rate', rate],
+    ['🔥 Streak', `${streak}  (best win streak ${r.bestStreak})`],
+  ]);
+  h += `<details><summary>🏏 Batting</summary>` + tbl([
+    ['Runs (Balls)', `${n(b.runs)} (${n(b.balls)})`],
+    ['Highest Score', `${c.hs.runs} (${c.hs.balls} balls)`],
+    ['Average', avg],
+    ['Strike Rate', b.sr.toFixed(2)],
+    ['Fours / Sixes', `${n(b.fours)} / ${n(b.sixes)}`],
+    ['50s / 100s', `${b.fifties} / ${b.hundreds}`],
+    ['Ducks', b.ducks],
+    ['Best Partnership', c.part.runs > 0 ? `${c.part.runs} runs` + (c.part.partner ? ` with ${hEsc(c.part.partner)}` : '') : '—'],
+  ]) + `</details>`;
+  h += `<details><summary>🎳 Bowling</summary>` + tbl([
+    ['Wickets', n(w.wkts)],
+    ['Balls Bowled', n(w.balls)],
+    ['Economy', w.eco.toFixed(2)],
+    ['Best Bowling', `${c.bestBowl.wkts}/${c.bestBowl.runs}`],
+    ['3W / 5W', `${w.w3} / ${w.w5}`],
+    ['Hat-tricks', w.hattricks],
+  ]) + `</details>`;
+  h += `<details><summary>🏆 Awards & Captaincy</summary>` + tbl([
+    ['🟠 Orange Cap', a.orange],
+    ['🟣 Purple Cap', a.purple],
+    ['🏅 Man of the Match', a.motm],
+    ['👑 Captain (matches)', capPlayed],
+    ['👑 Captain Win / Lose', `${r.cap.w} W · ${r.cap.l} L`],
+    ['👑 Captain Win Rate', capRate],
+  ]) + `</details>`;
+  return h;
+}
+
+// caption under the profile card: "Stats Summary" design (text fallback)
 function userCaption(t, name, career) {
   const line = '─────⊱◈◈◈⊰─────';
   const b = career.bat;
@@ -6633,12 +6836,40 @@ bot.command(['userinfo', 'myinfo'], async (ctx) => {
     // no username -> the name is used as the username
     const handle = '@' + (t.username ? cleanName(t.username, '') : name.replace(/\s+/g, '')) ;
     const img = await renderUserCard({ dp, name, handle, level: career.level, bat: career.bat, bowl: career.bowl });
-    await ctx.telegram.sendPhoto(ctx.chat.id, { source: img }, {
-      caption: userCaption(t, name, career),
-      parse_mode: 'Markdown',
-      reply_to_message_id: ctx.message.message_id,
-      allow_sending_without_reply: true,
-    });
+    const shown = [t.first_name, t.last_name].filter(Boolean).join(' ').trim() || t.username || name;
+    let photoSent = false;
+    let tableOk = false;
+    if (RICH_TABLES) {
+      try {
+        await ctx.telegram.sendPhoto(ctx.chat.id, { source: img }, {
+          caption: `📊 *${mdEsc(shown)}*  ·  Level ${career.level}`,
+          parse_mode: 'Markdown',
+          reply_to_message_id: ctx.message.message_id,
+          allow_sending_without_reply: true,
+        });
+        photoSent = true;
+        await sendRich(ctx.telegram, ctx.chat.id, userRichHtml(t, shown, career));
+        tableOk = true;
+      } catch (e) {
+        if (!richWarned) {
+          richWarned = true;
+          console.error('rich userinfo failed, using the text version:', e.message);
+        }
+        if (photoSent) {
+          // the photo is already out - only the native table failed: send the text version under it
+          await ctx.telegram.sendMessage(ctx.chat.id, userCaption(t, name, career), { parse_mode: 'Markdown' }).catch(() => {});
+          tableOk = true;
+        }
+      }
+    }
+    if (!tableOk) {
+      await ctx.telegram.sendPhoto(ctx.chat.id, { source: img }, {
+        caption: userCaption(t, name, career),
+        parse_mode: 'Markdown',
+        reply_to_message_id: ctx.message.message_id,
+        allow_sending_without_reply: true,
+      });
+    }
   } catch (e) {
     await reportCardError('Userinfo card', e);
     await ctx.reply('❌ Could not build the profile card right now.');
@@ -6755,8 +6986,7 @@ bot.command('ping', async (ctx) => {
       ctx.chat.id,
       sent.message_id,
       undefined,
-      `🏓 Pong\n> 🗄 Database: ${db} ms per query` + (db > 80 ? ' (slow)' : ' (good)') + `\n> ✈️ Telegram: ${tg} ms\n> 🏷 ${BOT_VERSION}`,
-      { parse_mode: 'Markdown' }
+      `🏓 Pong\n🗄 Database: ${db} ms per query` + (db > 80 ? ' (slow)' : ' (good)') + `\n✈️ Telegram: ${tg} ms\n🏷 ${BOT_VERSION}`
     );
   } catch (e) {
     await ctx.reply('❌ ' + e.message);
@@ -6791,12 +7021,19 @@ async function main() {
     updated_by TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await q(`CREATE TABLE IF NOT EXISTS match_awards (
+    match_id TEXT NOT NULL,
+    telegram_id BIGINT NOT NULL,
+    kind TEXT NOT NULL,
+    PRIMARY KEY (match_id, telegram_id, kind)
+  )`);
   await relaxNegativeRunConstraints();
   try {
     const { rows } = await q(`SELECT id FROM matches WHERE vs_bot=TRUE AND status NOT IN ('completed','cancelled')`);
     rows.forEach((r) => botMatchIds.add(String(r.id)));
   } catch (_) {}
   console.log('DB OK');
+  setTimeout(() => backfillAwards().catch((e) => console.error('awards backfill:', e.message)), 30000);
   try {
     const ms = await dbLatency(5);
     console.log(`DB latency: ${ms} ms per query` + (ms > 80 ? '  <-- SLOW: put the database in the same region as the bot host' : ''));
