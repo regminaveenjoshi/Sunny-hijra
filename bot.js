@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r48c-2026-10-30-test'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r48d-2026-10-30-test'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -367,7 +367,7 @@ const MAX_SOLO_PLAYERS = 100; // effectively unlimited
 
 // ── Test mode ──
 const TEST_OVERS = 20; // each innings = 20 overs
-const TEST_MIN_PLAYERS = 8; // minimum total players to start a Test
+const TEST_MIN_PLAYERS = 8; // minimum players PER TEAM to start a Test
 const TEST_MAX_PER_TEAM = 11; // max players per team
 const TEST_POWERPLAY_OVERS = 5; // first 5 overs: only 0-1-2-3 allowed
 const TEST_BOUNDARY_LIMIT = 2; // after powerplay: max 4/6 per over; 3rd = catch out
@@ -3223,15 +3223,16 @@ async function endTeamJoinPhase(telegram, matchId, chatId) {
   let needCancel = false;
   let reason = '';
   if (m.mode === 'test') {
-    if (total < TEST_MIN_PLAYERS || a.length < 2 || b.length < 2) {
+    // Test: 8 per team
+    if (a.length < TEST_MIN_PLAYERS || b.length < TEST_MIN_PLAYERS) {
       needCancel = true;
       reason =
         `Not enough players to start a Test match.\n` +
-        `> Required: at least *${TEST_MIN_PLAYERS}* players total, and *2* per team.\n` +
-        `> Current: Team A *${a.length}* · Team B *${b.length}* (total *${total}*).`;
+        `> Required: at least *${TEST_MIN_PLAYERS}* players per team.\n` +
+        `> Current: Team A *${a.length}* · Team B *${b.length}*.`;
     }
   } else {
-    // team (and any other non-solo)
+    // Team: 2 per team
     if (a.length < MIN_TEAM_PLAYERS || b.length < MIN_TEAM_PLAYERS) {
       needCancel = true;
       reason =
@@ -3363,7 +3364,7 @@ async function createTestMatch(ctx) {
       ctx,
       `${pe('trophy','🏆')} *${fancy('TEST MATCH')}*\n` +
         `> ${pe('crown','👑')} Host: *${mn(ctx.from)}*\n` +
-        `> ${pe('people','👤')} Min *${TEST_MIN_PLAYERS}* players · Max *${TEST_MAX_PER_TEAM}* per team\n` +
+        `> ${pe('people','👤')} Min *${TEST_MIN_PLAYERS}* per team · Max *${TEST_MAX_PER_TEAM}* per team\n` +
         `> 📅 3-day or 6-day Test (chosen after toss)\n` +
         `> ⏳ Each day = *${TEST_OVERS}* overs per side\n` +
         `> ⚡ Powerplay: first ${TEST_POWERPLAY_OVERS} overs → only 0-1-2-3\n` +
@@ -4036,14 +4037,11 @@ async function startGame(ctx) {
     const a = await getPlayers(m.id, 'A');
     const b = await getPlayers(m.id, 'B');
     if (m.mode === 'test') {
-      const total = a.length + b.length;
-      if (total < TEST_MIN_PLAYERS)
+      if (a.length < TEST_MIN_PLAYERS || b.length < TEST_MIN_PLAYERS)
         return ctx.reply(
-          `❌ Test needs at least *${TEST_MIN_PLAYERS}* players total (now ${total}). Team A: ${a.length}, Team B: ${b.length}`,
+          `❌ Test needs at least *${TEST_MIN_PLAYERS}* players per team (Team A: ${a.length}, Team B: ${b.length})`,
           { parse_mode: 'Markdown' }
         );
-      if (a.length < 2 || b.length < 2)
-        return ctx.reply(`❌ Each team needs at least 2 players (Team A: ${a.length}, Team B: ${b.length})`);
     } else if (a.length < MIN_TEAM_PLAYERS || b.length < MIN_TEAM_PLAYERS) {
       return ctx.reply(
         `❌ Each team needs at least ${MIN_TEAM_PLAYERS} players (Team A: ${a.length}, Team B: ${b.length})`
