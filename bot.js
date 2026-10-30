@@ -36,7 +36,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r46-2026-10-29'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r47-2026-10-30'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -362,10 +362,10 @@ const TEAM_JOIN_WARN_LAST = 10; // send warning this many seconds before end
 const MAX_SOLO_PLAYERS = 100; // effectively unlimited
 
 // ── Discipline rules ──
-const TURN_SECONDS = 30; // batsman / bowler must respond within this time
+const TURN_SECONDS = 60; // batsman / bowler must respond within this time
 const TURN_WARN_SECONDS = 10; // English warning this many seconds before timeout
 const TURN_PENALTY = 6; // runs lost for every missed turn
-const SOLO_BOWLER_WARN_LIMIT = 3; // solo: bowling auto-changes after this many missed turns
+const SOLO_BOWLER_WARN_LIMIT = 2; // solo: the bowler is thrown out of the game after this many missed turns
 const TEAM_BOWLER_WARN_LIMIT = 2; // team: captain is tagged to choose the next bowler after this many
 const BAT_RETIRE_LIMIT = 2; // batsman is retired OUT after this many missed turns
 const IDLE_WARN_SECONDS = 60; // host warning interval while the lobby / setup does not progress
@@ -662,29 +662,29 @@ const MOTM_LAYOUT = {
 
 // team_final.jpg (853x1280) - team result card
 const TEAMFIN_LAYOUT = {
-  file: 'team_final.jpg',
-  top: { cy: 71, px: 24, date: { cx: 190, w: 200 }, time: { cx: 428, w: 190 }, gc: { cx: 664, w: 205 } },
-  bar: { A: { cx: 430, cy: 311 }, B: { cx: 427, cy: 841 }, w: 360, px: 27 },
-  rowDy: { A: 0, B: 532 },
-  clipAboveY: null, // DP circles are placed fully above the name bars (never cut)
+  file: 'team_final.jpg', // 1024x1536 template
+  top: { cy: 85, px: 29, date: { cx: 228, w: 240 }, time: { cx: 514, w: 228 }, gc: { cx: 797, w: 246 } },
+  bar: { A: { cx: 516, cy: 373 }, B: { cx: 513, cy: 1010 }, w: 432, px: 32 },
+  rowDy: { A: 0, B: 639 },
+  clipAboveY: 566, // the name bar overlaps the last few pixels of the DP circle - nothing is drawn over the bar
   bat: {
-    circle: { cx: 205, cy: 430, r: 44 },
-    name: { cx: 205, cy: 490, w: 172 },
-    xs: [62, 135, 206, 270, 345], // RUNS BALLS 6s 4s STRIKE RATE
-    ws: [56, 58, 50, 50, 74],
-    cy: 572,
+    circle: { cx: 246, cy: 520, r: 58 },
+    name: { cx: 246, cy: 588, w: 206 },
+    xs: [74, 162, 247, 324, 414], // RUNS BALLS 6s 4s STRIKE RATE
+    ws: [67, 70, 60, 60, 89],
+    cy: 687,
   },
   bowl: {
-    circle: { cx: 649, cy: 430, r: 44 },
-    name: { cx: 650, cy: 490, w: 172 },
-    xs: [532, 655, 772], // WICKETS BALLS ECONOMY
-    ws: [96, 96, 96],
-    cy: 572,
+    circle: { cx: 779, cy: 520, r: 58 },
+    name: { cx: 780, cy: 588, w: 206 },
+    xs: [639, 786, 927], // WICKETS BALLS ECONOMY
+    ws: [115, 115, 115],
+    cy: 687,
   },
-  motm: { circle: { cx: 425, cy: 719, r: 48 }, name: { cx: 426, cy: 788, w: 230 }, clipAboveY: null },
-  winner: { cx: 430, cy: 1237, w: 330, px: 34 },
-  namePx: 22,
-  valPx: 24,
+  motm: { circle: { cx: 510, cy: 863, r: 58 }, name: { cx: 511, cy: 946, w: 276 }, clipAboveY: null },
+  winner: { cx: 516, cy: 1485, w: 396, px: 41 },
+  namePx: 26,
+  valPx: 29,
 };
 
 // team_banner.jpg (1280x934) - TEAM A vs TEAM B (host + both captains)
@@ -4747,6 +4747,20 @@ async function soloIdleHit(m, inn) {
   return true;
 }
 
+// Solo: too few players left -> the match is closed
+async function endSoloTooFew(m, inn) {
+  const groupId = Number(m.group_chat_id);
+  clearTurnClock(m.id);
+  await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE innings_id=$1 AND is_resolved=FALSE`, [inn.id]);
+  await bot.telegram.sendMessage(groupId, `😴 *${fancy('MATCH ENDED')}*\n> Not enough players are left to play.`, { parse_mode: 'Markdown' });
+  const fresh = (await q(`SELECT * FROM innings WHERE id=$1`, [inn.id])).rows[0] || inn;
+  await finishSolo(bot.telegram, groupId, m, fresh);
+  clearTurnClock(m.id);
+  clearWarns(m.id);
+  stopIdleWatch(m.id);
+  endVote(m.id);
+}
+
 // Bowler locked his number but the batsman did not type 0-6 in time
 async function batTimeout({ m, inn, pend }) {
   touchMatch(m.id);
@@ -4792,6 +4806,8 @@ async function batTimeout({ m, inn, pend }) {
         `> Next batsman will come in automatically.`,
       { parse_mode: 'Markdown' }
     );
+    const left = await getPlayers(m.id, 'A');
+    if (left.length < 2) return endSoloTooFew(m, inn);
   } else {
     // Team: tag batting captain to send the next batsman
     const team = await getTeam(m.id, inn.batting_team);
@@ -4799,7 +4815,7 @@ async function batTimeout({ m, inn, pend }) {
     await tg.sendMessage(
       groupId,
       `👑 ${cap ? mtag(cap) : 'Captain'} — ${mtag(striker)} is *retired OUT* after ${BAT_RETIRE_LIMIT} timeouts.\n` +
-        `> Send the next batsman: */bat <no.>*`,
+        `> Send your *new batsman*: /bat <no.>`,
       { parse_mode: 'Markdown' }
     );
   }
@@ -4857,7 +4873,23 @@ async function bowlTimeout({ m, inn, pend }) {
   if (warn >= limit) {
     resetWarn(m.id, bowler.id, 'bowl');
     if (isSolo) {
-      const nb = await soloRotateBowler(m, inn);
+      // thrown out of the solo game
+      await q(`UPDATE innings SET current_bowler_id=NULL WHERE id=$1 AND current_bowler_id=$2`, [inn.id, bowler.id]);
+      await q(`UPDATE innings SET last_bowler_id=NULL WHERE id=$1 AND last_bowler_id=$2`, [inn.id, bowler.id]);
+      try {
+        await q(`DELETE FROM match_players WHERE id=$1`, [bowler.id]);
+      } catch (e) {
+        console.error('solo bowler removal failed:', e.message);
+      }
+      await tg.sendMessage(
+        groupId,
+        `🚪 ${mtag(bowler)} timed out *${limit}* times and is *removed from this solo match*.`,
+        { parse_mode: 'Markdown' }
+      );
+      const left = await getPlayers(m.id, 'A');
+      if (left.length < 2) return endSoloTooFew(m, inn);
+      const innNow = (await q(`SELECT * FROM innings WHERE id=$1`, [inn.id])).rows[0] || inn;
+      const nb = await soloRotateBowler(m, innNow);
       if (nb) {
         await tg.sendMessage(groupId, `🔄 *BOWLING CHANGE*\n${mtag(nb)} is the new bowler.`, {
           parse_mode: 'Markdown',
@@ -4873,7 +4905,7 @@ async function bowlTimeout({ m, inn, pend }) {
       await tg.sendMessage(
         groupId,
         `👑 ${cap ? mtag(cap) : 'Captain'} — ${mn(bowler)} has been warned ${limit} times.\n` +
-          `Choose your next bowler: /ball <no.>`,
+          `Send your *new bowler*: /ball <no.>`,
         { parse_mode: 'Markdown' }
       );
       return;
@@ -5527,6 +5559,17 @@ async function overSummary(matchId, inn) {
   }
 }
 
+// captain of a team as a tag (for "send your new batsman / bowler" prompts)
+async function capTagOf(m, label) {
+  try {
+    const t = await getTeam(m.id, label);
+    const p = t && t.captain_id ? await getPlayerByTg(m.id, t.captain_id) : null;
+    return p ? mtag(p) : `Team ${label} captain`;
+  } catch (_) {
+    return `Team ${label} captain`;
+  }
+}
+
 // ─── After every ball (or retire): innings end? next prompts, scoreboard, clocks ───
 //  solo : unlimited overs, ends when every player is out
 //  team : all out (last batter has no partner => players-1 wickets), overs finished or target chased
@@ -5603,13 +5646,14 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
     } else if (!isSolo && isWicket && !inn2.striker_player_id) {
       await telegram.sendMessage(
         groupId,
-        `👑 Team ${inn2.batting_team} captain: next batsman → /bat <no.>`
+        `👑 ${await capTagOf(m, inn2.batting_team)} — send your *new batsman*: /bat <no.>`,
+        { parse_mode: 'Markdown' }
       );
     } else if (!isSolo && inn2.balls_bowled > 0 && inn2.balls_bowled % 6 === 0) {
       const ovSum = await overSummary(m.id, inn2);
       await telegram.sendMessage(
         groupId,
-        `🔔 *Over complete!*\n${ovSum}\n👑 Team ${inn2.bowling_team}: /ball <no.>`,
+        `🔔 *Over complete!*\n${ovSum}\n👑 ${await capTagOf(m, inn2.bowling_team)} — send your *new bowler*: /ball <no.>`,
         { parse_mode: 'Markdown' }
       );
     }
@@ -7588,10 +7632,17 @@ let ffmpegCache;
 function ffmpegBin() {
   if (ffmpegCache !== undefined) return ffmpegCache;
   const cands = [process.env.FFMPEG_PATH];
-  try {
-    cands.push(require('ffmpeg-static'));
-  } catch (_) {}
-  cands.push('ffmpeg');
+  for (const mod of ['ffmpeg-static', '@ffmpeg-installer/ffmpeg']) {
+    try {
+      const r = require(mod);
+      cands.push(typeof r === 'string' ? r : r && r.path);
+    } catch (_) {}
+    try {
+      const r = require(path.join(__dirname, 'node_modules', mod));
+      cands.push(typeof r === 'string' ? r : r && r.path);
+    } catch (_) {}
+  }
+  cands.push('ffmpeg', '/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/opt/render/project/.render/ffmpeg/ffmpeg');
   for (const c of cands.filter(Boolean)) {
     try {
       const r = spawnSync(c, ['-version'], { timeout: 8000 });
@@ -7600,26 +7651,105 @@ function ffmpegBin() {
   }
   return (ffmpegCache = null);
 }
-function runFfmpeg(args, timeoutMs = 300000) {
-  return new Promise((resolve, reject) => {
-    const bin = ffmpegBin();
-    if (!bin) return reject(new Error('ffmpeg not found'));
-    const pr = spawn(bin, ['-y', '-loglevel', 'error', '-threads', '2', ...args]);
-    let err = '';
-    const timer = setTimeout(() => {
-      pr.kill('SIGKILL');
-      reject(new Error('ffmpeg timeout'));
-    }, timeoutMs);
-    pr.stderr.on('data', (d) => (err += d));
-    pr.on('error', (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
-    pr.on('close', (code) => {
-      clearTimeout(timer);
-      code === 0 ? resolve() : reject(new Error('ffmpeg failed: ' + err.slice(-300)));
-    });
+// No ffmpeg on the host? Install the bundled one once (npm i ffmpeg-static) - the bot does it by itself.
+let ffmpegInstalling = null;
+function ensureFfmpeg() {
+  if (ffmpegBin()) return Promise.resolve(true);
+  if (ffmpegInstalling) return ffmpegInstalling;
+  ffmpegInstalling = new Promise((resolve) => {
+    console.log('ffmpeg not found - installing ffmpeg-static (one time, can take a minute)...');
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      ffmpegInstalling = null;
+      resolve(ok);
+    };
+    try {
+      const pr = spawn(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', 'ffmpeg-static', '--no-save', '--no-audit', '--no-fund', '--loglevel', 'error'], { cwd: __dirname });
+      let err = '';
+      const timer = setTimeout(() => {
+        try {
+          pr.kill('SIGKILL');
+        } catch (_) {}
+      }, 6 * 60 * 1000);
+      pr.stderr.on('data', (d) => (err += d));
+      pr.on('error', (e) => {
+        clearTimeout(timer);
+        console.error('npm could not start:', e.message);
+        finish(false);
+      });
+      pr.on('close', (code) => {
+        clearTimeout(timer);
+        if (code !== 0) {
+          console.error('ffmpeg-static install failed:', err.slice(-300));
+          return finish(false);
+        }
+        try {
+          Object.keys(require.cache).forEach((k) => /ffmpeg-static/.test(k) && delete require.cache[k]);
+        } catch (_) {}
+        ffmpegCache = undefined;
+        const ok = !!ffmpegBin();
+        console.log(ok ? 'ffmpeg ready' : 'ffmpeg-static installed but the binary does not run here');
+        finish(ok);
+      });
+    } catch (e) {
+      console.error('ffmpeg install error:', e.message);
+      finish(false);
+    }
   });
+  return ffmpegInstalling;
+}
+async function runFfmpeg(args, timeoutMs = 300000) {
+  let bin = ffmpegBin();
+  if (!bin) {
+    await ensureFfmpeg();
+    bin = ffmpegBin();
+  }
+  if (!bin) throw new Error('ffmpeg not found on this host (the bot tried `npm i ffmpeg-static` - see the logs)');
+  const once = (a) =>
+    new Promise((resolve, reject) => {
+      const pr = spawn(bin, ['-y', '-loglevel', 'error', '-threads', '2', ...a]);
+      let err = '';
+      const timer = setTimeout(() => {
+        pr.kill('SIGKILL');
+        reject(new Error('ffmpeg timeout'));
+      }, timeoutMs);
+      pr.stderr.on('data', (d) => (err += d));
+      pr.on('error', (e) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+      pr.on('close', (code) => {
+        clearTimeout(timer);
+        code === 0 ? resolve() : reject(new Error('ffmpeg failed: ' + err.slice(-400)));
+      });
+    });
+  try {
+    return await once(args);
+  } catch (e) {
+    if (!/Unknown encoder|libx264|Encoder/i.test(String(e.message))) throw e;
+    // this ffmpeg has no libx264: use the built-in mpeg4 encoder instead
+    const a2 = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '-c:v' && args[i + 1] === 'libx264') {
+        a2.push('-c:v', 'mpeg4', '-q:v', '5');
+        i++;
+      } else if (args[i] === '-preset' || args[i] === '-crf') i++;
+      else a2.push(args[i]);
+    }
+    return once(a2);
+  }
+}
+// tell the bot owner (once) why a video could not be rendered
+const ownerNotified = new Set();
+async function notifyOwnerOnce(key, text) {
+  try {
+    if (ownerNotified.has(key)) return;
+    ownerNotified.add(key);
+    const id = Number(process.env.BOT_OWNER_ID);
+    if (id) await bot.telegram.sendMessage(id, `⚠️ ${text}`.slice(0, 3800));
+  } catch (_) {}
 }
 // one video render at a time (they are CPU heavy) - the game itself never waits for them
 let videoChain = Promise.resolve();
@@ -7705,6 +7835,7 @@ async function sendWinVideo(telegram, groupId, m, label) {
     await sendVideoBuf(telegram, groupId, buf, caption);
   } catch (e) {
     console.error('win video failed, sending the plain video:', e.message);
+    notifyOwnerOnce('win', `Winning-team video: names could not be put on the video.\n${e.message}`);
     const lines =
       (capName ? `👑 *${mdEsc(capName)}*\n` : '') +
       listNames.map((n, i) => `${i + 1}. ${mdEsc(n)}`).join('\n');
@@ -7725,6 +7856,7 @@ async function sendFiftyVideo(telegram, groupId, p, runs, balls) {
     await sendVideoBuf(telegram, groupId, buf, caption);
   } catch (e) {
     console.error('fifty video failed, sending the plain video:', e.message);
+    notifyOwnerOnce('fifty', `Fifty video: names could not be put on the video.\n${e.message}`);
     await sendVideoFile(telegram, groupId, FIFTY_VIDEO, caption).catch((e2) => console.error('plain fifty video failed:', e2.message));
   }
 }
@@ -7774,6 +7906,7 @@ async function main() {
     rows.forEach((r) => botMatchIds.add(String(r.id)));
   } catch (_) {}
   console.log('DB OK');
+  if (MATCH_VIDEOS) ensureFfmpeg().catch(() => {});
   setTimeout(() => backfillAwards().catch((e) => console.error('awards backfill:', e.message)), 30000);
   try {
     const ms = await dbLatency(5);
