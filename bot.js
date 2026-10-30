@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r48b-2026-10-30-test'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r48c-2026-10-30-test'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -2874,10 +2874,15 @@ async function beginSoloFromLobby(matchId, chatId, telegram) {
   if (players.length < 2) {
     await telegram.sendMessage(
       chatId,
-      `❌ *Lobby closed* — can't play solo with one player.`,
+      `⚠️ *JOIN TIME OVER — MATCH CANCELLED*\n` +
+        `${line()}\n` +
+        `Not enough players to start a Solo match.\n` +
+        `> Required: at least *2* players.\n` +
+        `> Current: *${players.length}* player${players.length === 1 ? '' : 's'}.\n\n` +
+        `The lobby has been closed. Start a new one with /solo.`,
       { parse_mode: 'Markdown' }
     );
-    await q(`UPDATE matches SET status='cancelled' WHERE id=$1`, [matchId]);
+    await cancelMatchNow(m, telegram);
     return;
   }
 
@@ -3212,6 +3217,43 @@ async function endTeamJoinPhase(telegram, matchId, chatId) {
 
   const a = await getPlayers(matchId, 'A');
   const b = await getPlayers(matchId, 'B');
+  const total = a.length + b.length;
+
+  // ── Auto-cancel if minimum players not met (Team + Test) ──
+  let needCancel = false;
+  let reason = '';
+  if (m.mode === 'test') {
+    if (total < TEST_MIN_PLAYERS || a.length < 2 || b.length < 2) {
+      needCancel = true;
+      reason =
+        `Not enough players to start a Test match.\n` +
+        `> Required: at least *${TEST_MIN_PLAYERS}* players total, and *2* per team.\n` +
+        `> Current: Team A *${a.length}* · Team B *${b.length}* (total *${total}*).`;
+    }
+  } else {
+    // team (and any other non-solo)
+    if (a.length < MIN_TEAM_PLAYERS || b.length < MIN_TEAM_PLAYERS) {
+      needCancel = true;
+      reason =
+        `Not enough players to start the match.\n` +
+        `> Required: at least *${MIN_TEAM_PLAYERS}* players per team.\n` +
+        `> Current: Team A *${a.length}* · Team B *${b.length}*.`;
+    }
+  }
+
+  if (needCancel) {
+    await telegram.sendMessage(
+      chatId,
+      `⚠️ *JOIN TIME OVER — MATCH CANCELLED*\n` +
+        `${line()}\n` +
+        `${reason}\n\n` +
+        `The lobby has been closed. Start a new one with /team or /test.`,
+      { parse_mode: 'Markdown' }
+    );
+    await cancelMatchNow(m, telegram);
+    return;
+  }
+
   let list =
     `📋 *TEAM LIST*\n` +
     `🅰 *Team A* (${a.length})\n` +
@@ -3223,19 +3265,15 @@ async function endTeamJoinPhase(telegram, matchId, chatId) {
 
   await sendPlayersListPhoto(telegram, chatId, list);
 
-  // Always tag the host to start the game
   const hostId = Number(m.host_telegram_id);
   const hostTag = `[Host](tg://user?id=${hostId})`;
-  let hostMsg =
+  await telegram.sendMessage(
+    chatId,
     `👑 ${hostTag}\n` +
-    `⏱ Both join timers are over.\n` +
-    `> Send */startgame* now to choose captains and start the toss.`;
-  if (a.length < MIN_TEAM_PLAYERS || b.length < MIN_TEAM_PLAYERS) {
-    hostMsg +=
-      `\n\n⚠️ Need at least *${MIN_TEAM_PLAYERS}* per team ` +
-      `(A: ${a.length}, B: ${b.length}). Add players first.`;
-  }
-  await telegram.sendMessage(chatId, hostMsg, { parse_mode: 'Markdown' });
+      `⏱ Both join timers are over.\n` +
+      `> Send */startgame* now to choose captains and start the toss.`,
+    { parse_mode: 'Markdown' }
+  );
 }
 
 async function createTeamMatch(ctx) {
