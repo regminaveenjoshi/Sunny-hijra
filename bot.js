@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r48-2026-10-30-test'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r48b-2026-10-30-test'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -8285,6 +8285,16 @@ async function main() {
   await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ');
   await q('ALTER TABLE match_players ADD COLUMN IF NOT EXISTS last_name TEXT');
   await q('ALTER TABLE match_players ADD COLUMN IF NOT EXISTS test_lifeline INTEGER DEFAULT 1');
+  // Allow mode = 'test' (old check only had solo/team)
+  try {
+    await q(`ALTER TABLE matches DROP CONSTRAINT IF EXISTS matches_mode_check`);
+    await q(
+      `ALTER TABLE matches ADD CONSTRAINT matches_mode_check CHECK (mode IN ('solo','team','test'))`
+    );
+    console.log('matches_mode_check updated to include test');
+  } catch (e) {
+    console.error('matches_mode_check:', e.message);
+  }
   await q(`CREATE TABLE IF NOT EXISTS pgif_settings (
     result_key TEXT PRIMARY KEY,
     file_id TEXT NOT NULL,
