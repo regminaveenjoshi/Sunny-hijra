@@ -6,6 +6,10 @@
  * TEAM : /team (or /startteam) -> /join_a /join_b -> /startgame
  *        -> captain buttons -> toss -> bat/bowl choice -> host /setovers (1-20)
  *        -> /bat /bowl (captains) -> type 0-6
+ * TEST : /test (or /starttest) -> /team_a /team_b -> /startgame
+ *        -> captains -> toss -> host picks 3-day or 6-day Test
+ *        -> each day = 20 overs each side (2 innings), powerplay rules
+ *        -> series winner = more day wins · pause/resume with votes
  *
  * Cards need the ./assets folder next to this file and the `sharp` package:
  *   host.jpg (solo host) · solo_final.jpg (Man of the Match) · team_final.jpg · team_banner.jpg · players_list.jpg
@@ -36,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r47-2026-10-30'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r48-2026-10-30-test'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -361,6 +365,15 @@ const TEAM_JOIN_SECONDS = 45; // team lobby join window
 const TEAM_JOIN_WARN_LAST = 10; // send warning this many seconds before end
 const MAX_SOLO_PLAYERS = 100; // effectively unlimited
 
+// ── Test mode ──
+const TEST_OVERS = 20; // each innings = 20 overs
+const TEST_MIN_PLAYERS = 8; // minimum total players to start a Test
+const TEST_MAX_PER_TEAM = 11; // max players per team
+const TEST_POWERPLAY_OVERS = 5; // first 5 overs: only 0-1-2-3 allowed
+const TEST_BOUNDARY_LIMIT = 2; // after powerplay: max 4/6 per over; 3rd = catch out
+const TEST_PAUSE_MAX_MS = 48 * 60 * 60 * 1000; // pause can last up to 48 hours
+const TEST_PAUSE_VOTES = 2; // 2 votes from each team to pause / resume
+
 // ── Discipline rules ──
 const TURN_SECONDS = 60; // batsman / bowler must respond within this time
 const TURN_WARN_SECONDS = 10; // English warning this many seconds before timeout
@@ -571,8 +584,13 @@ function btn(text, data, peKey, style) {
 const mainKb = () =>
   Markup.inlineKeyboard([
     [btn('𝗦𝗢𝗟𝗢', 'm:solo', 'game', 'success'), btn('𝗧𝗘𝗔𝗠', 'm:team', 'people', 'primary')],
-    [btn('𝗣𝗥𝗢𝗙𝗜𝗟𝗘', 'm:profile', 'star', 'primary'), btn('𝗕𝗢𝗔𝗥𝗗', 'm:lb', 'trophy', 'success')],
-    [btn('𝗛𝗘𝗟𝗣', 'm:help', 'bulb')],
+    [btn('𝗧𝗘𝗦𝗧', 'm:test', 'trophy', 'danger'), btn('𝗣𝗥𝗢𝗙𝗜𝗟𝗘', 'm:profile', 'star', 'primary')],
+    [btn('𝗕𝗢𝗔𝗥𝗗', 'm:lb', 'trophy', 'success'), btn('𝗛𝗘𝗟𝗣', 'm:help', 'bulb')],
+  ]);
+
+const testDaysKb = (id) =>
+  Markup.inlineKeyboard([
+    [btn('3-𝗗𝗔𝗬 𝗧𝗘𝗦𝗧', `tdays:${id}:3`, 'clock', 'primary'), btn('6-𝗗𝗔𝗬 𝗧𝗘𝗦𝗧', `tdays:${id}:6`, 'clock', 'danger')],
   ]);
 
 const tossKb = (id) =>
@@ -2506,10 +2524,15 @@ bot.action('m:team', async (ctx) => {
   if (!isGroup(ctx)) return ctx.reply('Open this menu in a group — pressing TEAM there creates a team lobby right away.');
   return createTeamMatch(ctx);
 });
+bot.action('m:test', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isGroup(ctx)) return ctx.reply('Open this menu in a group — pressing TEST there creates a Test lobby right away.');
+  return createTestMatch(ctx);
+});
 bot.action('m:help', async (ctx) => {
   await ctx.answerCbQuery();
   await ctx.reply(
-    'Solo: /startsolo → join → start → type 0-6\nTeam: /team → join → /startgame → captains → toss → /setovers'
+    'Solo: /startsolo → join → start → type 0-6\nTeam: /team → join → /startgame → captains → toss → /setovers\nTest: /test → join → /startgame → captains → toss → 3/6 day → play'
   );
 });
 bot.action('m:profile', async (ctx) => {
@@ -3115,7 +3138,7 @@ async function startTeamJoinPhase(telegram, matchId, chatId) {
 async function runTeamJoinWindow(telegram, matchId, chatId, label) {
   clearTeamJoinTimer(matchId);
   const m0 = await getMatch(matchId);
-  if (!m0 || m0.status !== 'waiting' || m0.mode === 'solo') return;
+  if (!m0 || m0.status !== 'waiting' || m0.mode === 'solo') return; // team + test both OK
 
   const cmd = label === 'A' ? '/team\\_a' : '/team\\_b';
   const warnAt = Math.max(0, (TEAM_JOIN_SECONDS - TEAM_JOIN_WARN_LAST) * 1000);
@@ -3274,16 +3297,68 @@ async function createTeamMatch(ctx) {
 
 bot.command('startteam', createTeamMatch);
 
+// ─── TEST mode (multi-day, 20 overs, powerplay) ───────────────────────────────
+async function createTestMatch(ctx) {
+  if (!isGroup(ctx)) return ctx.reply('❌ Use this command in a group');
+  try {
+    if (await getActiveMatch(ctx.chat.id))
+      return ctx.reply(`⚠️ *Only one game per group.*\nA match is already running here.\nHost: /endmatch to cancel it first.`, {
+        parse_mode: 'Markdown',
+      });
+
+    const { rows } = await q(
+      `INSERT INTO matches (group_chat_id, group_title, mode, host_telegram_id, team_size, total_overs, max_overs_per_bowler, status)
+       VALUES ($1,$2,'test',$3,$4,$5,$6,'waiting') RETURNING *`,
+      [ctx.chat.id, ctx.chat.title || null, ctx.from.id, TEST_MAX_PER_TEAM, TEST_OVERS, MAX_BOWLER_OVERS]
+    );
+    const m = rows[0];
+    for (const L of ['A', 'B']) {
+      await q(`INSERT INTO match_teams (match_id, team_label) VALUES ($1,$2)`, [m.id, L]);
+    }
+    await upsertUser(ctx.from);
+    await q(
+      `UPDATE matches SET spam_free=TRUE, test_days=NULL, current_day=0, day_wins_a=0, day_wins_b=0, pause_key=NULL, paused_at=NULL WHERE id=$1`,
+      [m.id]
+    );
+
+    await sendHostBanner(
+      ctx,
+      `${pe('trophy','🏆')} *${fancy('TEST MATCH')}*\n` +
+        `> ${pe('crown','👑')} Host: *${mn(ctx.from)}*\n` +
+        `> ${pe('people','👤')} Min *${TEST_MIN_PLAYERS}* players · Max *${TEST_MAX_PER_TEAM}* per team\n` +
+        `> 📅 3-day or 6-day Test (chosen after toss)\n` +
+        `> ⏳ Each day = *${TEST_OVERS}* overs per side\n` +
+        `> ⚡ Powerplay: first ${TEST_POWERPLAY_OVERS} overs → only 0-1-2-3\n` +
+        `> After powerplay: max *${TEST_BOUNDARY_LIMIT}* fours/sixes per over (3rd = catch out)\n\n` +
+        `${pe('mega','📌')} *Join*\n` +
+        `> /team\\_a — Team A\n` +
+        `> /team\\_b — Team B\n\n` +
+        `${pe('zap','⚡')} *Host*\n` +
+        `> /startgame — captains → toss → pick days → play\n` +
+        `> /members — see the teams\n` +
+        `> /endmatch — cancel\n` +
+        `> /pause · /resume (2 votes each team)`
+    );
+    await startTeamJoinPhase(ctx.telegram, m.id, ctx.chat.id);
+    touchMatch(m.id);
+  } catch (e) {
+    console.error(e);
+    await ctx.reply('❌ ' + e.message);
+  }
+}
+bot.command(['test', 'starttest'], createTestMatch);
+
 async function joinTeam(ctx, label) {
   if (!isGroup(ctx)) return;
   try {
     const m = await getActiveMatch(ctx.chat.id);
     if (!m || m.status !== 'waiting' || m.mode === 'solo')
-      return ctx.reply('❌ There is no team lobby open. Use /team to create one.');
+      return ctx.reply('❌ There is no team/test lobby open. Use /team or /test to create one.');
     if (m.vs_bot && label === 'B') return ctx.reply('🤖 Team B is the bot team — join Team A with /team_a');
     if (await getPlayerByTg(m.id, ctx.from.id)) return ctx.reply('❌ You are already in a team');
     const team = await getPlayers(m.id, label);
-    if (team.length >= m.team_size) return ctx.reply(`❌ Team ${label} is full`);
+    const maxSize = m.mode === 'test' ? TEST_MAX_PER_TEAM : m.team_size;
+    if (team.length >= maxSize) return ctx.reply(`❌ Team ${label} is full (${maxSize})`);
 
     const { rows } = await q(
       `SELECT COALESCE(MAX(roster_position),0)+1 AS n FROM match_players WHERE match_id=$1 AND team_label=$2`,
@@ -3782,6 +3857,106 @@ bot.action(/^em:(Y|N):(.+)$/, async (ctx) => {
   }
 });
 
+// ─── Test pause / resume (2 votes from each team) ─────────
+const pauseVotes = new Map(); // matchId -> { A: Set, B: Set, phase: 'pause'|'resume', startedAt }
+function clearPauseVote(matchId) {
+  pauseVotes.delete(mkey(matchId));
+}
+
+bot.command('pause', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  try {
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m || m.mode !== 'test') return ctx.reply('❌ /pause is only for Test matches');
+    if (!['innings1', 'innings2'].includes(m.status)) return ctx.reply('⚠️ Match is not live');
+    if (m.paused_at) return ctx.reply('⏸ Test is already paused. Use /resume <host_id>');
+
+    const p = await getPlayerByTg(m.id, ctx.from.id);
+    if (!p) return ctx.reply('❌ Only players in this Test can vote');
+
+    let v = pauseVotes.get(mkey(m.id));
+    if (!v || v.phase !== 'pause') {
+      v = { A: new Set(), B: new Set(), phase: 'pause', startedAt: Date.now() };
+      pauseVotes.set(mkey(m.id), v);
+    }
+    v[p.team_label].add(Number(ctx.from.id));
+    const aN = v.A.size;
+    const bN = v.B.size;
+    await ctx.reply(
+      `⏸ *PAUSE VOTE*\n` +
+        `> Team A: *${aN}/${TEST_PAUSE_VOTES}* · Team B: *${bN}/${TEST_PAUSE_VOTES}*\n` +
+        `> Need *${TEST_PAUSE_VOTES}* from each team.\n` +
+        (aN >= TEST_PAUSE_VOTES && bN >= TEST_PAUSE_VOTES
+          ? `> ✅ Votes reached — pausing…`
+          : `> Type /pause again to add your vote.`),
+      { parse_mode: 'Markdown' }
+    );
+    if (aN >= TEST_PAUSE_VOTES && bN >= TEST_PAUSE_VOTES) {
+      const key = String(m.host_telegram_id);
+      await q(`UPDATE matches SET paused_at=NOW(), pause_key=$2 WHERE id=$1`, [m.id, key]);
+      clearTurnClock(m.id);
+      clearPauseVote(m.id);
+      await ctx.telegram.sendMessage(
+        ctx.chat.id,
+        `⏸ *TEST PAUSED*\n` +
+          `> Key (host id): \`${key}\`\n` +
+          `> Max pause: *48 hours*\n` +
+          `> To resume: 2 votes each team + /resume ${key}`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+  } catch (e) {
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
+bot.command('resume', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  try {
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m || m.mode !== 'test') return ctx.reply('❌ /resume is only for Test matches');
+    if (!m.paused_at) return ctx.reply('▶️ Test is not paused');
+
+    const arg = String(ctx.message?.text || '').split(/\s+/)[1] || '';
+    const key = String(m.pause_key || m.host_telegram_id);
+    if (arg && arg !== key)
+      return ctx.reply(`❌ Wrong key. Use: /resume ${key}`);
+
+    const pausedMs = Date.now() - new Date(m.paused_at).getTime();
+    if (pausedMs > TEST_PAUSE_MAX_MS) {
+      await cancelMatchNow(m);
+      return ctx.reply('🛑 Pause expired (48h). Test auto-cancelled.');
+    }
+
+    const p = await getPlayerByTg(m.id, ctx.from.id);
+    if (!p) return ctx.reply('❌ Only players in this Test can vote');
+
+    let v = pauseVotes.get(mkey(m.id));
+    if (!v || v.phase !== 'resume') {
+      v = { A: new Set(), B: new Set(), phase: 'resume', startedAt: Date.now() };
+      pauseVotes.set(mkey(m.id), v);
+    }
+    v[p.team_label].add(Number(ctx.from.id));
+    const aN = v.A.size;
+    const bN = v.B.size;
+    await ctx.reply(
+      `▶️ *RESUME VOTE*\n` +
+        `> Team A: *${aN}/${TEST_PAUSE_VOTES}* · Team B: *${bN}/${TEST_PAUSE_VOTES}*\n` +
+        (aN >= TEST_PAUSE_VOTES && bN >= TEST_PAUSE_VOTES ? `> ✅ Resuming…` : `> Type /resume ${key} to add your vote.`),
+      { parse_mode: 'Markdown' }
+    );
+    if (aN >= TEST_PAUSE_VOTES && bN >= TEST_PAUSE_VOTES) {
+      await q(`UPDATE matches SET paused_at=NULL, pause_key=NULL WHERE id=$1`, [m.id]);
+      clearPauseVote(m.id);
+      touchMatch(m.id);
+      await ctx.telegram.sendMessage(ctx.chat.id, `▶️ *TEST RESUMED* — play continues.`, { parse_mode: 'Markdown' });
+      await ensureTurnClock(m.id);
+    }
+  } catch (e) {
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
 // ─── /startgame : captains → toss ────────────────────────
 async function captainPromptText(m) {
   const tA = await getTeam(m.id, 'A');
@@ -3822,10 +3997,20 @@ async function startGame(ctx) {
 
     const a = await getPlayers(m.id, 'A');
     const b = await getPlayers(m.id, 'B');
-    if (a.length < MIN_TEAM_PLAYERS || b.length < MIN_TEAM_PLAYERS)
+    if (m.mode === 'test') {
+      const total = a.length + b.length;
+      if (total < TEST_MIN_PLAYERS)
+        return ctx.reply(
+          `❌ Test needs at least *${TEST_MIN_PLAYERS}* players total (now ${total}). Team A: ${a.length}, Team B: ${b.length}`,
+          { parse_mode: 'Markdown' }
+        );
+      if (a.length < 2 || b.length < 2)
+        return ctx.reply(`❌ Each team needs at least 2 players (Team A: ${a.length}, Team B: ${b.length})`);
+    } else if (a.length < MIN_TEAM_PLAYERS || b.length < MIN_TEAM_PLAYERS) {
       return ctx.reply(
         `❌ Each team needs at least ${MIN_TEAM_PLAYERS} players (Team A: ${a.length}, Team B: ${b.length})`
       );
+    }
 
     clearTeamJoinTimer(m.id);
     const claim = await q(
@@ -4108,14 +4293,25 @@ bot.action(/^toss:(.+):(bat|bowl)$/, async (ctx) => {
         `> 🎳 Bowling first: Team *${bowlFirst}*`
     );
     await ctx.answerCbQuery();
-    // Host gets overs buttons automatically — no /setovers needed
     const groupId = Number(m.group_chat_id);
-    await ctx.telegram.sendMessage(
-      groupId,
-      `⏱ *HOST — SET OVERS*\n` +
-        `> [Host](tg://user?id=${Number(m.host_telegram_id)}), pick total overs (1–${MAX_OVERS}):`,
-      { parse_mode: 'Markdown', ...oversKb(m.id) }
-    );
+    if (m.mode === 'test') {
+      await ctx.telegram.sendMessage(
+        groupId,
+        `📅 *HOST — CHOOSE TEST LENGTH*\n` +
+          `> [Host](tg://user?id=${Number(m.host_telegram_id)}), pick days:\n` +
+          `> • *3-Day Test* — best of 3 days\n` +
+          `> • *6-Day Test* — best of 6 days\n` +
+          `> Each day = *${TEST_OVERS}* overs per side · Powerplay rules apply`,
+        { parse_mode: 'Markdown', ...testDaysKb(m.id) }
+      );
+    } else {
+      await ctx.telegram.sendMessage(
+        groupId,
+        `⏱ *HOST — SET OVERS*\n` +
+          `> [Host](tg://user?id=${Number(m.host_telegram_id)}), pick total overs (1–${MAX_OVERS}):`,
+        { parse_mode: 'Markdown', ...oversKb(m.id) }
+      );
+    }
   } catch (e) {
     console.error(e);
     await ctx.answerCbQuery(String(e.message).slice(0, 150), { show_alert: true }).catch(() => {});
@@ -4213,6 +4409,89 @@ bot.action(/^ov:(.+):(\d+)$/, async (ctx) => {
     );
     if (startMsg?.message_id) await pinMsg(ctx.telegram, groupId, mm.id, startMsg.message_id);
     await botTeamAssist(m.id);
+    await ensureTurnClock(m.id);
+  } catch (e) {
+    console.error(e);
+    await ctx.answerCbQuery(String(e.message).slice(0, 150), { show_alert: true }).catch(() => {});
+  }
+});
+
+// ─── Test: host picks 3-day or 6-day ─────────────────────
+bot.action(/^tdays:(.+):(3|6)$/, async (ctx) => {
+  const matchId = ctx.match[1];
+  const days = Number(ctx.match[2]);
+  try {
+    const m = await getMatch(matchId);
+    if (!m || m.mode !== 'test' || m.status !== 'toss' || m.setup_phase !== 'overs')
+      return ctx.answerCbQuery('Days already set', { show_alert: true });
+    if (Number(m.host_telegram_id) !== ctx.from.id)
+      return ctx.answerCbQuery('Only the host can choose the days', { show_alert: true });
+
+    const a = await getPlayers(m.id, 'A');
+    const b = await getPlayers(m.id, 'B');
+    const minSize = Math.max(1, Math.min(a.length, b.length));
+    const perBowler = Math.min(TEST_OVERS, Math.max(MAX_BOWLER_OVERS, Math.ceil(TEST_OVERS / minSize)));
+
+    const upd = await q(
+      `UPDATE matches SET total_overs=$2, max_overs_per_bowler=$3, status='innings1',
+         current_innings=1, setup_phase='live', test_days=$4, current_day=1, day_wins_a=0, day_wins_b=0
+       WHERE id=$1 AND status='toss' AND setup_phase='overs' RETURNING *`,
+      [m.id, TEST_OVERS, perBowler, days]
+    );
+    if (!upd.rowCount) return ctx.answerCbQuery('Already set', { show_alert: true });
+    const mm = upd.rows[0];
+
+    await q(
+      `INSERT INTO innings (match_id, innings_number, batting_team, bowling_team, ball_state)
+       VALUES ($1,1,$2,$3,'idle')`,
+      [m.id, mm.current_batting_team, mm.current_bowling_team]
+    );
+
+    await ctx.answerCbQuery(`${days}-Day Test`);
+    try {
+      await ctx.editMessageText(
+        `✅ *${days}-Day Test* · ${TEST_OVERS} overs/side · Day *1/${days}*`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (_) {}
+
+    const groupId = Number(m.group_chat_id);
+    await sendMatchBanner(
+      ctx.telegram,
+      groupId,
+      mm,
+      `\n📅 Day *1/${days}* · max ${perBowler} per bowler\n⚡ Powerplay: first ${TEST_POWERPLAY_OVERS} overs → 0-1-2-3 only`
+    );
+    try {
+      const rosterMsg = await sendPlayersListPhoto(
+        ctx.telegram,
+        groupId,
+        `📊 *${fancy('TEST OVERVIEW')}*\n` +
+          `> ${pe('crown','👑')} Host: ${await hostLabel(mm)}\n` +
+          `> 📅 ${days}-Day Test · Day 1 · ${TEST_OVERS} overs\n` +
+          `> 🔄 *${statusLabel(mm)}*\n\n` +
+          (await rosterText(mm))
+      );
+      if (rosterMsg?.message_id) await pinMsg(ctx.telegram, groupId, mm.id, rosterMsg.message_id);
+    } catch (e) {
+      console.error('test start roster:', e.message);
+    }
+    const bowlTeam = await getTeam(m.id, mm.current_bowling_team);
+    const batTeam = await getTeam(m.id, mm.current_batting_team);
+    const bowlCap = bowlTeam?.captain_id ? await getPlayerByTg(m.id, bowlTeam.captain_id) : null;
+    const batCap = batTeam?.captain_id ? await getPlayerByTg(m.id, batTeam.captain_id) : null;
+    const startMsg = await sendCaptionedGif(
+      ctx.telegram,
+      groupId,
+      'starter',
+      `🏟 <b>${fancy('TEST DAY 1 STARTED')}</b>\n` +
+        `<blockquote>📅 ${days}-Day Test · ${TEST_OVERS} overs · Powerplay ${TEST_POWERPLAY_OVERS} ov</blockquote>\n` +
+        `🎳 <b>Team ${mm.current_bowling_team} is fielding</b>\n` +
+        `<blockquote>${bowlCap ? htag(bowlCap) : 'Captain'}, send your bowler → <code>/ball &lt;no.&gt;</code></blockquote>\n` +
+        `🏏 <b>Team ${mm.current_batting_team} is batting</b>\n` +
+        `<blockquote>${batCap ? htag(batCap) : 'Captain'}, send your openers → <code>/bat &lt;no.&gt;</code> (twice)</blockquote>`
+    );
+    if (startMsg?.message_id) await pinMsg(ctx.telegram, groupId, mm.id, startMsg.message_id);
     await ensureTurnClock(m.id);
   } catch (e) {
     console.error(e);
@@ -5141,6 +5420,10 @@ bot.hears(/^[0-6]$/, async (ctx) => {
 
     const m = await getActiveMatch(ctx.chat.id);
     if (!m || !['innings1', 'innings2'].includes(m.status)) return;
+    if (m.paused_at) {
+      await ctx.reply('⏸ Test is paused. Use /resume <host_id> (2 votes each team).').catch(() => {});
+      return;
+    }
     const inn = await getInnings(m.id);
     if (!inn || inn.ball_state !== 'waiting_bowl') return;
 
@@ -5159,6 +5442,58 @@ bot.hears(/^[0-6]$/, async (ctx) => {
         { parse_mode: 'HTML', reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true }
       );
       return;
+    }
+
+    // ── Test powerplay / boundary limit ──
+    if (m.mode === 'test') {
+      const oversDone = Math.floor((inn.balls_bowled || 0) / 6);
+      const ballInOver = (inn.balls_bowled || 0) % 6; // 0..5 before this ball
+      // Powerplay (first 5 overs): only 0-1-2-3
+      if (oversDone < TEST_POWERPLAY_OVERS && num >= 4) {
+        await ctx.telegram.sendMessage(
+          ctx.chat.id,
+          `⚡ *POWERPLAY* (overs 1–${TEST_POWERPLAY_OVERS})\n` +
+            `${htag(striker)} — only *0 / 1 / 2 / 3* allowed.\n4 / 5 / 6 are blocked in powerplay.`,
+          { parse_mode: 'HTML', reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true }
+        );
+        return;
+      }
+      // After powerplay: max 2 boundaries (4 or 6) per over → 3rd = catch out
+      if (oversDone >= TEST_POWERPLAY_OVERS && (num === 4 || num === 6)) {
+        const { rows: overDels } = await q(
+          `SELECT bat_number FROM deliveries WHERE innings_id=$1 AND over_number=$2`,
+          [inn.id, Math.floor((inn.balls_bowled || 0) / 6)]
+        );
+        const bounds = overDels.filter((d) => Number(d.bat_number) === 4 || Number(d.bat_number) === 6).length;
+        if (bounds >= TEST_BOUNDARY_LIMIT) {
+          // Force catch-out: treat as wicket regardless of bowler number
+          const claimOut = await q(
+            `UPDATE pending_balls SET is_resolved=TRUE WHERE callback_token=$1 AND is_resolved=FALSE AND bowl_number IS NOT NULL`,
+            [pend.callback_token]
+          );
+          if (!claimOut.rowCount) return;
+          // Override: resolve as out by matching bowl number artificially
+          const forcedPend = { ...pend, bowl_number: num };
+          try {
+            await ctx.telegram.sendMessage(
+              ctx.chat.id,
+              `✋ *CATCH OUT!* (Test rule)\n` +
+                `${htag(striker)} already hit *${TEST_BOUNDARY_LIMIT}* fours/sixes this over.\n` +
+                `Third boundary = catch out.`,
+              { parse_mode: 'HTML', reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true }
+            );
+            await resolveBall(ctx.telegram, m, inn, forcedPend, num, ctx.message.message_id);
+          } catch (e) {
+            try {
+              await q(`UPDATE pending_balls SET is_resolved=FALSE WHERE callback_token=$1 AND bowl_number IS NOT NULL`, [
+                pend.callback_token,
+              ]);
+            } catch (_) {}
+            throw e;
+          }
+          return;
+        }
+      }
     }
 
     const claim = await q(
@@ -5494,6 +5829,73 @@ async function finishTeam(telegram, groupId, m, inn2) {
     const margin = m.target - 1 - inn2.total_runs;
     resultLine = `🏆 *Team ${winner} WINS by ${margin} run${margin === 1 ? '' : 's'}!*`;
   }
+
+  // ── Test multi-day: record day win, start next day if remaining ──
+  if (m.mode === 'test' && m.test_days) {
+    let winsA = Number(m.day_wins_a || 0);
+    let winsB = Number(m.day_wins_b || 0);
+    if (winner === 'A') winsA++;
+    else if (winner === 'B') winsB++;
+    const day = Number(m.current_day || 1);
+    const totalDays = Number(m.test_days);
+
+    await q(
+      `UPDATE matches SET day_wins_a=$2, day_wins_b=$3 WHERE id=$1`,
+      [m.id, winsA, winsB]
+    );
+
+    const { rows: inns } = await q(`SELECT * FROM innings WHERE match_id=$1 ORDER BY innings_number`, [m.id]);
+    let dayCap =
+      `📅 *DAY ${day}/${totalDays} OVER*\n${resultLine}\n` +
+      `> Series: Team A *${winsA}* — *${winsB}* Team B\n`;
+    for (const i of inns) {
+      dayCap += `> Team ${i.batting_team}: *${i.total_runs}/${i.total_wickets}* (${oversStr(i.balls_bowled)} ov)\n`;
+    }
+    await telegram.sendMessage(groupId, dayCap, { parse_mode: 'Markdown' });
+
+    if (day < totalDays) {
+      // Start next day: clear innings/stats, keep players & captains, same toss order
+      await q(`DELETE FROM deliveries WHERE innings_id IN (SELECT id FROM innings WHERE match_id=$1)`, [m.id]);
+      await q(`DELETE FROM batting_stats WHERE innings_id IN (SELECT id FROM innings WHERE match_id=$1)`, [m.id]);
+      await q(`DELETE FROM bowling_stats WHERE innings_id IN (SELECT id FROM innings WHERE match_id=$1)`, [m.id]);
+      await q(`DELETE FROM innings WHERE match_id=$1`, [m.id]);
+      await q(`UPDATE match_players SET test_lifeline=1 WHERE match_id=$1`, [m.id]);
+
+      const nextDay = day + 1;
+      const batFirst = m.batting_first_team || 'A';
+      const bowlFirst = batFirst === 'A' ? 'B' : 'A';
+      await q(
+        `UPDATE matches SET status='innings1', current_innings=1, current_day=$2,
+           current_batting_team=$3, current_bowling_team=$4, target=NULL, setup_phase='live',
+           penalty_log=NULL WHERE id=$1`,
+        [m.id, nextDay, batFirst, bowlFirst]
+      );
+      await q(
+        `INSERT INTO innings (match_id, innings_number, batting_team, bowling_team, ball_state)
+         VALUES ($1,1,$2,$3,'idle')`,
+        [m.id, batFirst, bowlFirst]
+      );
+      await telegram.sendMessage(
+        groupId,
+        `📅 *DAY ${nextDay}/${totalDays} STARTED*\n` +
+          `> Series so far: A *${winsA}* — *${winsB}* B\n` +
+          `> 🏏 Batting: Team *${batFirst}* · 🎳 Bowling: Team *${bowlFirst}*\n` +
+          `> Captains: /bat & /ball as usual · Powerplay rules apply`,
+        { parse_mode: 'Markdown' }
+      );
+      await ensureTurnClock(m.id);
+      return;
+    }
+
+    // Series finished
+    let seriesWinner = winsA > winsB ? 'A' : winsB > winsA ? 'B' : 'tie';
+    resultLine =
+      seriesWinner === 'tie'
+        ? `🤝 *TEST SERIES TIED* (${winsA}–${winsB})`
+        : `🏆 *Team ${seriesWinner} WINS THE ${totalDays}-DAY TEST* (${winsA}–${winsB})`;
+    winner = seriesWinner;
+  }
+
   await q(`UPDATE matches SET status='completed', winner_team=$2, completed_at=NOW() WHERE id=$1`, [
     m.id,
     winner,
@@ -5501,17 +5903,19 @@ async function finishTeam(telegram, groupId, m, inn2) {
   await unpinMatchPins(telegram, groupId, m.id);
 
   const { rows: inns } = await q(`SELECT * FROM innings WHERE match_id=$1 ORDER BY innings_number`, [m.id]);
-  let caption = `🏁 *${fancy('MATCH OVER')}*\n${resultLine}\n`;
+  let caption = `🏁 *${fancy(m.mode === 'test' ? 'TEST SERIES OVER' : 'MATCH OVER')}*\n${resultLine}\n`;
   for (const i of inns) {
     caption += `> Team ${i.batting_team}: *${i.total_runs}/${i.total_wickets}* (${oversStr(i.balls_bowled)} ov)\n`;
+  }
+  if (m.mode === 'test') {
+    caption += `> Series: A *${m.day_wins_a || 0}* — *${m.day_wins_b || 0}* B\n`;
   }
   caption += `\n`;
   const aw = await matchAwards(m.id, winner);
   saveAwards(m.id, aw).catch((e) => console.error('saveAwards:', e.message));
   caption += `${awardsText(aw)}`;
   await sendTeamFinal(telegram, groupId, m, caption, { inns, winner, motm: aw.motm });
-  // after the result: winning team video (captain + players)
-  sendWinVideo(telegram, groupId, m, winner).catch((e) => console.error('win video:', e.message));
+  sendWinVideo(telegram, groupId, m, winner === 'tie' ? null : winner).catch((e) => console.error('win video:', e.message));
   await sendMotmGif(telegram, groupId, aw.motm);
   await sendLong(telegram, groupId, await fullScorecard(m.id));
   await sendMatchDataFile(telegram, groupId, m.id);
@@ -7873,7 +8277,14 @@ async function main() {
   await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS toss_caller TEXT');
   await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS solo_balls INTEGER');
   await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS vs_bot BOOLEAN');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS test_days INTEGER');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS current_day INTEGER');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS day_wins_a INTEGER');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS day_wins_b INTEGER');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS pause_key TEXT');
+  await q('ALTER TABLE matches ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ');
   await q('ALTER TABLE match_players ADD COLUMN IF NOT EXISTS last_name TEXT');
+  await q('ALTER TABLE match_players ADD COLUMN IF NOT EXISTS test_lifeline INTEGER DEFAULT 1');
   await q(`CREATE TABLE IF NOT EXISTS pgif_settings (
     result_key TEXT PRIMARY KEY,
     file_id TEXT NOT NULL,
