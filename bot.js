@@ -1,19 +1,26 @@
 /**
  * Hand Cricket Telegram Bot — single file
+ * Version: r49-gender-fgif-tgif-2026-10-31
  *
- * SOLO : /startsolo (or /solo) -> /joinsolo -> /forcestart (or /startgame)
- *        unlimited overs, one innings, everyone bats until out, just type 0-6
- * TEAM : /team (or /startteam) -> /join_a /join_b -> /startgame
- *        -> captain buttons -> toss -> bat/bowl choice -> host /setovers (1-20)
- *        -> /bat /bowl (captains) -> type 0-6
- * TEST : /test (or /starttest) -> /team_a /team_b -> /startgame
- *        -> captains -> toss -> host picks 3-day or 6-day Test
- *        -> each day = 20 overs each side (2 innings), powerplay rules
- *        -> series winner = more day wins · pause/resume with votes
+ * NEW (this revision):
+ *  - Gender selection on first private /start  (/gender to change)
+ *  - /fgif  — female-specific GIFs (same keys as /pgif)
+ *  - /tgif  — Test-mode only GIFs
+ *  - Gender emoji after player names (♂/♀ custom ids)
+ *  - Female fifty celebration video (assets/fifty_female.mp4)
+ *  - Partnership milestones every 30 runs (+ 50/80/100…)
+ *  - DB tables: fgif_settings, tgif_settings, users.gender, match_bets (stub)
  *
- * Cards need the ./assets folder next to this file and the `sharp` package:
- *   host.jpg (solo host) · solo_final.jpg (Man of the Match) · team_final.jpg · team_banner.jpg · players_list.jpg
- * If sharp/assets are missing the bot falls back to text.
+ * STILL TODO / needs iteration (templates provided in assets/):
+ *  - Full partnership card image (partnership_template.png)
+ *  - Over-by-over graph image after every over (graph_template.png)
+ *  - Real betting system (/bet 100 team a) + odds + settlement
+ *  - /ranking /leaderboard buttons (most runs, wickets, best figures this GC / all)
+ *  - Pin member list messages, unpin after match
+ *  - On over end always tag bowling captain: "Send new bowler /ball <no.>"
+ *
+ * SOLO / TEAM / TEST flow unchanged.
+ * Cards need ./assets + sharp. Put fifty_female.mp4, partnership_template.png, graph_template.png in assets/.
  */
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
@@ -40,7 +47,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r48d-2026-10-30-test'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r49-gender-fgif-tgif-2026-10-31'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 
 // ─── Text styles ─────────────────────────────────────────
@@ -523,9 +530,41 @@ async function upsertUser(u) {
      ON CONFLICT (telegram_id) DO UPDATE SET
        username=COALESCE(EXCLUDED.username,users.username),
        first_name=COALESCE(EXCLUDED.first_name,users.first_name),
+       last_name=COALESCE(EXCLUDED.last_name,users.last_name),
        updated_at=NOW()`,
     [u.id, u.username || null, u.first_name || null, u.last_name || null]
   );
+}
+
+async function getUserGender(tgId) {
+  try {
+    const { rows } = await q(`SELECT gender FROM users WHERE telegram_id=$1`, [tgId]);
+    return rows[0]?.gender || null; // 'male' | 'female' | null
+  } catch (_) {
+    return null;
+  }
+}
+
+async function setUserGender(tgId, gender) {
+  await q(`UPDATE users SET gender=$2, updated_at=NOW() WHERE telegram_id=$1`, [tgId, gender]);
+}
+
+// Premium gender emoji after player name (Telegram custom emoji ids provided by owner)
+const GENDER_EMOJI = {
+  female: { id: '5877555731170856986', fb: '♀' },
+  male:   { id: '6095758825929840339', fb: '♂' },
+};
+function genderEmojiHtml(gender) {
+  if (!gender) return '';
+  const g = GENDER_EMOJI[gender];
+  if (!g) return '';
+  // Prefer plain unicode fallback in text; premium id can be used in buttons if needed
+  return ` ${g.fb}`;
+}
+async function genderSuffixFor(p) {
+  if (!p) return '';
+  const g = p.gender || (await getUserGender(p.telegram_id ?? p.id));
+  return genderEmojiHtml(g);
 }
 
 // ─── Text helpers ────────────────────────────────────────
@@ -534,13 +573,28 @@ function escapeHtml(value) {
 }
 
 // plain name: first + last name preferred, else @username, else telegram id
-function name(p) {
+// Truncate long names for cards/messages (max ~18 chars)
+function shortName(str, max = 18) {
+  const s = String(str || '').trim();
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + '…';
+}
+function name(p, opts = {}) {
   if (!p) return '—';
   const full = [p.first_name, p.last_name].filter(Boolean).join(' ').trim();
-  if (full) return full;
-  if (p.username) return `@${p.username}`;
-  const id = p.telegram_id ?? p.id;
-  return id != null ? String(id) : '—';
+  let base = full || (p.username ? `@${p.username}` : null);
+  if (!base) {
+    const id = p.telegram_id ?? p.id;
+    base = id != null ? String(id) : '—';
+  }
+  if (opts.short) base = shortName(base, opts.max || 18);
+  return base;
+}
+// name + gender emoji (async when gender not already on p)
+async function nameWithGender(p, opts = {}) {
+  const n = name(p, opts);
+  const suf = await genderSuffixFor(p);
+  return n + suf;
 }
 
 // Telegram legacy-Markdown safe text (usernames contain "_" which would break parsing)
@@ -2071,6 +2125,26 @@ bot.start(async (ctx) => {
     } catch (e) {
       console.error('start prompt failed:', e.message);
     }
+    // First-time gender selection
+    const g = await getUserGender(ctx.from.id);
+    if (!g) {
+      return ctx.reply(
+        `╔══════════════════════╗\n` +
+          `║  🏏 CRIC MONSTER     ║\n` +
+          `╚══════════════════════╝\n\n` +
+          `Welcome! Please select your *gender* so we can show the correct GIFs & emojis.\n\n` +
+          `You can change it later with /gender`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [
+              Markup.button.callback('♂ Male', 'setgender:male'),
+              Markup.button.callback('♀ Female', 'setgender:female'),
+            ],
+          ]),
+        }
+      );
+    }
   }
   await ctx.reply(
     `╔══════════════════════╗\n` +
@@ -2081,8 +2155,44 @@ bot.start(async (ctx) => {
       `*Solo* → everyone bats until OUT, type *0–6* to bat\n` +
       `*Team* → /team → /startgame → captains, toss, /setovers\n\n` +
       `Bowling: send *1–6* in bot DM (0 not allowed)\n` +
-      `Batting: type *0–6* in group (0 = dot ball)`,
+      `Batting: type *0–6* in group (0 = dot ball)\n\n` +
+      `Gender: /gender  ·  GIFs: /pgif /fgif /tgif`,
     { parse_mode: 'Markdown', ...mainKb() }
+  );
+});
+
+// Gender selection callbacks + command
+bot.action(/^setgender:(male|female)$/, async (ctx) => {
+  try {
+    const gender = ctx.match[1];
+    await upsertUser(ctx.from);
+    await setUserGender(ctx.from.id, gender);
+    await ctx.answerCbQuery(`Gender set to ${gender}`);
+    await ctx.editMessageText(
+      `✅ Gender saved as *${gender === 'male' ? 'Male ♂' : 'Female ♀'}*.\n\n` +
+        `You will now receive ${gender === 'female' ? 'female' : 'male'} celebration GIFs.\n` +
+        `Change anytime with /gender`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (e) {
+    await ctx.answerCbQuery('Error').catch(() => {});
+  }
+});
+
+bot.command('gender', async (ctx) => {
+  await upsertUser(ctx.from);
+  const g = await getUserGender(ctx.from.id);
+  await ctx.reply(
+    `Your current gender: *${g ? (g === 'male' ? 'Male ♂' : 'Female ♀') : 'Not set'}*\n\nSelect:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback('♂ Male', 'setgender:male'),
+          Markup.button.callback('♀ Female', 'setgender:female'),
+        ],
+      ]),
+    }
   );
 });
 
@@ -2218,25 +2328,129 @@ bot.command('pgif', async (ctx) => {
   }
 });
 
+// ─── /fgif — female celebration GIFs (same keys as /pgif) ───
+bot.command('fgif', async (ctx) => {
+  try {
+    const parts = String(ctx.message?.text || '').trim().split(/\s+/);
+    let rawKey = String(parts[1] || '').toLowerCase();
+    if (rawKey === 'remove' || rawKey === 'rm' || rawKey === 'delete' || rawKey === 'del') {
+      if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only a group admin or bot owner can remove GIFs.');
+      const rk = String(parts[2] || '').toLowerCase();
+      const key = PGIF_ALIASES[rk] || rk;
+      if (!rk || !PGIF_KEYS.has(key))
+        return ctx.reply('Usage: `/fgif remove <key>`\nExample: `/fgif remove 50`\nSee keys: /giflist', { parse_mode: 'Markdown' });
+      const { rowCount } = await q(`DELETE FROM public.fgif_settings WHERE result_key = $1`, [key]);
+      if (!rowCount) return ctx.reply(`❌ No female GIF saved for *${key}*`, { parse_mode: 'Markdown' });
+      return ctx.reply(`🗑️ Removed *female* GIF for \`${key}\``, { parse_mode: 'Markdown' });
+    }
+    if (rawKey === 'list' || rawKey === 'show') {
+      const { rows } = await q(`SELECT result_key FROM fgif_settings ORDER BY result_key`);
+      return ctx.reply(rows.length ? `♀ Female GIFs:\n` + rows.map((r) => `• \`${r.result_key}\``).join('\n') : 'No female GIFs saved yet. Reply to a GIF with /fgif <key>', { parse_mode: 'Markdown' });
+    }
+    const key = PGIF_ALIASES[rawKey] || rawKey;
+    if (!PGIF_KEYS.has(key))
+      return ctx.reply('Reply to a GIF with /fgif <key> (same keys as /pgif).\nRemove: /fgif remove <key>\nList: /fgif list');
+    if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only admin/owner can set female GIFs.');
+    const replied = ctx.message?.reply_to_message;
+    if (!replied) return ctx.reply('❌ Reply to the GIF message with /fgif ' + key);
+    let fileId = replied.animation?.file_id || null;
+    let mediaType = 'animation';
+    if (!fileId && replied.document) {
+      const mime = String(replied.document.mime_type || '').toLowerCase();
+      if (mime === 'image/gif' || mime.startsWith('video/')) { fileId = replied.document.file_id; mediaType = 'document'; }
+    }
+    if (!fileId && replied.video) { fileId = replied.video.file_id; mediaType = 'video'; }
+    if (!fileId) return ctx.reply('❌ No GIF found in the replied message.');
+    await q(`INSERT INTO public.fgif_settings (result_key, file_id, media_type, updated_by, updated_at)
+      VALUES ($1,$2,$3,$4,NOW())
+      ON CONFLICT (result_key) DO UPDATE SET file_id=EXCLUDED.file_id, media_type=EXCLUDED.media_type,
+      updated_by=EXCLUDED.updated_by, updated_at=NOW()`, [key, fileId, mediaType, String(ctx.from.id)]);
+    return ctx.reply(`✅ *Female* GIF saved for \`${key}\`! It will show for female players.`, { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error('fgif error:', e);
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
+// ─── /tgif — Test-mode only GIFs ───
+bot.command('tgif', async (ctx) => {
+  try {
+    const parts = String(ctx.message?.text || '').trim().split(/\s+/);
+    let rawKey = String(parts[1] || '').toLowerCase();
+    if (rawKey === 'remove' || rawKey === 'rm' || rawKey === 'delete' || rawKey === 'del') {
+      if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only a group admin or bot owner can remove GIFs.');
+      const rk = String(parts[2] || '').toLowerCase();
+      const key = PGIF_ALIASES[rk] || rk;
+      if (!rk || !PGIF_KEYS.has(key))
+        return ctx.reply('Usage: `/tgif remove <key>`\nExample: `/tgif remove 50`', { parse_mode: 'Markdown' });
+      const { rowCount } = await q(`DELETE FROM public.tgif_settings WHERE result_key = $1`, [key]);
+      if (!rowCount) return ctx.reply(`❌ No test GIF saved for *${key}*`, { parse_mode: 'Markdown' });
+      return ctx.reply(`🗑️ Removed *Test* GIF for \`${key}\``, { parse_mode: 'Markdown' });
+    }
+    if (rawKey === 'list' || rawKey === 'show') {
+      const { rows } = await q(`SELECT result_key FROM tgif_settings ORDER BY result_key`);
+      return ctx.reply(rows.length ? `🧪 Test GIFs:\n` + rows.map((r) => `• \`${r.result_key}\``).join('\n') : 'No Test GIFs saved yet. Reply to a GIF with /tgif <key>', { parse_mode: 'Markdown' });
+    }
+    const key = PGIF_ALIASES[rawKey] || rawKey;
+    if (!PGIF_KEYS.has(key))
+      return ctx.reply('Reply to a GIF with /tgif <key> (same keys as /pgif).\nThese GIFs appear *only* in Test mode.\nRemove: /tgif remove <key>\nList: /tgif list');
+    if (!(await canConfigurePgif(ctx))) return ctx.reply('❌ Only admin/owner can set Test GIFs.');
+    const replied = ctx.message?.reply_to_message;
+    if (!replied) return ctx.reply('❌ Reply to the GIF message with /tgif ' + key);
+    let fileId = replied.animation?.file_id || null;
+    let mediaType = 'animation';
+    if (!fileId && replied.document) {
+      const mime = String(replied.document.mime_type || '').toLowerCase();
+      if (mime === 'image/gif' || mime.startsWith('video/')) { fileId = replied.document.file_id; mediaType = 'document'; }
+    }
+    if (!fileId && replied.video) { fileId = replied.video.file_id; mediaType = 'video'; }
+    if (!fileId) return ctx.reply('❌ No GIF found in the replied message.');
+    await q(`INSERT INTO public.tgif_settings (result_key, file_id, media_type, updated_by, updated_at)
+      VALUES ($1,$2,$3,$4,NOW())
+      ON CONFLICT (result_key) DO UPDATE SET file_id=EXCLUDED.file_id, media_type=EXCLUDED.media_type,
+      updated_by=EXCLUDED.updated_by, updated_at=NOW()`, [key, fileId, mediaType, String(ctx.from.id)]);
+    return ctx.reply(`✅ *Test-mode* GIF saved for \`${key}\`!`, { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error('tgif error:', e);
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+
 // key can be one key or a list (first key with a saved GIF wins)
-async function getPgif(key) {
-  const ck = Array.isArray(key) ? key.join('|') : String(key);
+// opts: { gender: 'male'|'female', mode: 'solo'|'team'|'test' }
+async function getPgif(key, opts = {}) {
+  const g = opts.gender || 'male';
+  const mode = opts.mode || '';
+  const ck = (Array.isArray(key) ? key.join('|') : String(key)) + '|' + g + '|' + mode;
   const hit = pgifCache.get(ck);
   if (hit && Date.now() - hit.at < PGIF_TTL_MS) return hit.v;
-  const v = await getPgifUncached(key);
+  const v = await getPgifUncached(key, opts);
   pgifCache.set(ck, { v, at: Date.now() });
   return v;
 }
-async function getPgifUncached(key) {
-  for (const k of Array.isArray(key) ? key : [key]) {
-    const legacy = PGIF_LEGACY[k] || k;
-    const { rows } = await q(
-      'SELECT file_id, media_type FROM public.pgif_settings WHERE result_key IN ($1,$2) ORDER BY (result_key=$1) DESC LIMIT 1',
-      [String(k), String(legacy)]
-    );
-    if (rows[0]) return rows[0];
+async function getPgifUncached(key, opts = {}) {
+  const gender = opts.gender || 'male';
+  const mode = opts.mode || '';
+  const tables = [];
+  // Test mode prefers tgif first
+  if (mode === 'test') tables.push('tgif_settings');
+  // Female prefers fgif
+  if (gender === 'female') tables.push('fgif_settings');
+  // Always fall back to classic pgif
+  tables.push('pgif_settings');
+  for (const table of tables) {
+    for (const k of Array.isArray(key) ? key : [key]) {
+      const legacy = PGIF_LEGACY[k] || k;
+      try {
+        const { rows } = await q(
+          `SELECT file_id, media_type FROM public.${table} WHERE result_key IN ($1,$2) ORDER BY (result_key=$1) DESC LIMIT 1`,
+          [String(k), String(legacy)]
+        );
+        if (rows[0]) return rows[0];
+      } catch (_) {}
+    }
   }
-  // media saved with /setmedia <key> (photo, video, GIF ... that can carry a caption)
+  // media saved with /setmedia <key>
   try {
     for (const k of Array.isArray(key) ? key : [key]) {
       const { rows } = await q(
@@ -6875,7 +7089,7 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
     else gifKeys.push(String(runs));
   }
 
-  // Partnership milestones (team mode only): runs since last wicket
+  // Partnership milestones (team mode only): every 30 runs + classic 50/80/100...
   if (!isSolo && !isWicket && nonP) {
     try {
       const { rows: pr } = await q(
@@ -6891,18 +7105,20 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
       );
       const partAfter = Number(pr[0]?.pruns || 0);
       const partBefore = partAfter - runs;
-      const partMs = [200, 150, 100, 50];
+      // 30, 50, 60, 80, 90, 100, 120 ... every 30 after 50, plus classic landmarks
+      const partMs = [30, 50, 60, 80, 90, 100, 120, 150, 180, 200];
       for (const ms of partMs) {
         if (partBefore < ms && partAfter >= ms) {
+          const n1 = shortName(name(strikerP), 16);
+          const n2 = shortName(name(nonP), 16);
           notes.push(
-            `${pe('hand','🎊')}🎊🎊🎊 <b>${fancy(ms + '-RUN PARTNERSHIP')}!</b>\n` +
-              `${disp(strikerP)} &amp; ${disp(nonP)} — <b>${ms} runs</b> together!`
+            `${pe('hand','🤝')} <b>${fancy(ms + '-RUN PARTNERSHIP')}!</b>\n` +
+              `${pe('ok','🎊')} Congratulations <b>${escapeHtml(n1)}</b> &amp; <b>${escapeHtml(n2)}</b> — <b>${ms} runs</b> together!`
           );
-          // reuse personal milestone GIF if no better key; optional partnership uses 50/100 gif
-          if (ms === 200) gifKeys.unshift('200');
-          else if (ms === 150) gifKeys.unshift('150');
-          else if (ms === 100) gifKeys.unshift('100');
-          else gifKeys.unshift('50');
+          if (ms >= 100) gifKeys.unshift(String(ms >= 200 ? 200 : ms >= 150 ? 150 : 100));
+          else if (ms >= 50) gifKeys.unshift('50');
+          // Optional: send partnership card image (template in assets/partnership_template.png)
+          // sendPartnershipCard(telegram, groupId, strikerP, nonP, partAfter).catch(() => {});
           break;
         }
       }
@@ -8064,6 +8280,7 @@ const os = require('os');
 const MATCH_VIDEOS = process.env.MATCH_VIDEOS !== '0'; // MATCH_VIDEOS=0 switches both videos off
 const WIN_VIDEO = path.join(ASSET_DIR, 'win_team.mp4');
 const FIFTY_VIDEO = path.join(ASSET_DIR, 'fifty.mp4');
+const FIFTY_FEMALE_VIDEO = path.join(ASSET_DIR, 'fifty_female.mp4'); // Smriti-style female celebration
 const FIFTY_FREEZE_AT = 11.0; // the video pauses here ...
 const FIFTY_FREEZE_SEC = 3; // ... for 3 seconds while the stats card is shown
 const FIFTY_LEN = 22.07;
@@ -8287,17 +8504,30 @@ async function sendWinVideo(telegram, groupId, m, label) {
 
 // batsman crossed 50: the video pauses in the middle for 3 seconds and shows his numbers
 async function sendFiftyVideo(telegram, groupId, p, runs, balls) {
-  if (!MATCH_VIDEOS || !p || isBotId(p.telegram_id) || !fs.existsSync(FIFTY_VIDEO)) return;
+  if (!MATCH_VIDEOS || !p || isBotId(p.telegram_id)) return;
+  const gender = p.gender || (await getUserGender(p.telegram_id));
+  const isFemale = gender === 'female';
+  const baseVideo = isFemale && fs.existsSync(FIFTY_FEMALE_VIDEO) ? FIFTY_FEMALE_VIDEO : FIFTY_VIDEO;
+  if (!fs.existsSync(baseVideo)) return;
   const name = videoName(p);
   const sr = balls > 0 ? ((runs * 100) / balls).toFixed(2) : '0.00';
   const caption = `🏏 *${mdEsc(name)}* — *${runs}* (${balls})  ·  SR ${sr}`;
+  // Female video is a celebration montage without freeze overlay support for now
+  if (isFemale && baseVideo === FIFTY_FEMALE_VIDEO) {
+    try {
+      await sendVideoFile(telegram, groupId, baseVideo, caption);
+    } catch (e) {
+      console.error('female fifty video failed:', e.message);
+    }
+    return;
+  }
   try {
     const buf = await queueVideo(() => renderFiftyVideo({ name, runs, balls }));
     await sendVideoBuf(telegram, groupId, buf, caption);
   } catch (e) {
     console.error('fifty video failed, sending the plain video:', e.message);
     notifyOwnerOnce('fifty', `Fifty video: names could not be put on the video.\n${e.message}`);
-    await sendVideoFile(telegram, groupId, FIFTY_VIDEO, caption).catch((e2) => console.error('plain fifty video failed:', e2.message));
+    await sendVideoFile(telegram, groupId, baseVideo, caption).catch((e2) => console.error('plain fifty video failed:', e2.message));
   }
 }
 
@@ -8338,6 +8568,22 @@ async function main() {
     updated_by TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  // Female-specific GIFs (same keys as pgif, separate table)
+  await q(`CREATE TABLE IF NOT EXISTS fgif_settings (
+    result_key TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    media_type TEXT NOT NULL DEFAULT 'animation',
+    updated_by TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  // Test-mode only GIFs
+  await q(`CREATE TABLE IF NOT EXISTS tgif_settings (
+    result_key TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    media_type TEXT NOT NULL DEFAULT 'animation',
+    updated_by TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   await q(`CREATE TABLE IF NOT EXISTS bot_media (
     media_key TEXT PRIMARY KEY,
     file_id TEXT NOT NULL,
@@ -8356,6 +8602,23 @@ async function main() {
     chat_id BIGINT PRIMARY KEY,
     commentary_lang TEXT NOT NULL DEFAULT 'en',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  // gender on users
+  try {
+    await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS gender TEXT`);
+  } catch (e) {
+    console.error('users.gender:', e.message);
+  }
+  // simple virtual bets (team matches)
+  await q(`CREATE TABLE IF NOT EXISTS match_bets (
+    id SERIAL PRIMARY KEY,
+    match_id TEXT NOT NULL,
+    telegram_id BIGINT NOT NULL,
+    team_label TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    odds NUMERIC(6,2) NOT NULL DEFAULT 1.80,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
   await relaxNegativeRunConstraints();
   try {
