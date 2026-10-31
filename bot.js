@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r50-2026-10-31-owner-coins-mvp'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r52-2026-10-31-lb-start-coins'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 
