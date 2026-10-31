@@ -347,6 +347,8 @@ const _callApi = bot.telegram.callApi.bind(bot.telegram);
 bot.telegram.callApi = async (method, payload = {}, extra) => {
   if (!payload) return _callApi(method, payload, extra);
   const p = { ...payload };
+  // lone surrogates (cut emoji / odd names) make Telegram answer "text must be encoded in UTF-8"
+  for (const k of ['text', 'caption']) if (typeof p[k] === 'string' && p[k].toWellFormed) p[k] = p[k].toWellFormed();
   const field = TEXT_FIELD[method];
   if (p.parse_mode === 'Markdown') {
     p.parse_mode = 'HTML';
@@ -9266,7 +9268,7 @@ async function partnershipStats(inningsId) {
             COUNT(*) FILTER (WHERE d.runs_scored=6 AND d.is_wicket IS NOT TRUE)::int AS s6
        FROM deliveries d
       WHERE d.innings_id=$1
-        AND d.id > COALESCE((SELECT id FROM deliveries WHERE innings_id=$1 AND is_wicket=TRUE ORDER BY over_number DESC, ball_number DESC LIMIT 1), 0)
+        AND (d.over_number * 100 + d.ball_number) > COALESCE((SELECT MAX(over_number * 100 + ball_number) FROM deliveries WHERE innings_id=$1 AND is_wicket=TRUE), 0)
       GROUP BY d.batsman_id`,
     [inningsId]
   );
