@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r54-2026-10-31-lb-split'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r56-2026-11-01-superover-rain'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 
@@ -506,19 +506,47 @@ async function getMatch(id) {
   return rows[0] || null;
 }
 
+// players saved without any name: look the name up (group member / profile) once, store it for good
+const nameFail = new Map();
+async function fillNames(rows, chatId = null) {
+  const need = rows.filter((r) => Number(r.telegram_id) > 0 && !r.first_name && !r.last_name && !r.username);
+  if (!need.length) return rows;
+  if (!chatId && rows[0] && rows[0].match_id) {
+    try { chatId = Number((await q(`SELECT group_chat_id FROM matches WHERE id=$1`, [rows[0].match_id])).rows[0]?.group_chat_id) || null; } catch (_) {}
+  }
+  for (const r of need) {
+    const k = String(r.telegram_id);
+    let c = nameCache.get(k);
+    if (!(c && (c.first_name || c.last_name || c.username))) {
+      c = null;
+      if (Date.now() - (nameFail.get(k) || 0) < 600000) continue;
+      if (chatId && chatId < 0) { try { c = (await withTimeout(bot.telegram.getChatMember(chatId, Number(k)), 4000)).user; } catch (_) {} }
+      if (!c) { try { c = await withTimeout(bot.telegram.getChat(Number(k)), 4000); } catch (_) {} }
+      if (c && (c.first_name || c.last_name || c.username)) {
+        nameCache.set(k, { first_name: c.first_name, last_name: c.last_name, username: c.username });
+        upsertUser({ id: Number(k), username: c.username, first_name: c.first_name, last_name: c.last_name }).catch(() => {});
+      } else { nameFail.set(k, Date.now()); continue; }
+      c = nameCache.get(k);
+    }
+    r.first_name = c.first_name || null; r.last_name = c.last_name || null; r.username = c.username || null;
+    if (r.id) q(`UPDATE match_players SET first_name=$2, last_name=$3, username=$4 WHERE id=$1`, [r.id, r.first_name, r.last_name, r.username]).catch(() => {});
+  }
+  return rows;
+}
+
 async function getPlayers(matchId, team = null) {
   if (team) {
     const { rows } = await q(
       `SELECT * FROM match_players WHERE match_id=$1 AND team_label=$2 ORDER BY roster_position`,
       [matchId, team]
     );
-    return rows;
+    return fillNames(rows);
   }
   const { rows } = await q(
     `SELECT * FROM match_players WHERE match_id=$1 ORDER BY team_label, roster_position`,
     [matchId]
   );
-  return rows;
+  return fillNames(rows);
 }
 
 async function getPlayerByPos(matchId, team, pos) {
@@ -1516,6 +1544,28 @@ const richTable = (headers, rows) =>
   `</table>`;
 
 // returns html, or null when there is nothing to show as a table (not started / finished)
+// win chance of the batting side (0-100): innings 1 = projected vs par, innings 2 = chase maths
+function winChance(match, inn, totalOvers, wicketsMax) {
+  const ballsTotal = totalOvers * 6;
+  const left = Math.max(0, ballsTotal - inn.balls_bowled);
+  const crr = inn.balls_bowled > 0 ? (inn.total_runs * 6) / inn.balls_bowled : 0;
+  const wLeft = Math.max(0, wicketsMax - (inn.total_wickets || 0)) / Math.max(1, wicketsMax);
+  let p;
+  if (inn.innings_number >= 2 && match.target) {
+    const need = match.target - inn.total_runs;
+    if (need <= 0) return 100;
+    if (left <= 0 || wLeft <= 0) return 0;
+    const rrr = (need * 6) / left;
+    const edge = (crr || rrr) - rrr; // runs per over ahead / behind
+    p = 1 / (1 + Math.exp(-(edge * 0.9 + (wLeft - 0.5) * 2.2)));
+  } else {
+    const proj = inn.total_runs + (crr || 7) * (left / 6);
+    const par = totalOvers * 7.5;
+    p = 1 / (1 + Math.exp(-((proj - par) / (par * 0.22) + (wLeft - 0.5))));
+  }
+  return Math.max(3, Math.min(97, Math.round(p * 100)));
+}
+
 async function scoreboardRich(matchId) {
   const match = await getMatch(matchId);
   if (!match || ['completed', 'cancelled'].includes(match.status)) return null;
@@ -1531,87 +1581,105 @@ async function scoreboardRich(matchId) {
   const { rows: wsRows } = await q(`SELECT * FROM bowling_stats WHERE innings_id=$1`, [inn.id]);
   const bmap = new Map(bsRows.map((r) => [r.player_id, r]));
   const wmap = new Map(wsRows.map((r) => [r.player_id, r]));
+  const bat = (r) => (r ? `${r.runs}(${r.balls_faced}) · ${r.fours || 0}x4 · ${r.sixes || 0}x6` : '0(0)');
 
   let h = `<p><b>🏏 ${hEsc(fancy('SCORECARD'))}</b>  ·  Innings ${inn.innings_number}</p>`;
-
-  // summary quote
   const pen = match.penalty_log ? String(match.penalty_log).split('\n').filter(Boolean) : [];
-  if (isSolo) {
-    const crr = inn.balls_bowled > 0 ? ((inn.total_runs * 6) / inn.balls_bowled).toFixed(2) : '0.00';
-    h += `<blockquote><p>🏏 Score: <b>${inn.total_runs}/${inn.total_wickets}</b></p><p>⏱ Balls: <b>${inn.balls_bowled}</b></p><p>📈 RR: <b>${crr}</b></p>` +
-      pen.map((l) => `<p>⚖️ ${hEsc(l)}</p>`).join('') + `</blockquote>`;
-  } else {
-    const { rows: all } = await q(`SELECT * FROM innings WHERE match_id=$1 ORDER BY innings_number`, [match.id]);
-    const line = (label) => {
-      const i = all.find((x) => x.batting_team === label);
-      const runs = i ? i.total_runs : 0;
-      const wk = i ? i.total_wickets : 0;
-      const balls = i ? i.balls_bowled : 0;
-      const crr = balls > 0 ? ((runs * 6) / balls).toFixed(2) : '0.0';
-      const icon = label === inn.batting_team ? '🏏' : '🎳';
-      return `<p>${icon} Team ${label} | <b>${runs}/${wk}</b> | ${oversStr(balls)}/${totalOvers} overs</p><p>📈 CRR: ${crr}</p>`;
-    };
-    h += `<blockquote>${line('A')}${line('B')}` + pen.map((l) => `<p>⚖️ ${hEsc(l)}</p>`).join('') + `</blockquote>`;
-  }
 
-  // batting table
   if (isSolo) {
+    const crr = inn.balls_bowled > 0 ? ((inn.total_runs * 6) / inn.balls_bowled).toFixed(1) : '0.0';
+    h += `<p>🏏 <b>${inn.total_runs}/${inn.total_wickets}</b> · ${inn.balls_bowled} balls · RR ${crr}</p>`;
     const players = await getPlayers(match.id, 'A');
     const rows = players
       .map((p) => ({ p, r: bmap.get(p.id) }))
       .filter((x) => x.r || (striker && x.p.id === striker.id))
       .sort((a, b) => (b.r?.runs || 0) - (a.r?.runs || 0))
-      .slice(0, 12)
-      .map(({ p, r }) => {
-        const mark = striker && p.id === striker.id ? '🏃 ' : r?.is_out ? '❌ ' : '';
-        return [mark + richName(p), batCell(r?.runs || 0, r?.balls_faced || 0, r?.fours || 0, r?.sixes || 0)];
-      });
-    h += `<p><b>PLAYERS</b></p>`;
-    if (rows.length) h += richTable(['Name', 'Score'], rows);
-    if (bowler) h += `<p>🎳 Bowler: <b>${richName(bowler)}</b></p>`;
-  } else {
-    const batters = await getPlayers(match.id, inn.batting_team);
-    const bowlers = await getPlayers(match.id, inn.bowling_team);
-    const batRows = [];
-    for (const p of batters) {
-      const r = bmap.get(p.id);
-      const isStr = striker && p.id === striker.id;
-      const isNon = non && p.id === non.id;
-      if (!r && !isStr && !isNon) continue;
-      const mark = isStr ? '🏃 ' : isNon ? '🏏 ' : r?.is_out ? '❌ ' : '';
-      batRows.push([mark + richName(p), batCell(r?.runs || 0, r?.balls_faced || 0, r?.fours || 0, r?.sixes || 0)]);
-    }
-    h += `<p><b>TEAM ${inn.batting_team} PLAYERS</b></p>`;
-    if (batRows.length) h += richTable(['Name', 'Score'], batRows);
-    if (!striker) h += `<p>⏳ waiting for the batting captain: /bat &lt;no.&gt;</p>`;
-
-    const bowlRows = [];
-    for (const p of bowlers) {
-      const r = wmap.get(p.id);
-      const bb = r?.balls_bowled || 0;
-      const isCur = bowler && p.id === bowler.id;
-      if (bb === 0 && !isCur) continue;
-      const conc = r?.runs_conceded || 0;
-      bowlRows.push([
-        (isCur ? '🎳 ' : '') + richName(p),
-        `${oversStr(bb)} overs | ${conc} runs | ${r?.wickets || 0} wkt | ${bb > 0 ? ((conc * 6) / bb).toFixed(1) : '0.0'} econ`,
-      ]);
-    }
-    h += `<p><b>TEAM ${inn.bowling_team} BOWLERS</b></p>`;
-    if (bowlRows.length) h += richTable(['Name', 'Overs'], bowlRows);
-    if (!bowler) h += `<p>⏳ waiting for the bowling captain: /ball &lt;no.&gt;</p>`;
-
-    if (match.target && inn.innings_number === 2) {
-      const need = Math.max(0, match.target - inn.total_runs);
-      const left = Math.max(0, totalOvers * 6 - inn.balls_bowled);
-      const bar = pressureBar(need, left, inn.total_wickets || 0, Math.max(1, batters.length - 1));
-      h += `<p>• Chasing Target <b>${match.target}</b> — <b>${need}</b> runs need from <b>${left}</b> balls</p>`;
-      h += `<blockquote><p>PRESSURE <code>[${bar}]</code></p></blockquote>`;
-    }
+      .slice(0, 10)
+      .map(({ p, r }) => [(striker && p.id === striker.id ? '🏃 ' : r?.is_out ? '❌ ' : '') + richName(p), bat(r)]);
+    if (rows.length) h += richTable(['Player', 'Score'], rows);
+    if (bowler) h += `<p>🎳 <b>${richName(bowler)}</b></p>`;
+    h += `<p>⏱ ${TURN_SECONDS}s · bowl 1–6 in DM · bat 0–6 here</p>`;
+    return h;
   }
 
-  h += `<p>💡 Bowler: 1–6 in bot DM · Batsman: 0–6 in group (0 = dot)</p>`;
-  h += `<p>⏱ ${TURN_SECONDS}s to respond, otherwise -${TURN_PENALTY} runs</p>`;
+  const { rows: all } = await q(`SELECT * FROM innings WHERE match_id=$1 ORDER BY innings_number`, [match.id]);
+  const batters = await getPlayers(match.id, inn.batting_team);
+  const bowlers = await getPlayers(match.id, inn.bowling_team);
+  const wMax = Math.max(1, batters.length - 1);
+  const crrNow = inn.balls_bowled > 0 ? (inn.total_runs * 6) / inn.balls_bowled : 0;
+  const left = Math.max(0, totalOvers * 6 - inn.balls_bowled);
+  const proj = Math.round(inn.total_runs + (crrNow || 0) * (left / 6));
+  const wp = winChance(match, inn, totalOvers, wMax);
+  const bowlTeam = inn.bowling_team;
+  const winLine = `Team ${inn.batting_team} <b>${wp}%</b> · Team ${bowlTeam} <b>${100 - wp}%</b>`;
+
+  // momentum: runs / wickets in the last 12 balls against the innings run rate
+  let momentum = '';
+  try {
+    const { rows: last } = await q(
+      `SELECT runs_scored, is_wicket FROM deliveries WHERE innings_id=$1 ORDER BY over_number DESC, ball_number DESC LIMIT 12`,
+      [inn.id]
+    );
+    if (last.length >= 3) {
+      const rr = last.reduce((a, d) => a + (d.is_wicket ? 0 : Number(d.runs_scored) || 0), 0);
+      const wk = last.filter((d) => d.is_wicket).length;
+      const rec = (rr * 6) / last.length;
+      const batting = wk === 0 ? rec >= crrNow : rec >= crrNow + 3 * wk;
+      momentum = `⚡ Momentum: <b>Team ${batting && wk < 2 ? inn.batting_team : bowlTeam}</b>`;
+    }
+  } catch (_) {}
+
+  const line = (label) => {
+    const i = all.find((x) => x.batting_team === label);
+    const runs = i ? i.total_runs : 0;
+    const wk = i ? i.total_wickets : 0;
+    const balls = i ? i.balls_bowled : 0;
+    const crr = balls > 0 ? ((runs * 6) / balls).toFixed(1) : '0.0';
+    return `<p>${label === inn.batting_team ? '🏏' : '🎳'} Team ${label}: <b>${runs}/${wk}</b> (${oversStr(balls)}/${totalOvers}) · CRR ${crr}</p>`;
+  };
+  h += `<blockquote>${line('A')}${line('B')}` +
+    `<p>📈 Projected: <b>${proj}</b></p><p>🎯 Win chance: ${winLine}</p>` +
+    (momentum ? `<p>${momentum}</p>` : '') +
+    pen.map((l) => `<p>⚖️ ${hEsc(l)}</p>`).join('') + `</blockquote>`;
+
+  const batRows = [];
+  for (const p of batters) {
+    const r = bmap.get(p.id);
+    const isStr = striker && p.id === striker.id;
+    const isNon = non && p.id === non.id;
+    if (!r && !isStr && !isNon) continue;
+    batRows.push([(isStr ? '🏃 ' : isNon ? '🏏 ' : r?.is_out ? '❌ ' : '') + richName(p), bat(r)]);
+  }
+  if (batRows.length) h += richTable([`Team ${inn.batting_team} batting`, 'Score'], batRows);
+  if (!striker) h += `<p>⏳ batting captain: /bat &lt;no.&gt;</p>`;
+
+  const bowlRows = [];
+  for (const p of bowlers) {
+    const r = wmap.get(p.id);
+    const bb = r?.balls_bowled || 0;
+    const isCur = bowler && p.id === bowler.id;
+    if (bb === 0 && !isCur) continue;
+    bowlRows.push([(isCur ? '🎳 ' : '') + richName(p), `${oversStr(bb)}-${r?.runs_conceded || 0}-${r?.wickets || 0}`]);
+  }
+  if (bowlRows.length) h += richTable([`Team ${bowlTeam} bowling`, 'O-R-W'], bowlRows);
+  if (!bowler) h += `<p>⏳ bowling captain: /ball &lt;no.&gt;</p>`;
+
+  // current bowler: this over ball by ball  e.g. Name (W 6 6 4)
+  if (bowler) {
+    try {
+      const ov = inn.balls_bowled % 6 === 0 ? Math.max(1, inn.balls_bowled / 6) : Math.floor(inn.balls_bowled / 6) + 1;
+      const { rows: dl } = await q(`SELECT runs_scored, is_wicket FROM deliveries WHERE innings_id=$1 AND over_number=$2 ORDER BY ball_number`, [inn.id, ov]);
+      if (dl.length) h += `<p>🎳 <b>${richName(bowler)}</b> (${dl.map((d) => (d.is_wicket ? 'W' : d.runs_scored)).join(' ')})</p>`;
+    } catch (_) {}
+  }
+
+  if (match.target && inn.innings_number === 2) {
+    const need = Math.max(0, match.target - inn.total_runs);
+    const bar = pressureBar(need, left, inn.total_wickets || 0, wMax);
+    h += `<p>🎯 Target <b>${match.target}</b> · need <b>${need}</b> from <b>${left}</b> balls</p>`;
+    h += `<p>PRESSURE <code>[${bar}]</code></p>`;
+  }
+  h += `<p>⏱ ${TURN_SECONDS}s per turn · bowl 1–6 in DM · bat 0–6 here</p>`;
   return h;
 }
 
@@ -2131,9 +2199,11 @@ bot.start(async (ctx) => {
   if (ctx.chat && ctx.chat.type === 'private') {
     try {
       const { rows } = await q(
-        `SELECT * FROM pending_balls WHERE bowler_telegram_id=$1 AND is_resolved=FALSE AND bowl_number IS NULL`,
+        `SELECT pb.* FROM pending_balls pb JOIN matches m ON m.id=pb.match_id
+          WHERE pb.bowler_telegram_id=$1 AND pb.is_resolved=FALSE AND pb.bowl_number IS NULL AND m.status IN ('innings1','innings2')`,
         [ctx.from.id]
       );
+      q(`UPDATE pending_balls SET is_resolved=TRUE WHERE is_resolved=FALSE AND match_id IN (SELECT id FROM matches WHERE status IN ('completed','cancelled'))`).catch(() => {});
       for (const pend of rows) await sendBowlerPrompt(ctx.telegram, pend);
     } catch (e) {
       console.error('start prompt failed:', e.message);
@@ -3106,40 +3176,60 @@ async function createSoloLobby(ctx) {
 }
 bot.command(['startsolo', 'solo'], createSoloLobby);
 
+const joinRequests = new Map(); // `${matchId}:${userId}` -> user
+async function addSoloPlayer(telegram, chatId, m, u) {
+  if (await getPlayerByTg(m.id, u.id)) return;
+  const pl = await getPlayers(m.id, 'A');
+  if (pl.length >= MAX_SOLO_PLAYERS) return telegram.sendMessage(chatId, `❌ Lobby full (${MAX_SOLO_PLAYERS}/${MAX_SOLO_PLAYERS})`);
+  const pos = pl.length + 1;
+  await q(
+    `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name, is_captain)
+     VALUES ($1,$2,'A',$3,$4,$5,$6,FALSE)`,
+    [m.id, u.id, pos, u.username || null, u.first_name || null, u.last_name || null]
+  );
+  await upsertUser(u);
+  const left = lobbies.has(m.id) ? Math.max(0, Math.ceil((lobbies.get(m.id).endsAt - Date.now()) / 1000)) : 0;
+  await telegram.sendMessage(chatId, `✅ *${mn(u)}* joined  ·  #${pos}  ·  ${pos} player${pos > 1 ? 's' : ''}` + (left ? `  ·  ${left}s left` : ''), { parse_mode: 'Markdown' });
+}
 async function joinSolo(ctx) {
   if (!isGroup(ctx)) return;
   try {
     const m = await getActiveMatch(ctx.chat.id);
-    if (!m || m.mode !== 'solo' || m.status !== 'waiting')
-      return ctx.reply('❌ There is no open solo lobby');
+    if (!m || m.mode !== 'solo' || !['waiting', 'innings1'].includes(m.status))
+      return ctx.reply('❌ There is no solo match to join');
     if (await getPlayerByTg(m.id, ctx.from.id)) return ctx.reply('❌ You already joined');
-
-    const pl = await getPlayers(m.id, 'A');
-    if (pl.length >= MAX_SOLO_PLAYERS)
-      return ctx.reply(`❌ Lobby full (${MAX_SOLO_PLAYERS}/${MAX_SOLO_PLAYERS})`);
-
-    // Join order number = roster position on team A
-    const pos = pl.length + 1;
-    await q(
-      `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name, is_captain)
-       VALUES ($1,$2,'A',$3,$4,$5,$6,FALSE)`,
-      [m.id, ctx.from.id, pos, ctx.from.username || null, ctx.from.first_name || null, ctx.from.last_name || null]
-    );
-
-    await upsertUser(ctx.from);
-    const total = pos;
-    const left = lobbies.has(m.id)
-      ? Math.max(0, Math.ceil((lobbies.get(m.id).endsAt - Date.now()) / 1000))
-      : 0;
-
-    await ctx.reply(
-      `✅ *${mn(ctx.from)}* joined  ·  #${pos}  ·  ${total} player${total > 1 ? 's' : ''}` + (left ? `  ·  ${left}s left` : ''),
-      { parse_mode: 'Markdown' }
+    // before the start everybody joins freely; after the start the host has to accept
+    if (m.status === 'waiting' || Number(m.host_telegram_id) === ctx.from.id) return addSoloPlayer(ctx.telegram, ctx.chat.id, m, ctx.from);
+    if (m.vs_bot) return ctx.reply('❌ This match is against the bot.');
+    const key = `${m.id}:${ctx.from.id}`;
+    if (joinRequests.has(key)) return ctx.reply('⏳ Your request is already waiting for the host.');
+    joinRequests.set(key, ctx.from);
+    setTimeout(() => joinRequests.delete(key), 5 * 60 * 1000);
+    return ctx.reply(
+      `🙋 ${mtag(ctx.from)} wants to join the running match.\n[Host](tg://user?id=${Number(m.host_telegram_id)}), accept?`,
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[btn('𝗔𝗖𝗖𝗘𝗣𝗧', `jr:Y:${m.id}:${ctx.from.id}`, 'ok', 'success'), btn('𝗗𝗘𝗖𝗟𝗜𝗡𝗘', `jr:N:${m.id}:${ctx.from.id}`, 'no', 'danger')]]) }
     );
   } catch (e) {
     await ctx.reply('❌ ' + e.message);
   }
 }
+bot.action(/^jr:(Y|N):([^:]+):(\d+)$/, async (ctx) => {
+  try {
+    const m = await getMatch(ctx.match[2]);
+    if (!m || !['waiting', 'innings1'].includes(m.status)) return ctx.answerCbQuery('Match is over', { show_alert: true });
+    if (Number(m.host_telegram_id) !== ctx.from.id && !isAdmin(ctx.from.id)) return ctx.answerCbQuery('Only the host can answer', { show_alert: true });
+    const key = `${m.id}:${ctx.match[3]}`;
+    const u = joinRequests.get(key);
+    joinRequests.delete(key);
+    if (!u) return ctx.answerCbQuery('Request expired', { show_alert: true });
+    await ctx.answerCbQuery(ctx.match[1] === 'Y' ? 'Accepted' : 'Declined');
+    if (ctx.match[1] === 'N') return editCard(ctx, `❌ Request of ${mtag(u)} was declined.`);
+    await editCard(ctx, `✅ ${mtag(u)} was accepted.`);
+    return addSoloPlayer(ctx.telegram, Number(m.group_chat_id), m, u);
+  } catch (e) {
+    console.error('join request:', e.message);
+  }
+});
 bot.command(['join_solo', 'joinsolo'], joinSolo);
 
 bot.command('leavesolo', async (ctx) => {
@@ -4225,12 +4315,12 @@ bot.action(/^cap:(.+):(A|B)$/, async (ctx) => {
 });
 
 // edit a card that may be a GIF (caption) or a plain text message
-async function editCard(ctx, md) {
+async function editCard(ctx, md, kb) {
   const msg = ctx.callbackQuery && ctx.callbackQuery.message;
   const isMedia = msg && (msg.animation || msg.video || msg.document || msg.photo);
   try {
-    if (isMedia) await ctx.editMessageCaption(stripPe(md2html(md)), { parse_mode: 'HTML' });
-    else await ctx.editMessageText(md, { parse_mode: 'Markdown' });
+    if (isMedia) await ctx.editMessageCaption(stripPe(md2html(md)), { parse_mode: 'HTML', ...(kb || {}) });
+    else await ctx.editMessageText(md, { parse_mode: 'Markdown', ...(kb || {}) });
   } catch (_) {}
 }
 
@@ -4546,6 +4636,7 @@ bot.action(/^ov:(.+):(\d+)$/, async (ctx) => {
         `<blockquote>${batCap ? htag(batCap) : 'Captain'}, send your openers → <code>/bat &lt;no.&gt;</code> (twice)</blockquote>`
     );
     if (startMsg?.message_id) await pinMsg(ctx.telegram, groupId, mm.id, startMsg.message_id);
+    askRainMode(ctx.telegram, groupId, mm).catch((e) => console.error('rain ask:', e.message));
     await botTeamAssist(m.id);
     await ensureTurnClock(m.id);
   } catch (e) {
@@ -5972,7 +6063,7 @@ async function finishTeam(telegram, groupId, m, inn2) {
   let winner;
   if (inn2.total_runs >= m.target) {
     winner = inn2.batting_team;
-    const left = Math.max(1, batSide.length - 1 - inn2.total_wickets);
+    const left = m.super_over ? Math.max(1, Math.min(3, batSide.length - 1) - inn2.total_wickets) : Math.max(1, batSide.length - 1 - inn2.total_wickets);
     resultLine = `🏆 *Team ${winner} WINS by ${left} wicket${left === 1 ? '' : 's'}!*`;
   } else if (inn2.total_runs === m.target - 1) {
     winner = 'tie';
@@ -5982,6 +6073,13 @@ async function finishTeam(telegram, groupId, m, inn2) {
     const margin = m.target - 1 - inn2.total_runs;
     resultLine = `🏆 *Team ${winner} WINS by ${margin} run${margin === 1 ? '' : 's'}!*`;
   }
+
+  // ── tie in a team match: SUPER OVER ──
+  if (winner === 'tie' && m.mode === 'team') {
+    await startSuperOver(telegram, groupId, m, inn2);
+    return;
+  }
+  if (m.super_over && winner !== 'tie') resultLine = `⚡ *SUPER OVER* — ` + resultLine;
 
   // ── Test multi-day: record day win, start next day if remaining ──
   if (m.mode === 'test' && m.test_days) {
@@ -6161,11 +6259,14 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
 
   const batSide = await getPlayers(m.id, inn2.batting_team);
   const nBat = Math.max(1, batSide.length);
-  const maxBalls = (m.total_overs || DEFAULT_OVERS) * 6;
+  const so = !!m.super_over && Number(inn2.innings_number) >= 3; // super over: 1 over, 3 wickets
+  const maxBalls = so ? 6 : (m.total_overs || DEFAULT_OVERS) * 6;
+  const wkCap = so ? Math.min(3, nBat - 1) : nBat - 1;
+  const isChase = so ? Number(inn2.innings_number) % 2 === 0 : inn2.innings_number === 2;
   let ended = isSolo
     ? inn2.total_wickets >= nBat
-    : inn2.total_wickets >= nBat - 1 || inn2.balls_bowled >= maxBalls;
-  if (!isSolo && inn2.innings_number === 2 && m.target && inn2.total_runs >= m.target) ended = true;
+    : inn2.total_wickets >= wkCap || inn2.balls_bowled >= maxBalls;
+  if (!isSolo && isChase && m.target && inn2.total_runs >= m.target) ended = true;
 
   let matchFinished = false;
   // scoreboard: team → at the end of every over; solo → when a new bowler comes
@@ -6181,26 +6282,27 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
     if (isSolo) {
       matchFinished = true;
       await finishSolo(telegram, groupId, m, inn2);
-    } else if (inn2.innings_number === 1) {
+    } else if (!isChase) {
       const target = inn2.total_runs + 1;
+      const nextNo = Number(inn2.innings_number) + 1;
       const bat2 = inn2.bowling_team;
       const bowl2 = inn2.batting_team;
       // a team that was penalised before it batted starts its innings below zero
       const t2 = await getTeam(m.id, bat2);
       const startRuns = Number(t2?.penalty_runs || 0);
       await q(
-        `UPDATE matches SET status='innings2', current_innings=2,
+        `UPDATE matches SET status='innings2', current_innings=${nextNo},
          current_batting_team=$2, current_bowling_team=$3, target=$4 WHERE id=$1`,
         [m.id, bat2, bowl2, target]
       );
       await q(
         `INSERT INTO innings (match_id, innings_number, batting_team, bowling_team, ball_state, total_runs)
-         VALUES ($1,2,$2,$3,'idle',$4)`,
+         VALUES ($1,${nextNo},$2,$3,'idle',$4)`,
         [m.id, bat2, bowl2, startRuns]
       );
 
       const mid =
-        `🏁 *END OF INNINGS 1*\n` +
+        `🏁 *END OF ${so ? 'SUPER OVER INNINGS' : 'INNINGS 1'}*\n` +
         `${line()}\n` +
         `Team ${inn2.batting_team}: *${inn2.total_runs}/${inn2.total_wickets}* (${oversStr(inn2.balls_bowled)} ov)\n` +
         `🎯 Target for Team ${bat2}: *${target}*\n` +
@@ -6214,6 +6316,7 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
       await finishTeam(telegram, groupId, m, inn2);
     }
   } else {
+    try { await maybeRain(telegram, m, inn2); } catch (e) { console.error('rain:', e.message); }
     // Continue play prompts
     if (isSolo && isWicket) {
       // Auto next batsman on same side
@@ -9404,6 +9507,7 @@ const withTimeout = (p, ms, label = 'timeout') =>
   Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms))]);
 
 async function initR50() {
+  for (const c of ['super_over', 'rain_mode', 'rain_used']) await q(`ALTER TABLE matches ADD COLUMN IF NOT EXISTS ${c} BOOLEAN`);
   await q(`CREATE TABLE IF NOT EXISTS banned_users (telegram_id BIGINT PRIMARY KEY, reason TEXT, banned_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   await q(`CREATE TABLE IF NOT EXISTS coin_payouts (match_id TEXT NOT NULL, telegram_id BIGINT NOT NULL, amount INTEGER NOT NULL,
     PRIMARY KEY (match_id, telegram_id))`);
@@ -9497,7 +9601,7 @@ async function dmCoins(telegram, p, amount, extra = '', toChat = null) {
 }
 async function matchPerf(matchId) {
   const { rows } = await q(
-    `SELECT mp.telegram_id, mp.username, mp.first_name, mp.last_name, mp.team_label,
+    `SELECT mp.id, mp.match_id, mp.telegram_id, mp.username, mp.first_name, mp.last_name, mp.team_label,
             COALESCE(b.runs,0)::int AS runs, COALESCE(w.wkts,0)::int AS wkts
        FROM match_players mp
        LEFT JOIN (SELECT bs.player_id, SUM(bs.runs) AS runs FROM batting_stats bs JOIN innings i ON i.id=bs.innings_id
@@ -9507,7 +9611,7 @@ async function matchPerf(matchId) {
       WHERE mp.match_id=$1`,
     [matchId]
   );
-  return rows;
+  return fillNames(rows);
 }
 // after a finished match: 40 / 100 by performance, 150 for the Man of the Match (once per player per match)
 async function payMatchCoins(telegram, m, aw) {
@@ -10018,6 +10122,147 @@ bot.action(/^lbc:(\w+):(a|g)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   try { await showCat(ctx, ctx.match[1], ctx.match[2]); } catch (e) { console.error('lbc:', e.message); }
 });
+
+// /clearstuck: closes every unfinished match / lobby you are in (and any bowl prompts waiting for you)
+bot.command('clearstuck', async (ctx) => {
+  try {
+    const { rows } = await q(
+      `SELECT DISTINCT m.* FROM matches m LEFT JOIN match_players mp ON mp.match_id=m.id
+        WHERE m.status NOT IN ('completed','cancelled') AND (m.host_telegram_id=$1 OR mp.telegram_id=$1)`,
+      [ctx.from.id]
+    );
+    for (const m of rows) {
+      try { await cancelMatchNow({ ...m, status: 'waiting' }, ctx.telegram); } catch (e) { console.error('clearstuck:', e.message); }
+    }
+    await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE bowler_telegram_id=$1 AND is_resolved=FALSE`, [ctx.from.id]);
+    return ctx.reply(rows.length ? `🧹 Cleared ${rows.length} stuck match${rows.length === 1 ? '' : 'es'}. You can start a new one now.` : '✅ Nothing stuck. You are free.');
+  } catch (e) {
+    return ctx.reply('❌ ' + e.message);
+  }
+});
+
+// ═══ SUPER OVER ═══
+// tie in a team match: the team that batted last bats again (1 over, 3 wickets), then the other team chases
+async function startSuperOver(telegram, groupId, m, lastInn) {
+  const first = lastInn.batting_team;
+  const second = lastInn.bowling_team;
+  const n = Number(lastInn.innings_number) + 1;
+  await q(
+    `UPDATE matches SET super_over=TRUE, status='innings2', current_innings=$2,
+       current_batting_team=$3, current_bowling_team=$4, target=NULL WHERE id=$1`,
+    [m.id, n, first, second]
+  );
+  await q(
+    `INSERT INTO innings (match_id, innings_number, batting_team, bowling_team, ball_state) VALUES ($1,$2,$3,$4,'idle')`,
+    [m.id, n, first, second]
+  );
+  const { rows: inns } = await q(`SELECT * FROM innings WHERE match_id=$1 ORDER BY innings_number`, [m.id]);
+  let t = `🤝 *${fancy('MATCH TIED')}*\n`;
+  for (const i of inns.filter((x) => Number(x.innings_number) <= 2)) t += `> Team ${i.batting_team}: *${i.total_runs}/${i.total_wickets}* (${oversStr(i.balls_bowled)} ov)\n`;
+  t += `\n⚡ *${fancy('SUPER OVER')}*\n` +
+    `> Team ${first} bats first: *1 over, 3 wickets*\n` +
+    `> Then Team ${second} chases\n\n` +
+    `🏏 ${await capTagOf(m, first)} — send your openers: /bat <no.>\n` +
+    `🎳 ${await capTagOf(m, second)} — send your bowler: /ball <no.>`;
+  await telegram.sendMessage(groupId, t, { parse_mode: 'Markdown' });
+  await ensureTurnClock(m.id);
+}
+
+// ═══ RAIN MODE ═══
+const rainVotes = new Map(); // matchId -> { voters:Set, need, msgId, timer }
+async function askRainMode(telegram, groupId, m) {
+  if (m.mode !== 'team') return;
+  await telegram.sendMessage(
+    groupId,
+    `🌧 *${fancy('RAIN MODE')}*\n[Host](tg://user?id=${Number(m.host_telegram_id)}), do you want rain mode?\n> Rain can stop the match: overs are cut and a DLS target is set.`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[btn('𝗬𝗘𝗦', `rn:Y:${m.id}`, 'ok', 'success'), btn('𝗡𝗢', `rn:N:${m.id}`, 'no', 'danger')]]) }
+  );
+}
+bot.action(/^rn:(Y|N):(.+)$/, async (ctx) => {
+  try {
+    const m = await getMatch(ctx.match[2]);
+    if (!m || ['completed', 'cancelled'].includes(m.status)) return ctx.answerCbQuery('Match is over', { show_alert: true });
+    if (Number(m.host_telegram_id) !== ctx.from.id && !isAdmin(ctx.from.id)) return ctx.answerCbQuery('Only the host can answer', { show_alert: true });
+    if (ctx.match[1] === 'N') {
+      await ctx.answerCbQuery('Rain mode off');
+      return editCard(ctx, '☀️ Rain mode is *off*.');
+    }
+    const pl = (await getPlayers(m.id)).filter((p) => Number(p.telegram_id) > 0);
+    const need = Math.min(3, Math.max(1, pl.length));
+    await ctx.answerCbQuery('Voting started');
+    const v = { voters: new Set(), need, msgId: null, timer: null };
+    rainVotes.set(String(m.id), v);
+    await editCard(ctx, `🌧 *RAIN MODE VOTE*\nVotes: *0/${need}*\nPlayers of this match: tap *Vote*.`).catch(() => {});
+    const sent = await ctx.telegram.sendMessage(Number(m.group_chat_id), `🌧 *RAIN MODE VOTE*\n${need} votes from joined players needed.\nVotes: *0/${need}*`, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[btn('𝗩𝗢𝗧𝗘', `rv:${m.id}`, 'people', 'primary')]]),
+    });
+    v.msgId = sent.message_id;
+    v.timer = setTimeout(async () => {
+      if (!rainVotes.has(String(m.id))) return;
+      rainVotes.delete(String(m.id));
+      ctx.telegram.editMessageText(Number(m.group_chat_id), v.msgId, undefined, '☀️ Rain mode vote expired. Rain mode is off.').catch(() => {});
+    }, 3 * 60 * 1000);
+  } catch (e) {
+    console.error('rain answer:', e.message);
+  }
+});
+bot.action(/^rv:(.+)$/, async (ctx) => {
+  try {
+    const m = await getMatch(ctx.match[1]);
+    const v = rainVotes.get(String(ctx.match[1]));
+    if (!m || !v) return ctx.answerCbQuery('Voting is closed', { show_alert: true });
+    if (!(await getPlayerByTg(m.id, ctx.from.id))) return ctx.answerCbQuery('Only players of this match can vote', { show_alert: true });
+    if (v.voters.has(ctx.from.id)) return ctx.answerCbQuery('You already voted');
+    v.voters.add(ctx.from.id);
+    await ctx.answerCbQuery('Voted');
+    if (v.voters.size >= v.need) {
+      clearTimeout(v.timer);
+      rainVotes.delete(String(m.id));
+      await q(`UPDATE matches SET rain_mode=TRUE WHERE id=$1`, [m.id]);
+      return editCard(ctx, `🌧 *RAIN MODE IS ON*\nRain may arrive at any time: overs will be cut and the target set by DLS.`);
+    }
+    await editCard(ctx, `🌧 *RAIN MODE VOTE*\nVotes: *${v.voters.size}/${v.need}*`, Markup.inlineKeyboard([[btn('𝗩𝗢𝗧𝗘', `rv:${m.id}`, 'people', 'primary')]])).catch(() => {});
+  } catch (e) {
+    console.error('rain vote:', e.message);
+  }
+});
+// simple DLS-style resources: % of the innings left for u overs left and w wickets lost
+function dlsRes(u, w, U0) {
+  const base = ((1 - Math.exp(-0.07 * Math.max(0, u))) / (1 - Math.exp(-0.07 * U0))) * 100;
+  return base * Math.max(0.12, 1 - 0.085 * w);
+}
+async function maybeRain(telegram, m, inn2) {
+  if (!m.rain_mode || m.rain_used || m.super_over || m.mode !== 'team') return;
+  if (inn2.balls_bowled < 6 || Math.random() > 0.035) return;
+  const total = Number(m.total_overs) || DEFAULT_OVERS;
+  const done = Math.ceil(inn2.balls_bowled / 6);
+  if (total - done < 3) return; // too late for a cut
+  const claim = await q(`UPDATE matches SET rain_used=TRUE WHERE id=$1 AND rain_used IS NOT TRUE RETURNING id`, [m.id]);
+  if (!claim.rowCount) return;
+  const groupId = Number(m.group_chat_id);
+  clearTurnClock(m.id);
+  await telegram.sendMessage(groupId, `🌧 *${fancy('RAIN IS COMING')}*\n> Play is stopped for *5 seconds*...`, { parse_mode: 'Markdown' });
+  await sleep(5000);
+  const newTotal = Math.max(done + 1, Math.round(total * 0.7));
+  let msg = `🌦 *${fancy('PLAY RESUMES')}*\n> Overs reduced: *${total}* → *${newTotal}*\n`;
+  if (inn2.innings_number === 1) {
+    await q(`UPDATE matches SET total_overs=$2 WHERE id=$1`, [m.id, newTotal]);
+    msg += `> Both teams now play *${newTotal} overs*.`;
+  } else {
+    const s1 = Number(m.target) - 1;
+    const uBefore = total - inn2.balls_bowled / 6;
+    const uAfter = newTotal - inn2.balls_bowled / 6;
+    const w = Number(inn2.total_wickets) || 0;
+    const lost = dlsRes(uBefore, w, total) - dlsRes(uAfter, w, total);
+    const r2 = Math.max(10, 100 - lost);
+    const newTarget = Math.max(inn2.total_runs + 1, Math.floor((s1 * r2) / 100) + 1);
+    await q(`UPDATE matches SET total_overs=$2, target=$3 WHERE id=$1`, [m.id, newTotal, newTarget]);
+    const ballsLeft = newTotal * 6 - inn2.balls_bowled;
+    msg += `> 📐 *DLS target: ${newTarget}* (was ${m.target})\n> Team ${inn2.batting_team} needs *${Math.max(0, newTarget - inn2.total_runs)}* from *${ballsLeft}* balls.`;
+  }
+  await telegram.sendMessage(groupId, msg, { parse_mode: 'Markdown' });
+}
 
 // ─── Launch ──────────────────────────────────────────────
 async function main() {
