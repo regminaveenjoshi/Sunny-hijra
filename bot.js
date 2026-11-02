@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r62-2026-11-02-changehost-changecap'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r63-2026-11-02-rain-cancel'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 // /Store, /SHOP, /Bat … → the command word is read in lower case
@@ -11798,7 +11798,7 @@ bot.action(/^rn:(Y|N):(.+)$/, async (ctx) => {
     await editCard(ctx, `🌧 *RAIN MODE VOTE*\nVotes: *0/${need}*\nPlayers of this match: tap *Vote*.`).catch(() => {});
     const sent = await ctx.telegram.sendMessage(Number(m.group_chat_id), `🌧 *RAIN MODE VOTE*\n${need} votes from joined players needed.\nVotes: *0/${need}*`, {
       parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([[btn('𝗩𝗢𝗧𝗘', `rv:${m.id}`, 'people', 'primary')]]),
+      ...Markup.inlineKeyboard([[btn('𝗩𝗢𝗧𝗘', `rv:${m.id}`, 'people', 'primary'), btn('𝗖𝗔𝗡𝗖𝗘𝗟', `rx:${m.id}`, 'no', 'danger')]]),
     });
     v.msgId = sent.message_id;
     v.timer = setTimeout(async () => {
@@ -11808,6 +11808,21 @@ bot.action(/^rn:(Y|N):(.+)$/, async (ctx) => {
     }, 3 * 60 * 1000);
   } catch (e) {
     console.error('rain answer:', e.message);
+  }
+});
+// Cancel button on the rain vote: host (or admin) turns the vote off
+bot.action(/^rx:(.+)$/, async (ctx) => {
+  try {
+    const m = await getMatch(ctx.match[1]);
+    const v = rainVotes.get(String(ctx.match[1]));
+    if (!m || !v) return ctx.answerCbQuery('Voting is closed', { show_alert: true });
+    if (Number(m.host_telegram_id) !== ctx.from.id && !isAdmin(ctx.from.id)) return ctx.answerCbQuery('Only the host can cancel', { show_alert: true });
+    clearTimeout(v.timer);
+    rainVotes.delete(String(m.id));
+    await ctx.answerCbQuery('Cancelled').catch(() => {});
+    await editCard(ctx, '☀️ Rain mode vote cancelled. Rain mode is *off*.').catch(() => {});
+  } catch (e) {
+    console.error('rain cancel:', e.message);
   }
 });
 bot.action(/^rv:(.+)$/, async (ctx) => {
@@ -11825,7 +11840,7 @@ bot.action(/^rv:(.+)$/, async (ctx) => {
       await q(`UPDATE matches SET rain_mode=TRUE WHERE id=$1`, [m.id]);
       return editCard(ctx, `🌧 *RAIN MODE IS ON*\nRain may arrive at any time: overs will be cut and the target set by DLS.`);
     }
-    await editCard(ctx, `🌧 *RAIN MODE VOTE*\nVotes: *${v.voters.size}/${v.need}*`, Markup.inlineKeyboard([[btn('𝗩𝗢𝗧𝗘', `rv:${m.id}`, 'people', 'primary')]])).catch(() => {});
+    await editCard(ctx, `🌧 *RAIN MODE VOTE*\nVotes: *${v.voters.size}/${v.need}*`, Markup.inlineKeyboard([[btn('𝗩𝗢𝗧𝗘', `rv:${m.id}`, 'people', 'primary'), btn('𝗖𝗔𝗡𝗖𝗘𝗟', `rx:${m.id}`, 'no', 'danger')]])).catch(() => {});
   } catch (e) {
     console.error('rain vote:', e.message);
   }
