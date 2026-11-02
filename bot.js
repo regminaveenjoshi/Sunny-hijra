@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r64-2026-11-02-lb-design'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r65-2026-11-02-lb-gc-emojis'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 // /Store, /SHOP, /Bat … → the command word is read in lower case
@@ -182,7 +182,8 @@ const PE = {
   mega:     { id: '5271983638995545748', fb: '📢' }, // megaphone
   door:     { id: '6035130900075777681', fb: '🚪' }, // leave / exit
   list:     { id: '5233658378797994515', fb: '📋' }, // clipboard
-  shield:   { id: '5348129380474306311', fb: '🛡' }, // shield with check
+  shield:   { id: '5253669400229220437', fb: '🛡' }, // shield
+  refresh:  { id: '6030517456659814017', fb: '🔄' }, // refresh
   game:     { id: '5938413566624272793', fb: '🎮' }, // controller
   game2:    { id: '5319120041780726017', fb: '🎮' }, // controller alt
   target:   { id: '5782962967716829279', fb: '🎯' }, // target
@@ -353,7 +354,7 @@ const PREMIUM_EMOJI = {
   '📢': '5271983638995545748', '📌': '5271983638995545748', // announce
   '🚪': '6035130900075777681', // leave
   '📋': '5233658378797994515', // list
-  '🛡': '5348129380474306311', // shield
+  '🛡': '5253669400229220437', // shield
   '🎮': '5938413566624272793', // game
   '🎯': '5782962967716829279', // target
   '⚠': '6271786398404055377', // warning
@@ -378,6 +379,13 @@ const PREMIUM_EMOJI = {
   '🔕': '6021313238665271979', // mute
   '♀': '5877555731170856986', // female badge (after player names)
   '♂': '6095758825929840339', // male badge (after player names)
+  '💯': '6071345441545393785', // 100
+  '💠': '5195316862149214021', // 50
+  '📣': '5197304993920616826', '🔄': '6030517456659814017', '🗳': '5359741159566484212',
+  '🌧': '5283243028905994049', '☀': '5206659381151680254', '🎩': '6089182711308622162',
+  '🔒': '5231245436106318447', '🎉': '5193209274452425995', '🎊': '6298535785436022911',
+  '🔔': '5242628160297641831', '🛑': '5472379060610961186', '🧢': '5859387370968714964',
+  '🎙': '6240038021626862152', '⌛': '5451646226975955576',
 };
 const PREMIUM_RE_SRC = Object.keys(PREMIUM_EMOJI)
   .sort((x, y) => y.length - x.length)
@@ -7618,7 +7626,7 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
     } else if (hitBatMs === 50) {
       gifKeys.push('50');
       notes.push(
-        `${pe('spark','🌟')} <b>${fancy('FIFTY')}!</b>\n` +
+        `${pe('spark','💠')} <b>${fancy('FIFTY')}!</b>\n` +
           `${pe('ok','🎊')} Congratulations ${disp(strikerP)} — hit the <b>50!</b>`
       );
       // FIFTY video (pauses for 3s with the batsman's numbers) - rendered in the background, the game does not wait
@@ -9698,17 +9706,21 @@ const LBX = {
   matches: { t: 'MOST MATCHES', ic: '🎮', pe: 'game2', btn: 'MATCHES' },
   ducks: { t: 'MOST DUCKS', ic: '🦆', pe: 'rdot', btn: 'DUCKS' },
   hundreds: { t: 'MOST 100S', ic: '💯', pe: 'six', btn: '100s' },
-  fifties: { t: 'MOST 50S', ic: '🏅', pe: 'target', btn: '50s' },
+  fifties: { t: 'MOST 50S', ic: '💠', pe: 'target', btn: '50s' },
   hattricks: { t: 'MOST HAT-TRICKS', ic: '👑', pe: 'crown', btn: 'HAT-TRICKS' },
   potm: { t: 'MOST PLAYER OF THE MATCH', ic: '🌟', pe: 'star', btn: 'POTM' },
 };
 const LB_ORDER = ['overall', 'today', 'streak', 'wealthy', 'runs', 'wkts', 'matches', 'ducks', 'hundreds', 'fifties', 'hattricks', 'potm'];
-let lbCache = { at: 0, data: null, busy: null };
-async function lbData() {
+const lbCaches = new Map();
+async function lbData(gid = null) {
+  const ck = gid ? String(Number(gid)) : 'g';
+  let lbCache = lbCaches.get(ck);
+  if (!lbCache) { lbCache = { at: 0, data: null, busy: null }; lbCaches.set(ck, lbCache); }
+  const G = gid ? ` AND m.group_chat_id=${Number(gid)}` : '';
   if (lbCache.data && Date.now() - lbCache.at < 120000) return lbCache.data;
   if (lbCache.busy) return lbCache.busy;
   lbCache.busy = (async () => {
-    const J = `JOIN match_players mp ON mp.id=%s JOIN innings i ON i.id=%s.innings_id JOIN matches m ON m.id=i.match_id WHERE m.status='completed' AND mp.telegram_id>0`;
+    const J = `JOIN match_players mp ON mp.id=%s JOIN innings i ON i.id=%s.innings_id JOIN matches m ON m.id=i.match_id WHERE m.status='completed' AND mp.telegram_id>0${G}`;
     const safe = async (sql) => { try { return (await q(sql)).rows; } catch (e) { console.error('lb sql:', e.message); return []; } };
     const [bat, bowl, mt, aw, coins, hat, st] = await Promise.all([
       safe(`SELECT mp.telegram_id AS id, SUM(bs.runs)::int AS runs, COUNT(*) FILTER (WHERE bs.is_out AND COALESCE(bs.runs,0)=0)::int AS ducks,
@@ -9717,18 +9729,18 @@ async function lbData() {
       safe(`SELECT mp.telegram_id AS id, SUM(w.wickets)::int AS wkts FROM bowling_stats w ${J.replace('%s', 'w.player_id').replace('%s', 'w')} GROUP BY mp.telegram_id`),
       safe(`SELECT mp.telegram_id AS id, COUNT(DISTINCT m.id)::int AS mt,
                    COUNT(DISTINCT m.id) FILTER (WHERE (m.created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date)::int AS today
-              FROM match_players mp JOIN matches m ON m.id=mp.match_id WHERE m.status='completed' AND mp.telegram_id>0 GROUP BY mp.telegram_id`),
-      safe(`SELECT telegram_id AS id, COUNT(*)::int AS potm FROM match_awards WHERE kind='motm' AND telegram_id>0 GROUP BY telegram_id`),
+              FROM match_players mp JOIN matches m ON m.id=mp.match_id WHERE m.status='completed' AND mp.telegram_id>0${G} GROUP BY mp.telegram_id`),
+      safe(`SELECT a.telegram_id AS id, COUNT(*)::int AS potm FROM match_awards a JOIN matches m ON m.id::text=a.match_id WHERE a.kind='motm' AND a.telegram_id>0${G} GROUP BY a.telegram_id`),
       safe(`SELECT telegram_id AS id, coins::bigint AS coins FROM wallets WHERE telegram_id>0`),
       safe(`WITH d AS (SELECT dl.innings_id, dl.bowler_id, dl.is_wicket::text AS wk, ROW_NUMBER() OVER (PARTITION BY dl.innings_id ORDER BY dl.over_number, dl.ball_number) AS rn
-                         FROM deliveries dl JOIN innings i ON i.id=dl.innings_id JOIN matches m ON m.id=i.match_id WHERE m.status='completed')
+                         FROM deliveries dl JOIN innings i ON i.id=dl.innings_id JOIN matches m ON m.id=i.match_id WHERE m.status='completed'${G})
             SELECT mp.telegram_id AS id, COUNT(*)::int AS hat FROM d a
               JOIN d b ON b.innings_id=a.innings_id AND b.rn=a.rn+1 JOIN d c ON c.innings_id=a.innings_id AND c.rn=a.rn+2
               JOIN match_players mp ON mp.id=a.bowler_id
              WHERE a.wk IN ('t','true','1') AND b.wk IN ('t','true','1') AND c.wk IN ('t','true','1') AND a.bowler_id=b.bowler_id AND b.bowler_id=c.bowler_id AND mp.telegram_id>0
              GROUP BY mp.telegram_id`),
       safe(`SELECT mp.telegram_id AS id, (me.r > opp.r) AS win
-              FROM match_players mp JOIN matches m ON m.id=mp.match_id AND m.status='completed' AND m.mode<>'solo'
+              FROM match_players mp JOIN matches m ON m.id=mp.match_id AND m.status='completed' AND m.mode<>'solo'${G}
               JOIN LATERAL (SELECT COALESCE(SUM(i.total_runs),0) AS r FROM innings i WHERE i.match_id=m.id AND i.batting_team=mp.team_label) me ON true
               JOIN LATERAL (SELECT COALESCE(SUM(i.total_runs),0) AS r FROM innings i WHERE i.match_id=m.id AND i.batting_team<>mp.team_label) opp ON true
              WHERE mp.telegram_id>0 ORDER BY mp.telegram_id, m.id`),
@@ -9751,7 +9763,7 @@ async function lbData() {
       today: (x) => x.today, streak: (x) => x.streak, wealthy: (x) => x.coins, runs: (x) => x.runs, wkts: (x) => x.wkts, matches: (x) => x.mt,
       ducks: (x) => x.ducks, hundreds: (x) => x.hundreds, fifties: (x) => x.fifties, hattricks: (x) => x.hat, potm: (x) => x.potm,
     };
-    const players = [...U.entries()].filter(([, x]) => x.mt > 0 || x.coins > 0);
+    const players = [...U.entries()].filter(([, x]) => x.mt > 0 || (!gid && x.coins > 0));
     const out = {};
     for (const cat of LB_ORDER) {
       const arr = players.map(([id, x]) => ({ id, v: val[cat](x) })).filter((r) => r.v > 0).sort((a, b) => b.v - a.v);
@@ -9765,10 +9777,14 @@ async function lbData() {
   })().finally(() => { lbCache.busy = null; });
   return lbCache.busy;
 }
-function lbKbX(cat, uid) {
-  const b = (c) => btn(fancy(LBX[c].btn), `lbn:${c}:${cat}:${uid}`, LBX[c].pe, c === cat ? 'success' : 'primary');
+function lbKbX(cat, uid, scope = 'g', inGroup = false) {
+  const sc = scope === 'c' ? 'c' : 'g';
+  const b = (c) => btn(fancy(LBX[c].btn), `lbn:${c}:${cat}:${uid}:${sc}`, LBX[c].pe, c === cat ? 'success' : 'primary');
   return Markup.inlineKeyboard([
-    [btn(fancy('NEXT'), `lbn:next:${cat}:${uid}`, 'point', 'primary')],
+    ...(inGroup
+      ? [[btn(fancy('GLOBAL'), `lbn:${cat}:${cat}:${uid}:g`, 'people', sc === 'g' ? 'success' : 'primary'), btn(fancy('THIS GC'), `lbn:${cat}:${cat}:${uid}:c`, 'flag', sc === 'c' ? 'success' : 'primary')]]
+      : []),
+    [btn(fancy('NEXT'), `lbn:next:${cat}:${uid}:${sc}`, 'point', 'primary')],
     [b('today')],
     [b('streak'), b('wealthy')],
     [b('runs'), b('wkts')],
@@ -9778,8 +9794,8 @@ function lbKbX(cat, uid) {
     [b('overall')],
   ]);
 }
-async function lbTextX(cat, from) {
-  const D = (await lbData())[cat];
+async function lbTextX(cat, from, gid = null) {
+  const D = (await lbData(gid))[cat];
   const X = LBX[cat];
   const fmt = X.fmt || ((v) => String(Math.round(Number(v))));
   const ids = D.top.map((r) => r.id);
@@ -9787,7 +9803,7 @@ async function lbTextX(cat, from) {
   const um = new Map(us.map((x) => [Number(x.telegram_id), x]));
   const me = D.rank.get(Number(from.id));
   const myName = escapeHtml(shortName({ telegram_id: from.id, username: from.username, first_name: from.first_name, last_name: from.last_name }, 22).replace(/[♂♀]️?/g, '').trim());
-  let t = `${X.ic} <b>${X.t}</b>\n<i>Top ${D.top.length} of ${D.total} players</i>\n\n`;
+  let t = `${X.ic} <b>${X.t}</b>\n<i>${gid ? 'This group · ' : ''}Top ${D.top.length} of ${D.total} players</i>\n\n`;
   if (!D.top.length) return t + '<i>No data yet. Play some matches!</i>';
   const MED = ['🥇', '🥈', '🥉'];
   D.top.forEach((r, i) => {
@@ -9801,11 +9817,14 @@ async function lbTextX(cat, from) {
   t += `\n🎯 <a href="tg://user?id=${from.id}">${myName}</a> · <b>${me ? '#' + me : '–'}</b> of ${D.total}\n<code>${'▰'.repeat(filled)}${'▱'.repeat(10 - filled)}</code>${me ? ' Top ' + Math.max(1, Math.round((me / D.total) * 100)) + '%' : ''}`;
   return t;
 }
-async function showLbX(ctx, cat, uid) {
+async function showLbX(ctx, cat, uid, scope = 'g') {
+  const inGroup = !!(ctx.chat && ctx.chat.type !== 'private');
+  const gid = scope === 'c' && inGroup ? ctx.chat.id : null;
+  if (!gid) scope = 'g';
   if (!LBX[cat]) cat = 'overall';
   const from = ctx.callbackQuery ? ctx.from : ctx.from;
-  const text = await lbTextX(cat, from);
-  const kb = lbKbX(cat, uid);
+  const text = await lbTextX(cat, from, gid);
+  const kb = lbKbX(cat, uid, scope, inGroup);
   const cq = ctx.callbackQuery;
   if (cq && cq.message && !cq.message.photo) {
     try { return await ctx.editMessageText(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...kb }); }
@@ -9816,14 +9835,14 @@ async function showLbX(ctx, cat, uid) {
     ...(ctx.message ? { reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true } : {}),
   });
 }
-bot.action(/^lbn:(\w+):(\w+):(\d+)$/, async (ctx) => {
+bot.action(/^lbn:(\w+):(\w+):(\d+)(?::([gc]))?$/, async (ctx) => {
   try {
     const uid = Number(ctx.match[3]);
     if (ctx.from.id !== uid) return ctx.answerCbQuery('This is not your leaderboard - send /lb', { show_alert: true });
     await ctx.answerCbQuery().catch(() => {});
     let cat = ctx.match[1];
     if (cat === 'next') cat = LB_ORDER[(Math.max(0, LB_ORDER.indexOf(ctx.match[2])) + 1) % LB_ORDER.length];
-    await showLbX(ctx, cat, uid);
+    await showLbX(ctx, cat, uid, ctx.match[4] || 'g');
   } catch (e) { console.error('lbn:', e.message); }
 });
 async function sendLbMenu(ctx) {
