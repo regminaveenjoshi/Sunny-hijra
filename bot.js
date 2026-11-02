@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r63-2026-11-02-rain-cancel'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r64-2026-11-02-lb-design'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 // /Store, /SHOP, /Bat … → the command word is read in lower case
@@ -9785,18 +9785,21 @@ async function lbTextX(cat, from) {
   const ids = D.top.map((r) => r.id);
   const { rows: us } = ids.length ? await q(`SELECT telegram_id, username, first_name, last_name FROM users WHERE telegram_id = ANY($1::bigint[])`, [ids]) : { rows: [] };
   const um = new Map(us.map((x) => [Number(x.telegram_id), x]));
-  const dash = '-------------✦-------------';
   const me = D.rank.get(Number(from.id));
   const myName = escapeHtml(shortName({ telegram_id: from.id, username: from.username, first_name: from.first_name, last_name: from.last_name }, 22).replace(/[♂♀]️?/g, '').trim());
-  let t = `<code>${dash}</code>\n${X.ic} ${X.t}\n\n👤 <a href="tg://user?id=${from.id}">${myName}</a> — <b>${me ? '#' + me : '–'}/${D.total}</b>\n<code>${dash}</code>\n\n`;
+  let t = `${X.ic} <b>${X.t}</b>\n<i>Top ${D.top.length} of ${D.total} players</i>\n\n`;
   if (!D.top.length) return t + '<i>No data yet. Play some matches!</i>';
   const MED = ['🥇', '🥈', '🥉'];
   D.top.forEach((r, i) => {
     const uu = um.get(r.id) || { telegram_id: r.id };
     const nm = escapeHtml(shortName({ ...uu, telegram_id: r.id }, 20).replace(/[♂♀]️?/g, '').trim());
-    t += `<blockquote>${MED[i] || `${i + 1}.`} <b>${nm}</b> — ${fmt(r.v)} ${X.ic}</blockquote>\n`;
+    if (i < 3) t += `<blockquote>${MED[i]} <b>${nm}</b>\n┗ ${X.ic} <b>${fmt(r.v)}</b></blockquote>\n`;
+    else t += `<blockquote>${String(i + 1).padStart(2, '0')} ▸ ${nm} · <b>${fmt(r.v)}</b></blockquote>\n`;
   });
-  return t + `<code>────────────────────</code>`;
+  const pct = me ? Math.max(0, 1 - (me - 1) / Math.max(1, D.total)) : 0;
+  const filled = Math.round(pct * 10);
+  t += `\n🎯 <a href="tg://user?id=${from.id}">${myName}</a> · <b>${me ? '#' + me : '–'}</b> of ${D.total}\n<code>${'▰'.repeat(filled)}${'▱'.repeat(10 - filled)}</code>${me ? ' Top ' + Math.max(1, Math.round((me / D.total) * 100)) + '%' : ''}`;
+  return t;
 }
 async function showLbX(ctx, cat, uid) {
   if (!LBX[cat]) cat = 'overall';
