@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r74-2026-11-03-tag-msg-each'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r75-2026-11-03-tag-scan'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 // /Store, /SHOP, /Bat … → the command word is read in lower case
@@ -2793,7 +2793,7 @@ async function isHatTrickBall(inn) {
   );
   return (
     rows.length === 2 &&
-    rows.every((r) => r.bowler_id === inn.current_bowler_id && (r.is_wicket === true || r.is_wicket === 1 || r.is_wicket === 't'))
+    rows.every((r) => Number(r.bowler_id) === Number(inn.current_bowler_id) && (r.is_wicket === true || r.is_wicket === 1 || r.is_wicket === 't'))
   );
 }
 
@@ -12657,6 +12657,7 @@ const TAG_ACTIVE_MIN = 60; // "active" = sent a message in this group within the
 const TAG_EMOJIS = ['🔥', '⚡', '🏏', '💎', '👑', '🎯', '🚀', '🌟', '🦁', '🐉', '🏆', '💥', '🎲', '🧿', '🌈', '🍀', '🎉', '💫', '🦅', '🐯'];
 const seenThrottle = new Map();
 const tagRuns = new Map();
+const tagSync = new Set();
 async function initTagSeen() {
   await q(`CREATE TABLE IF NOT EXISTS group_seen (chat_id BIGINT NOT NULL, user_id BIGINT NOT NULL, last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (chat_id, user_id))`);
   await q(`INSERT INTO group_seen (chat_id, user_id, last_seen)
@@ -12671,9 +12672,34 @@ function trackSeen(ctx) {
     if (now - (seenThrottle.get(k) || 0) < 45000) return;
     seenThrottle.set(k, now);
     q(`INSERT INTO group_seen (chat_id, user_id, last_seen) VALUES ($1,$2,NOW()) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_seen=NOW()`, [c.id, u.id]).catch(() => {});
+    const nm = ctx.message && ctx.message.new_chat_members;
+    if (nm) nm.filter((x) => !x.is_bot).forEach((x) => q(`INSERT INTO group_seen (chat_id, user_id, last_seen) VALUES ($1,$2,NOW()) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_seen=NOW()`, [c.id, x.id]).catch(() => {}));
     const left = ctx.message && ctx.message.left_chat_member;
     if (left) q(`DELETE FROM group_seen WHERE chat_id=$1 AND user_id=$2`, [c.id, left.id]).catch(() => {});
   } catch (_) {}
+}
+const tagNon = new Map(); // chat id -> Set of users already checked and not in the group
+async function syncMembers(ctx) {
+  // the Bot API has no member list: check every user who ever used the bot, keep the ones who are in this group
+  const chat = ctx.chat.id;
+  const non = tagNon.get(chat) || new Set(); tagNon.set(chat, non);
+  const { rows } = await q(`SELECT u.telegram_id FROM users u WHERE u.telegram_id > 0 AND NOT EXISTS (SELECT 1 FROM group_seen g WHERE g.chat_id=$1 AND g.user_id=u.telegram_id) ORDER BY u.telegram_id DESC LIMIT 6000`, [chat]);
+  const todo = rows.map((r) => Number(r.telegram_id)).filter((id) => !non.has(id));
+  if (!todo.length) return 0;
+  let found = 0;
+  for (let i = 0; i < todo.length; i += 20) {
+    await Promise.all(todo.slice(i, i + 20).map(async (id) => {
+      try {
+        const m = await ctx.telegram.getChatMember(chat, id);
+        if (['creator', 'administrator', 'member', 'restricted'].includes(m.status) && !(m.status === 'restricted' && m.is_member === false)) {
+          found++;
+          await q(`INSERT INTO group_seen (chat_id, user_id, last_seen) VALUES ($1,$2,'2000-01-01') ON CONFLICT DO NOTHING`, [chat, id]);
+        } else non.add(id);
+      } catch (_) { non.add(id); }
+    }));
+    await new Promise((r) => setTimeout(r, 700));
+  }
+  return found;
 }
 async function runTag(ctx, activeOnly) {
   if (!isGroup(ctx)) return ctx.reply('Use this command in a group.');
@@ -12684,6 +12710,15 @@ async function runTag(ctx, activeOnly) {
   const body = raw.slice(shift).replace(/\s+$/, '');
   const ents = (ctx.message.entities || []).filter((e) => e.offset >= shift && e.type !== 'bot_command' && e.offset - shift + e.length <= body.length)
     .slice(0, 50).map((e) => ({ ...e, offset: e.offset - shift }));
+  if (!activeOnly) {
+    if (tagSync.has(ctx.chat.id)) return ctx.reply('Member scan is still running, try again in a minute.', trep(ctx));
+    tagSync.add(ctx.chat.id);
+    try {
+      const need = (await q(`SELECT COUNT(*)::int AS c FROM users`)).rows[0].c;
+      if (need > 300 && !(tagNon.get(ctx.chat.id) || { size: 0 }).size) await ctx.reply('Scanning members for the first time, this takes a little while...', trep(ctx));
+      await syncMembers(ctx);
+    } catch (e) { console.error('syncMembers:', e.message); } finally { tagSync.delete(ctx.chat.id); }
+  }
   const ids = new Set();
   const { rows } = await q(
     activeOnly
