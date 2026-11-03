@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r73-2026-11-03-tag-seq-stop'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r74-2026-11-03-tag-msg-each'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 // /Store, /SHOP, /Bat … → the command word is read in lower case
@@ -12694,7 +12694,7 @@ async function runTag(ctx, activeOnly) {
   ids.delete(ctx.from.id);
   if (!ids.size) return ctx.reply(activeOnly ? `Nobody else was active in the last ${TAG_ACTIVE_MIN} minutes.` : 'I have not seen any members here yet. They will be tagged once they send a message.', trep(ctx));
   const list = [...ids];
-  const PER = 5, GAP = 3000; // 5 emojis per message, one message after another (group limit is ~20 msgs/min)
+  const PER = 5, GAP = 1000; // 5 emojis per message, one message after another
   const key = String(ctx.chat.id);
   if (tagRuns.has(key)) return ctx.reply('A tag is already running. Send /stop to stop it.', trep(ctx));
   const run = { stop: false };
@@ -12703,8 +12703,8 @@ async function runTag(ctx, activeOnly) {
   try {
     while (i < list.length && !run.stop) {
       const part = list.slice(i, i + PER); i += PER;
-      let text = first ? (body ? body + '\n\n' : '') : '';
-      const es = first ? ents.slice() : [];
+      let text = body ? body + '\n\n' : '';
+      const es = ents.slice();
       part.forEach((uid, k) => {
         const em = TAG_EMOJIS[(n++) % TAG_EMOJIS.length];
         es.push({ type: 'text_mention', offset: text.length, length: em.length, user: { id: uid } });
@@ -12713,7 +12713,10 @@ async function runTag(ctx, activeOnly) {
       const opt = { entities: es, disable_web_page_preview: true };
       if (first) { opt.reply_to_message_id = ctx.message.message_id; opt.allow_sending_without_reply = true; }
       first = false;
-      await ctx.telegram.sendMessage(ctx.chat.id, text, opt).then(() => { sentCount += part.length; }).catch((e) => console.error('tag:', e.message));
+      for (let tryN = 0; tryN < 3; tryN++) {
+        try { await ctx.telegram.sendMessage(ctx.chat.id, text, opt); sentCount += part.length; break; }
+        catch (e) { const ra = e && e.response && e.response.parameters && e.response.parameters.retry_after; if (ra && tryN < 2) { await new Promise((r) => setTimeout(r, (ra + 1) * 1000)); continue; } console.error('tag:', e.message); break; }
+      }
       if (i < list.length && !run.stop) await new Promise((r) => setTimeout(r, GAP));
     }
   } finally { tagRuns.delete(key); }
