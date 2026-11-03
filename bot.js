@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r75-2026-11-03-tag-scan'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r76-2026-11-03-hat-owner-host'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 // /Store, /SHOP, /Bat … → the command word is read in lower case
@@ -2507,6 +2507,9 @@ const PGIF_LABELS = {
 };
 
 async function canConfigurePgif(ctx) {
+  return !!(ctx.from && isAdmin(ctx.from.id)); // GIF settings: bot owner only
+}
+async function canConfigurePgifOld(ctx) {
   const ids = [process.env.BOT_OWNER_ID, '7807828008', '7047624013', ...(process.env.ADMIN_IDS || '').split(',')]
     .map((v) => Number(String(v || '').trim())).filter((n) => Number.isSafeInteger(n) && n > 0);
   if (ctx.from && ids.includes(ctx.from.id)) return true;
@@ -2786,15 +2789,22 @@ function spamFreeOn(m) {
 }
 
 // Hat-trick ball: the current bowler took wickets with his previous two deliveries
-async function isHatTrickBall(inn) {
+async function isHatTrickBall(inn, bowlerTg) {
+  // true when the last two deliveries of this innings were both wickets by the bowler who is bowling the next ball
   const { rows } = await q(
-    `SELECT bowler_id, is_wicket FROM deliveries WHERE innings_id=$1 ORDER BY over_number DESC, ball_number DESC LIMIT 2`,
+    `SELECT d.bowler_id, d.is_wicket, d.bat_number, d.bowl_number, mp.telegram_id AS btg
+       FROM deliveries d LEFT JOIN match_players mp ON mp.id = d.bowler_id
+      WHERE d.innings_id=$1 ORDER BY d.over_number DESC, d.ball_number DESC, d.id DESC LIMIT 2`,
     [inn.id]
   );
-  return (
-    rows.length === 2 &&
-    rows.every((r) => Number(r.bowler_id) === Number(inn.current_bowler_id) && (r.is_wicket === true || r.is_wicket === 1 || r.is_wicket === 't'))
-  );
+  if (rows.length < 2) return false;
+  let tg = bowlerTg ? Number(bowlerTg) : 0;
+  if (!tg && inn.current_bowler_id) {
+    const r = await q(`SELECT telegram_id FROM match_players WHERE id=$1`, [inn.current_bowler_id]);
+    tg = r.rows[0] ? Number(r.rows[0].telegram_id) : 0;
+  }
+  const wk = (r) => r.is_wicket === true || r.is_wicket === 1 || r.is_wicket === 't' || r.is_wicket === 'true';
+  return rows.every((r) => wk(r) && (Number(r.bowler_id) === Number(inn.current_bowler_id) || (tg && Number(r.btg) === tg)));
 }
 
 // Spam-free: the bowler may not send the same number three times in a row
@@ -6049,9 +6059,11 @@ bot.command(['changehost', 'votehost'], async (ctx) => {
       const targets = parseAddTargets(ctx);
       if (targets.length) {
         const info = await resolveTarget(ctx, targets[0]);
-        const np = info ? await getPlayerByTg(m.id, info.id) : null;
-        if (!np) return ctx.reply('❌ That user is not a player of this match');
+        if (!info) return ctx.reply('❌ User not found. Reply to them or use @username / id.');
+        const np = { telegram_id: info.id, id: info.id, first_name: info.first_name, last_name: info.last_name, username: info.username };
+        if (info.is_bot) return ctx.reply('❌ A bot cannot be the host');
         if (Number(np.telegram_id) === ctx.from.id) return ctx.reply('ℹ️ You are already the host');
+        try { await upsertUser({ id: info.id, first_name: info.first_name, last_name: info.last_name, username: info.username }); } catch (_) {}
         await q(`UPDATE matches SET host_telegram_id=$2 WHERE id=$1`, [m.id, np.telegram_id]);
         const lob0 = lobbies.get(m.id);
         if (lob0) lob0.hostId = Number(np.telegram_id);
@@ -6156,7 +6168,6 @@ bot.action(/^hc:(.+)$/, async (ctx) => {
     if (!m || !v || v.phase !== 'claim')
       return ctx.answerCbQuery('This vote is not active', { show_alert: true });
     const p = await getPlayerByTg(m.id, ctx.from.id);
-    if (!p) return ctx.answerCbQuery('Only players of this match can become host', { show_alert: true });
     if (Number(m.host_telegram_id) === ctx.from.id)
       return ctx.answerCbQuery('You are already the host', { show_alert: true });
 
@@ -6210,7 +6221,7 @@ bot.hears(/^[0-6]$/, async (ctx) => {
     if (!striker || Number(striker.telegram_id) !== ctx.from.id) return;
 
     // hat-trick ball: a dot (0) is not allowed
-    if (num === 0 && (await isHatTrickBall(inn))) {
+    if (num === 0 && (await isHatTrickBall(inn, pend.bowler_telegram_id))) {
       await ctx.telegram.sendMessage(
         ctx.chat.id,
         `🎩 ${htag(striker)} — <b>0 is not allowed on a hat-trick ball!</b>\nType a number from <b>1–6</b>.`,
@@ -9259,7 +9270,7 @@ function registerGifSet(pre, c, label) {
     `${label} GIFs — reply to a GIF with:\n/${c}gif <key>\n\n` +
     `Keys: 0 1 2 3 4 5 6 · out · dugout · stance · runup · batentry · bowlentry · starter · opener · toss · 50 · 100 · 150 · 200 · 3w · 5fer · hatrick · motm\n\n` +
     `Remove: /rm${c}gif <key>   (or /${c}gif remove <key>)\nShow all: /show${c}gif\nList: /${c}giflist`;
-  const deny = '❌ Only a group admin or the bot owner can do this.';
+  const deny = '❌ Only the bot owner can do this.';
 
   async function removeKey(ctx, raw) {
     const key = keyOf(raw);
