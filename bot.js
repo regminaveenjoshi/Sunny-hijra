@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r71-2026-11-03-dragon3d-trophies'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r73-2026-11-03-tag-seq-stop'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 // /Store, /SHOP, /Bat … → the command word is read in lower case
@@ -54,6 +54,8 @@ bot.use(async (ctx, next) => {
   } catch (_) {}
   return next();
 });
+
+bot.use((ctx, next) => { try { trackSeen(ctx); } catch (_) {} return next(); });
 
 // per-command cooldown (spam control): a command can be reused only after 10s.
 // Exempt: host, team captains, striker / non-striker / bowler of the running match, bot admins.
@@ -2387,6 +2389,7 @@ async function sendMatchBanner(telegram, groupId, m, extraCaption = '') {
 // ─── /start ──────────────────────────────────────────────
 bot.start(async (ctx) => {
   await upsertUser(ctx.from);
+  try { await refJoin(ctx); } catch (e) { console.error('ref:', e.message); }
   // a bowler who had not started the bot yet: deliver the number request now
   if (ctx.chat && ctx.chat.type === 'private') {
     try {
@@ -9610,16 +9613,6 @@ bot.command(['wallet', 'balance', 'coins', 'purse'], async (ctx) => {
     allow_sending_without_reply: true,
   });
 });
-bot.command('daily', async (ctx) => {
-  await walletOf(ctx.from.id);
-  const { rows } = await q(
-    `UPDATE wallets SET coins = coins + $2, last_daily = NOW(), updated_at = NOW()
-      WHERE telegram_id=$1 AND (last_daily IS NULL OR last_daily < NOW() - INTERVAL '24 hours') RETURNING coins`,
-    [ctx.from.id, DAILY_COINS]
-  );
-  if (!rows.length) return ctx.reply('⏳ Daily bonus already claimed. Come back in 24 hours.', { reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true });
-  return ctx.reply(`🎁 *DAILY BONUS* — ${mtag(ctx.from)} +${DAILY_COINS} 🪙\n> Balance: *${fmtCoins(rows[0].coins)}*`, { parse_mode: 'Markdown', reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true });
-});
 bot.command('bets', async (ctx) => {
   if (!isGroup(ctx)) return ctx.reply('❌ Use this in the match group.');
   const m = await getActiveMatch(ctx.chat.id);
@@ -12267,6 +12260,475 @@ function startMiniApp() {
   srv.listen(MINI_PORT, '127.0.0.1', () => console.log(`Mini app on http://127.0.0.1:${MINI_PORT}`));
 }
 
+
+// ═════════════ r72: daily streak, referrals, weekly board, tournaments + auction ═════════════
+const REF_REWARD = 300; // coins for the inviter when the friend finishes a first match
+const REF_BONUS = 100; // coins for the friend
+const REF_MAX = 30; // rewarded invites per player
+const WEEK_PRIZES = [1000, 600, 300];
+const STREAK_DAYS = 7;
+const STREAK_BONUS = 400;
+const AUC_SECONDS = 15; // every player is sold automatically after 15s without a higher bid
+const AUC_GAP_MS = 3500;
+const rDm = (id, text, extra = {}) => bot.telegram.sendMessage(id, text, { parse_mode: 'HTML', ...extra }).catch(() => {});
+
+async function kvGet(k) { const { rows } = await q(`SELECT v FROM kv WHERE k=$1`, [k]); return rows[0] ? rows[0].v : null; }
+async function kvSet(k, v) { await q(`INSERT INTO kv (k, v) VALUES ($1,$2) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [k, String(v)]); }
+
+async function initR72() {
+  await q(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS streak INT NOT NULL DEFAULT 0`);
+  await q(`CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)`);
+  await q(`CREATE TABLE IF NOT EXISTS referrals (referred_id BIGINT PRIMARY KEY, referrer_id BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), rewarded BOOLEAN NOT NULL DEFAULT FALSE)`);
+  await q(`CREATE TABLE IF NOT EXISTS tournaments (
+    id BIGSERIAL PRIMARY KEY, group_chat_id BIGINT NOT NULL, group_title TEXT, name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'registration',
+    host_id BIGINT NOT NULL, team_size INT NOT NULL DEFAULT 6, purse INT NOT NULL DEFAULT 1000, base_price INT NOT NULL DEFAULT 50,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await q(`CREATE TABLE IF NOT EXISTS tournament_players (
+    tid BIGINT NOT NULL, telegram_id BIGINT NOT NULL, name TEXT, username TEXT, role TEXT NOT NULL DEFAULT 'player',
+    owner_id BIGINT, price INT, state TEXT NOT NULL DEFAULT 'registered', purse INT, PRIMARY KEY (tid, telegram_id))`);
+}
+
+// ── daily reward with a 7-day streak bonus ──
+bot.command('daily', async (ctx) => {
+  const id = ctx.from.id;
+  await walletOf(id);
+  const reply = { reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true };
+  const { rows: w } = await q(`SELECT last_daily, streak FROM wallets WHERE telegram_id=$1`, [id]);
+  const last = w[0] && w[0].last_daily ? new Date(w[0].last_daily).getTime() : 0;
+  const hrs = last ? (Date.now() - last) / 3600000 : 99999;
+  if (hrs < 24) {
+    return ctx.reply(`⏳ Daily bonus already claimed. Come back in about ${Math.ceil(24 - hrs)}h.\n> Streak: *${Number(w[0].streak || 0) % STREAK_DAYS || (w[0].streak ? STREAK_DAYS : 0)}/${STREAK_DAYS}*`, { parse_mode: 'Markdown', ...reply });
+  }
+  const streak = hrs < 48 ? Number(w[0].streak || 0) + 1 : 1;
+  const bonus = streak % STREAK_DAYS === 0 ? STREAK_BONUS : 0;
+  const { rows } = await q(
+    `UPDATE wallets SET coins = coins + $2, last_daily = NOW(), streak = $3, updated_at = NOW()
+      WHERE telegram_id=$1 AND (last_daily IS NULL OR last_daily < NOW() - INTERVAL '24 hours') RETURNING coins`,
+    [id, DAILY_COINS + bonus, streak]
+  );
+  if (!rows.length) return ctx.reply('⏳ Daily bonus already claimed.', reply);
+  const inCycle = ((streak - 1) % STREAK_DAYS) + 1;
+  const left = STREAK_DAYS - inCycle;
+  return ctx.reply(
+    `🎁 *DAILY BONUS* — ${mtag(ctx.from)} +${DAILY_COINS} 🪙` +
+      (bonus ? `\n🔥 *${STREAK_DAYS}-DAY STREAK BONUS* +${bonus} 🪙` : '') +
+      `\n> Streak: *${inCycle}/${STREAK_DAYS}*` + (bonus ? '' : ` · ${left} more day${left === 1 ? '' : 's'} for +${STREAK_BONUS} 🪙`) +
+      `\n> Balance: *${fmtCoins(rows[0].coins)}*`,
+    { parse_mode: 'Markdown', ...reply }
+  );
+});
+
+// ── referrals ──
+async function refJoin(ctx) {
+  const mm = String(ctx.startPayload || '').match(/^ref_(\d+)$/);
+  if (!mm) return;
+  const rid = Number(mm[1]);
+  if (!rid || rid === ctx.from.id) return;
+  const ex = await q(`SELECT 1 FROM users WHERE telegram_id=$1`, [rid]);
+  if (!ex.rows.length) return;
+  const ins = await q(`INSERT INTO referrals (referred_id, referrer_id) VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING 1`, [ctx.from.id, rid]);
+  if (ins.rows.length) rDm(rid, `${htag(ctx.from)} joined with your invite link.\nYou get <b>${REF_REWARD}</b> coins when they finish their first match.`);
+}
+async function refTick() {
+  const { rows } = await q(
+    `SELECT r.referred_id, r.referrer_id FROM referrals r WHERE r.rewarded=FALSE AND EXISTS
+       (SELECT 1 FROM match_players mp JOIN matches m ON m.id=mp.match_id WHERE mp.telegram_id=r.referred_id AND m.status='completed') LIMIT 50`);
+  for (const r of rows) {
+    const upd = await q(`UPDATE referrals SET rewarded=TRUE WHERE referred_id=$1 AND rewarded=FALSE RETURNING 1`, [r.referred_id]);
+    if (!upd.rows.length) continue;
+    const done = (await q(`SELECT COUNT(*)::int AS c FROM referrals WHERE referrer_id=$1 AND rewarded`, [r.referrer_id])).rows[0].c;
+    if (done <= REF_MAX) { await addCoins(r.referrer_id, REF_REWARD); rDm(r.referrer_id, `Your invited friend finished a first match. <b>+${REF_REWARD}</b> coins added.`); }
+    await addCoins(r.referred_id, REF_BONUS);
+    rDm(r.referred_id, `Welcome bonus for your first match: <b>+${REF_BONUS}</b> coins.`);
+  }
+}
+bot.command(['invite', 'refer', 'referral'], async (ctx) => {
+  if (!BOT_USERNAME) return;
+  const link = `https://t.me/${BOT_USERNAME}?start=ref_${ctx.from.id}`;
+  const { rows } = await q(`SELECT COUNT(*)::int AS n, COUNT(*) FILTER (WHERE rewarded)::int AS d FROM referrals WHERE referrer_id=$1`, [ctx.from.id]);
+  const kb = Markup.inlineKeyboard([[ubtn('𝗦𝗛𝗔𝗥𝗘 𝗜𝗡𝗩𝗜𝗧𝗘', `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('Play hand cricket with me on Cric Monster!')}`, 'people', 'success')]]);
+  return ctx.reply(
+    `<b>INVITE FRIENDS</b>\n<blockquote>You get <b>${REF_REWARD}</b> coins when a friend finishes their first match.\nYour friend gets <b>${REF_BONUS}</b> coins.</blockquote>\n<code>${link}</code>\nFriends joined: <b>${rows[0].n}</b> · Rewarded: <b>${rows[0].d}</b>`,
+    { parse_mode: 'HTML', reply_markup: kb.reply_markup, reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true }
+  );
+});
+
+// ── weekly leaderboard (Monday to Sunday, IST) ──
+async function weeklyBoard(offset = 0, limit = 10) {
+  const { rows } = await q(
+    `WITH w AS (SELECT date_trunc('week', (NOW() AT TIME ZONE 'Asia/Kolkata')) - ($1::int * INTERVAL '7 days') AS s),
+      mm AS (SELECT m.id FROM matches m, w WHERE m.status='completed' AND (m.created_at AT TIME ZONE 'Asia/Kolkata') >= w.s AND (m.created_at AT TIME ZONE 'Asia/Kolkata') < w.s + INTERVAL '7 days'),
+      b AS (SELECT mp.telegram_id AS id, SUM(bs.runs)::int AS runs FROM batting_stats bs JOIN match_players mp ON mp.id=bs.player_id JOIN innings i ON i.id=bs.innings_id
+             WHERE i.match_id IN (SELECT id FROM mm) AND mp.telegram_id>0 GROUP BY 1),
+      k AS (SELECT mp.telegram_id AS id, SUM(x.wickets)::int AS wkts FROM bowling_stats x JOIN match_players mp ON mp.id=x.player_id JOIN innings i ON i.id=x.innings_id
+             WHERE i.match_id IN (SELECT id FROM mm) AND mp.telegram_id>0 GROUP BY 1),
+      g AS (SELECT mp.telegram_id AS id, COUNT(DISTINCT mp.match_id)::int AS mt FROM match_players mp WHERE mp.match_id IN (SELECT id FROM mm) AND mp.telegram_id>0 GROUP BY 1)
+     SELECT g.id, COALESCE(b.runs,0) AS runs, COALESCE(k.wkts,0) AS wkts, g.mt, (COALESCE(b.runs,0) + COALESCE(k.wkts,0)*25 + g.mt*5)::int AS pts
+       FROM g LEFT JOIN b ON b.id=g.id LEFT JOIN k ON k.id=g.id ORDER BY pts DESC, g.id LIMIT $2`, [offset, limit]);
+  return rows.map((r) => ({ id: Number(r.id), runs: Number(r.runs), wkts: Number(r.wkts), mt: Number(r.mt), pts: Number(r.pts) }));
+}
+async function weeklyTick() {
+  const key = (await q(`SELECT to_char(date_trunc('week', (NOW() AT TIME ZONE 'Asia/Kolkata')) - INTERVAL '7 days', 'YYYY-MM-DD') AS k`)).rows[0].k;
+  const paid = await kvGet('week_paid');
+  if (paid === key) return;
+  await kvSet('week_paid', key);
+  if (paid === null) return; // first run: start fresh, nothing to pay for old weeks
+  const top = (await weeklyBoard(1, 3)).filter((r) => r.pts > 0);
+  if (!top.length) return;
+  const names = await miniNames(top.map((r) => r.id));
+  let t = `<b>WEEKLY LEADERBOARD · WINNERS</b>\n`;
+  for (let i = 0; i < top.length; i++) {
+    await addCoins(top[i].id, WEEK_PRIZES[i]);
+    t += `${['🥇', '🥈', '🥉'][i]} <b>${escapeHtml((names.get(top[i].id) || {}).name || 'Player')}</b> · ${top[i].pts} pts · +${WEEK_PRIZES[i]} coins\n`;
+    rDm(top[i].id, `You finished #${i + 1} on last week's leaderboard. <b>+${WEEK_PRIZES[i]}</b> coins added.`);
+  }
+  if (typeof LOG_CHAT_ID !== 'undefined' && LOG_CHAT_ID) bot.telegram.sendMessage(LOG_CHAT_ID, t, { parse_mode: 'HTML' }).catch(() => {});
+}
+bot.command('weekly', async (ctx) => {
+  const rows = await weeklyBoard(0, 10);
+  const names = await miniNames(rows.map((r) => r.id));
+  let t = `<b>WEEKLY LEADERBOARD</b>\n<i>Resets every Monday 12:00 AM IST · prizes ${WEEK_PRIZES.join(' / ')} coins for the top 3</i>\n\n`;
+  if (!rows.length) t += 'No matches this week yet. Play one!';
+  rows.forEach((r, i) => { t += `<blockquote>${i < 3 ? ['🥇', '🥈', '🥉'][i] : String(i + 1).padStart(2, '0') + ' ▸'} <b>${escapeHtml((names.get(r.id) || {}).name || 'Player')}</b> · ${r.pts} pts\n┗ ${r.runs} runs · ${r.wkts} wkts · ${r.mt} matches</blockquote>`; });
+  return ctx.reply(t, { parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
+});
+function startGrowthTicks() {
+  const run = (f, n) => f().catch((e) => console.error(n + ':', e.message));
+  setTimeout(() => { run(weeklyTick, 'weekly'); run(refTick, 'ref'); }, 20000);
+  setInterval(() => run(weeklyTick, 'weekly'), 10 * 60 * 1000).unref();
+  setInterval(() => run(refTick, 'ref'), 5 * 60 * 1000).unref();
+}
+
+// ── tournaments: /tournament, /register, /addcaptain, /abid (auction, 15s per player) ──
+const tourAuc = new Map(); // tournament id -> live auction state
+const tName = (r) => String(r.name || (r.username ? '@' + r.username : 'Player')).slice(0, 24);
+const tTag = (r) => `<a href="tg://user?id=${Number(r.telegram_id)}">${escapeHtml(tName(r))}</a>`;
+const fullName = (u) => [u.first_name, u.last_name].filter(Boolean).join(' ').trim();
+const trep = (ctx) => ({ parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
+async function activeTour(chatId) {
+  const { rows } = await q(`SELECT * FROM tournaments WHERE group_chat_id=$1 AND status IN ('registration','auction','ready') ORDER BY id DESC LIMIT 1`, [chatId]);
+  return rows[0] || null;
+}
+async function canManageTour(ctx, t) {
+  return Number(t.host_id) === ctx.from.id || isAdmin(ctx.from.id) || (await isGroupAdmin(ctx.chat.id, ctx.from.id));
+}
+async function tourText(t) {
+  const { rows } = await q(`SELECT * FROM tournament_players WHERE tid=$1 ORDER BY role DESC, telegram_id`, [t.id]);
+  const caps = rows.filter((r) => r.role === 'captain');
+  const pl = rows.filter((r) => r.role !== 'captain');
+  let s = `🏆 <b>${escapeHtml(t.name)}</b>\n<i>${t.status === 'registration' ? 'Registration open' : t.status === 'auction' ? 'Auction in progress' : 'Teams are set'} · squad ${t.team_size} · purse ${t.purse} · base ${t.base_price}</i>\n\n`;
+  s += `<b>Registered:</b> ${pl.length}   <b>Captains:</b> ${caps.length}\n`;
+  if (t.status === 'registration') {
+    s += caps.length ? `<blockquote>${caps.map((c) => '👑 ' + escapeHtml(tName(c))).join('\n')}</blockquote>` : '<i>No captains yet. Host: /addcaptain @user</i>\n';
+    s += `\n/register to join · /abid to start the auction`;
+  } else {
+    for (const c of caps) {
+      const mine = pl.filter((p) => Number(p.owner_id) === Number(c.telegram_id));
+      s += `<blockquote><b>${escapeHtml(tName(c))}</b> (C) · purse ${c.purse ?? 0}\n${mine.length ? mine.map((p) => `${escapeHtml(tName(p))} · ${p.price ?? 0}`).join('\n') : '—'}</blockquote>`;
+    }
+    const un = pl.filter((p) => !p.owner_id);
+    if (un.length) s += `<i>Unsold: ${un.map((p) => escapeHtml(tName(p))).join(', ')}</i>`;
+  }
+  return s;
+}
+bot.command(['tournament', 'tourney'], async (ctx) => {
+  if (!isGroup(ctx)) return ctx.reply('Use this command in a group.');
+  const ex = await activeTour(ctx.chat.id);
+  if (ex) return ctx.reply(await tourText(ex), trep(ctx));
+  if (!(isAdmin(ctx.from.id) || (await isGroupAdmin(ctx.chat.id, ctx.from.id)))) return ctx.reply('Only a group admin can start a tournament.', trep(ctx));
+  const name = (cmdArgs(ctx) || 'Cric Monster Cup').slice(0, 40);
+  const { rows } = await q(`INSERT INTO tournaments (group_chat_id, group_title, name, host_id) VALUES ($1,$2,$3,$4) RETURNING *`, [ctx.chat.id, ctx.chat.title || null, name, ctx.from.id]);
+  const t = rows[0];
+  return ctx.reply(
+    `🏆 <b>${escapeHtml(t.name)}</b>\nRegistration is open.\n<blockquote><b>/register</b> — join (set automatically)\n<b>/unregister</b> — leave\n<b>/addcaptain @user</b> — host adds captains\n<b>/abid</b> — host starts the auction, every player is sold automatically (${AUC_SECONDS}s per player)\n<b>/tlist</b> — players and teams\n<b>/tset size 6 purse 1000 base 50</b> — settings\n<b>/endtour</b> — cancel</blockquote>`,
+    trep(ctx)
+  );
+});
+bot.command('tlist', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  return ctx.reply(t ? await tourText(t) : 'No tournament here. An admin can start one with /tournament.', trep(ctx));
+});
+bot.command('register', async (ctx) => {
+  if (!isGroup(ctx)) return ctx.reply('Use /register in the tournament group.');
+  const t = await activeTour(ctx.chat.id);
+  if (!t) return ctx.reply('No tournament is open. An admin can start one with /tournament.', trep(ctx));
+  if (t.status !== 'registration') return ctx.reply('Registration is closed. The auction has started.', trep(ctx));
+  const me = { telegram_id: ctx.from.id, name: fullName(ctx.from), username: ctx.from.username || null };
+  const ins = await q(`INSERT INTO tournament_players (tid, telegram_id, name, username) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING 1`, [t.id, me.telegram_id, me.name || null, me.username]);
+  const n = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='player'`, [t.id])).rows[0].c;
+  if (!ins.rows.length) return ctx.reply(`❌ ${tTag(me)} you are already registered.`, trep(ctx));
+  return ctx.reply(`✅ ${tTag(me)} registered for <b>${escapeHtml(t.name)}</b> · ${n} player${n === 1 ? '' : 's'}`, trep(ctx));
+});
+bot.command('unregister', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t || t.status !== 'registration') return ctx.reply('Nothing to leave right now.', trep(ctx));
+  const d = await q(`DELETE FROM tournament_players WHERE tid=$1 AND telegram_id=$2 RETURNING 1`, [t.id, ctx.from.id]);
+  return ctx.reply(d.rows.length ? 'You are out of the tournament.' : 'You were not registered.', trep(ctx));
+});
+bot.command(['addcaptain', 'addcap'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t) return ctx.reply('No tournament is open.', trep(ctx));
+  if (!(await canManageTour(ctx, t))) return ctx.reply('Only the host or a group admin can add captains.', trep(ctx));
+  if (t.status !== 'registration') return ctx.reply('Captains can only be added before the auction.', trep(ctx));
+  const targets = parseAddTargets(ctx);
+  if (!targets.length) return ctx.reply('Usage: /addcaptain @user  (or reply to someone, or send a user id)', trep(ctx));
+  const out = [];
+  for (const tg of targets) {
+    const u = await resolveTarget(ctx, tg);
+    if (!u) { out.push(`❌ ${escapeHtml(tg.username ? '@' + tg.username : String(tg.id))} not found (they must have used the bot)`); continue; }
+    const cnt = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='captain' AND telegram_id<>$2`, [t.id, u.id])).rows[0].c;
+    if (cnt >= 8) { out.push('❌ Maximum 8 captains'); break; }
+    await q(`INSERT INTO tournament_players (tid, telegram_id, name, username, role, purse) VALUES ($1,$2,$3,$4,'captain',$5)
+             ON CONFLICT (tid, telegram_id) DO UPDATE SET role='captain', purse=EXCLUDED.purse`, [t.id, u.id, fullName(u) || null, u.username || null, t.purse]);
+    out.push(`👑 ${tTag({ telegram_id: u.id, name: fullName(u), username: u.username })} is a captain`);
+  }
+  return ctx.reply(out.join('\n'), trep(ctx));
+});
+bot.command(['remcaptain', 'removecaptain'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t || t.status !== 'registration') return;
+  if (!(await canManageTour(ctx, t))) return;
+  for (const tg of parseAddTargets(ctx)) {
+    const u = await resolveTarget(ctx, tg);
+    if (u) await q(`UPDATE tournament_players SET role='player', purse=NULL WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id]);
+  }
+  return ctx.reply('Captain list updated. See /tlist', trep(ctx));
+});
+bot.command('tset', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t) return;
+  if (!(await canManageTour(ctx, t))) return ctx.reply('Only the host or a group admin can change settings.', trep(ctx));
+  if (t.status !== 'registration') return ctx.reply('Settings are locked once the auction starts.', trep(ctx));
+  const a = cmdArgs(ctx).toLowerCase().split(/\s+/);
+  const lim = { size: ['team_size', 2, 15], purse: ['purse', 100, 100000], base: ['base_price', 10, 10000] };
+  for (let i = 0; i + 1 < a.length; i += 2) {
+    const L = lim[a[i]]; const v = parseInt(a[i + 1], 10);
+    if (L && v >= L[1] && v <= L[2]) await q(`UPDATE tournaments SET ${L[0]}=$2 WHERE id=$1`, [t.id, v]);
+  }
+  const t2 = (await q(`SELECT * FROM tournaments WHERE id=$1`, [t.id])).rows[0];
+  await q(`UPDATE tournament_players SET purse=$2 WHERE tid=$1 AND role='captain'`, [t.id, t2.purse]);
+  return ctx.reply(`Settings: squad <b>${t2.team_size}</b> · purse <b>${t2.purse}</b> · base price <b>${t2.base_price}</b>`, trep(ctx));
+});
+bot.command(['endtour', 'canceltour'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t) return ctx.reply('No tournament to cancel.', trep(ctx));
+  if (!(await canManageTour(ctx, t))) return ctx.reply('Only the host or a group admin can cancel.', trep(ctx));
+  const S = tourAuc.get(String(t.id));
+  if (S) { clearTimeout(S.timer); clearTimeout(S.warn); tourAuc.delete(String(t.id)); }
+  await q(`UPDATE tournaments SET status='cancelled' WHERE id=$1`, [t.id]);
+  return ctx.reply(`Tournament <b>${escapeHtml(t.name)}</b> cancelled.`, trep(ctx));
+});
+
+// the auction
+function aucStep(S) { return Math.max(10, S.t.base_price); }
+function aucAsk(S) {
+  const st = aucStep(S);
+  return S.bidder ? [S.price + st, S.price + st * 2, S.price + st * 4] : [S.price, S.price + st, S.price + st * 2];
+}
+function aucText(S, warn) {
+  const c = S.bidder ? S.caps.get(S.bidder) : null;
+  return `🔨 <b>PLAYER ON THE BLOCK</b>  ·  ${S.sold + S.unsold.length + 1}/${S.total}\n<blockquote><b>${escapeHtml(tName(S.cur))}</b></blockquote>` +
+    (c ? `Highest bid: <b>${S.price}</b> by <b>${escapeHtml(tName(c))}</b>` : `Base price: <b>${S.price}</b> · no bids yet`) +
+    `\n${warn ? '⏳ <b>5 seconds left!</b>' : `⏱ Sold automatically after ${AUC_SECONDS}s without a higher bid`}`;
+}
+function aucKb(S) {
+  return Markup.inlineKeyboard([aucAsk(S).map((p) => btn(`BID ${p}`, `ab:${S.tid}:${S.seq}:${p}`, null, 'success'))]);
+}
+function aucArm(S) {
+  clearTimeout(S.timer); clearTimeout(S.warn);
+  const seq = S.seq;
+  S.warn = setTimeout(() => {
+    if (S.seq !== seq) return;
+    S.tg.editMessageText(S.chatId, S.msgId, undefined, aucText(S, true), { parse_mode: 'HTML', reply_markup: aucKb(S).reply_markup }).catch(() => {});
+  }, (AUC_SECONDS - 5) * 1000);
+  S.timer = setTimeout(() => aucClose(S, seq).catch((e) => console.error('auction close:', e.message)), AUC_SECONDS * 1000);
+}
+async function aucNext(S) {
+  if (!tourAuc.has(String(S.tid))) return;
+  const open = [...S.caps.values()].filter((c) => c.count < S.t.team_size - 1);
+  if (!open.length || !S.queue.length) return aucFinish(S);
+  S.cur = S.queue.shift();
+  S.seq++; S.price = S.t.base_price; S.bidder = null;
+  const m = await S.tg.sendMessage(S.chatId, aucText(S), { parse_mode: 'HTML', reply_markup: aucKb(S).reply_markup });
+  S.msgId = m.message_id;
+  aucArm(S);
+}
+async function aucAssign(S, p, capId, price) {
+  const c = S.caps.get(capId);
+  c.purse -= price; c.count++;
+  await q(`UPDATE tournament_players SET owner_id=$3, price=$4, state='sold' WHERE tid=$1 AND telegram_id=$2`, [S.tid, p.telegram_id, capId, price]);
+  await q(`UPDATE tournament_players SET purse=$3 WHERE tid=$1 AND telegram_id=$2`, [S.tid, capId, c.purse]);
+}
+async function aucClose(S, seq) {
+  if (S.seq !== seq || !tourAuc.has(String(S.tid))) return;
+  clearTimeout(S.timer); clearTimeout(S.warn);
+  const p = S.cur;
+  if (S.bidder) {
+    await aucAssign(S, p, S.bidder, S.price);
+    S.sold++;
+    const c = S.caps.get(S.bidder);
+    await S.tg.editMessageText(S.chatId, S.msgId, undefined, `🔨 <b>SOLD</b>\n<blockquote><b>${escapeHtml(tName(p))}</b></blockquote>`, { parse_mode: 'HTML' }).catch(() => {});
+    await S.tg.sendMessage(S.chatId, `🔨 <b>SOLD!</b> ${escapeHtml(tName(p))} goes to <b>${escapeHtml(tName(c))}</b> for <b>${S.price}</b>\n<i>Purse left: ${c.purse}</i>`, { parse_mode: 'HTML' });
+  } else {
+    S.unsold.push(p);
+    await q(`UPDATE tournament_players SET state='unsold' WHERE tid=$1 AND telegram_id=$2`, [S.tid, p.telegram_id]);
+    await S.tg.editMessageText(S.chatId, S.msgId, undefined, `❌ <b>UNSOLD</b>\n<blockquote><b>${escapeHtml(tName(p))}</b></blockquote>`, { parse_mode: 'HTML' }).catch(() => {});
+  }
+  setTimeout(() => aucNext(S).catch((e) => console.error('auction next:', e.message)), AUC_GAP_MS);
+}
+async function aucFinish(S) {
+  // leftover players are sold automatically to the teams that still have room (smallest squad first)
+  const left = [...S.unsold, ...S.queue];
+  S.queue = []; S.unsold = [];
+  for (const p of left) {
+    const open = [...S.caps.entries()].filter(([, c]) => c.count < S.t.team_size - 1).sort((a, b) => a[1].count - b[1].count || b[1].purse - a[1].purse);
+    if (!open.length) break;
+    await aucAssign(S, p, open[0][0], Math.min(S.t.base_price, Math.max(0, open[0][1].purse)));
+  }
+  tourAuc.delete(String(S.tid));
+  await q(`UPDATE tournaments SET status='ready' WHERE id=$1`, [S.tid]);
+  const t = (await q(`SELECT * FROM tournaments WHERE id=$1`, [S.tid])).rows[0];
+  await S.tg.sendMessage(S.chatId, `🏁 <b>AUCTION COMPLETE</b>\n\n` + (await tourText(t)), { parse_mode: 'HTML' });
+}
+bot.command(['abid', 'auction', 'startauction'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t) return ctx.reply('No tournament is open. An admin can start one with /tournament.', trep(ctx));
+  if (!(await canManageTour(ctx, t))) return ctx.reply('Only the host or a group admin can start the auction.', trep(ctx));
+  if (tourAuc.has(String(t.id))) return ctx.reply('The auction is already running.', trep(ctx));
+  if (t.status === 'ready') return ctx.reply('The auction is finished. See /tlist', trep(ctx));
+  const all = (await q(`SELECT * FROM tournament_players WHERE tid=$1`, [t.id])).rows;
+  const capRows = all.filter((r) => r.role === 'captain');
+  const pool = all.filter((r) => r.role !== 'captain' && !r.owner_id);
+  if (capRows.length < 2) return ctx.reply('You need at least 2 captains. Use /addcaptain @user', trep(ctx));
+  if (!pool.length) return ctx.reply('No players are registered yet. Players can use /register', trep(ctx));
+  for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+  const caps = new Map();
+  for (const c of capRows) caps.set(Number(c.telegram_id), { telegram_id: Number(c.telegram_id), name: c.name, username: c.username, purse: c.purse == null ? t.purse : Number(c.purse), count: all.filter((p) => Number(p.owner_id) === Number(c.telegram_id)).length });
+  await q(`UPDATE tournaments SET status='auction' WHERE id=$1`, [t.id]);
+  const S = { tid: t.id, chatId: ctx.chat.id, t, tg: ctx.telegram, seq: 0, queue: pool, total: pool.length, sold: 0, unsold: [], cur: null, price: 0, bidder: null, caps, timer: null, warn: null, msgId: null };
+  tourAuc.set(String(t.id), S);
+  await ctx.reply(
+    `🔨 <b>AUCTION STARTS</b> · <b>${escapeHtml(t.name)}</b>\n<blockquote>${pool.length} players · ${capRows.length} captains\nSquad ${t.team_size} · purse ${t.purse} · base ${t.base_price}\nCaptains bid with the buttons. Each player is sold automatically after ${AUC_SECONDS}s without a higher bid.</blockquote>`,
+    trep(ctx)
+  );
+  setTimeout(() => aucNext(S).catch((e) => console.error('auction next:', e.message)), 4000);
+});
+bot.action(/^ab:(\d+):(\d+):(\d+)$/, async (ctx) => {
+  const S = tourAuc.get(ctx.match[1]);
+  if (!S) return ctx.answerCbQuery('The auction is not running', { show_alert: true });
+  if (Number(ctx.match[2]) !== S.seq) return ctx.answerCbQuery('This player is already closed');
+  const cap = S.caps.get(ctx.from.id);
+  if (!cap) return ctx.answerCbQuery('Only captains can bid', { show_alert: true });
+  if (cap.count >= S.t.team_size - 1) return ctx.answerCbQuery('Your squad is full', { show_alert: true });
+  const price = Number(ctx.match[3]);
+  if (price < (S.bidder ? S.price + 1 : S.price)) return ctx.answerCbQuery('Someone already bid higher');
+  if (S.bidder === ctx.from.id) return ctx.answerCbQuery('You already hold the highest bid');
+  if (price > cap.purse) return ctx.answerCbQuery(`Not enough purse. You have ${cap.purse}`, { show_alert: true });
+  S.price = price; S.bidder = ctx.from.id;
+  aucArm(S);
+  await ctx.answerCbQuery(`You bid ${price}`);
+  await ctx.telegram.editMessageText(S.chatId, S.msgId, undefined, aucText(S), { parse_mode: 'HTML', reply_markup: aucKb(S).reply_markup }).catch(() => {});
+});
+async function miniTours() {
+  const { rows } = await q(`SELECT * FROM tournaments WHERE status<>'cancelled' ORDER BY id DESC LIMIT 20`);
+  const out = [];
+  for (const t of rows) {
+    const pl = (await q(`SELECT * FROM tournament_players WHERE tid=$1`, [t.id])).rows;
+    const caps = pl.filter((p) => p.role === 'captain');
+    out.push({
+      id: String(t.id), name: t.name, group: t.group_title || 'Group', status: t.status, size: t.team_size, purse: t.purse,
+      registered: pl.filter((p) => p.role !== 'captain').length,
+      teams: caps.map((c) => ({ captain: tName(c), purse: c.purse == null ? t.purse : Number(c.purse), players: pl.filter((p) => Number(p.owner_id) === Number(c.telegram_id)).map((p) => ({ name: tName(p), price: Number(p.price || 0) })) })),
+      unsold: pl.filter((p) => p.role !== 'captain' && !p.owner_id).length,
+    });
+  }
+  return out;
+}
+
+// ── /tagall and /tagactive: members are tagged as emojis (hidden mentions), name is not shown ──
+const TAG_ACTIVE_MIN = 60; // "active" = sent a message in this group within the last 60 minutes
+const TAG_EMOJIS = ['🔥', '⚡', '🏏', '💎', '👑', '🎯', '🚀', '🌟', '🦁', '🐉', '🏆', '💥', '🎲', '🧿', '🌈', '🍀', '🎉', '💫', '🦅', '🐯'];
+const seenThrottle = new Map();
+const tagRuns = new Map();
+async function initTagSeen() {
+  await q(`CREATE TABLE IF NOT EXISTS group_seen (chat_id BIGINT NOT NULL, user_id BIGINT NOT NULL, last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (chat_id, user_id))`);
+  await q(`INSERT INTO group_seen (chat_id, user_id, last_seen)
+           SELECT m.group_chat_id, mp.telegram_id, MAX(m.created_at) FROM match_players mp JOIN matches m ON m.id = mp.match_id
+            WHERE mp.telegram_id > 0 GROUP BY 1, 2 ON CONFLICT DO NOTHING`);
+}
+function trackSeen(ctx) {
+  try {
+    const c = ctx.chat, u = ctx.from;
+    if (!c || !u || u.is_bot || (c.type !== 'group' && c.type !== 'supergroup')) return;
+    const k = c.id + ':' + u.id, now = Date.now();
+    if (now - (seenThrottle.get(k) || 0) < 45000) return;
+    seenThrottle.set(k, now);
+    q(`INSERT INTO group_seen (chat_id, user_id, last_seen) VALUES ($1,$2,NOW()) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_seen=NOW()`, [c.id, u.id]).catch(() => {});
+    const left = ctx.message && ctx.message.left_chat_member;
+    if (left) q(`DELETE FROM group_seen WHERE chat_id=$1 AND user_id=$2`, [c.id, left.id]).catch(() => {});
+  } catch (_) {}
+}
+async function runTag(ctx, activeOnly) {
+  if (!isGroup(ctx)) return ctx.reply('Use this command in a group.');
+  if (!(isAdmin(ctx.from.id) || (await isGroupAdmin(ctx.chat.id, ctx.from.id)))) return ctx.reply('Only group admins can use this.', trep(ctx));
+  const raw = String(ctx.message.text || '');
+  const cm = raw.match(/^\/\S+\s*/);
+  const shift = cm ? cm[0].length : 0;
+  const body = raw.slice(shift).replace(/\s+$/, '');
+  const ents = (ctx.message.entities || []).filter((e) => e.offset >= shift && e.type !== 'bot_command' && e.offset - shift + e.length <= body.length)
+    .slice(0, 50).map((e) => ({ ...e, offset: e.offset - shift }));
+  const ids = new Set();
+  const { rows } = await q(
+    activeOnly
+      ? `SELECT user_id FROM group_seen WHERE chat_id=$1 AND last_seen > NOW() - ($2::int * INTERVAL '1 minute')`
+      : `SELECT user_id FROM group_seen WHERE chat_id=$1 AND $2::int >= 0`, [ctx.chat.id, TAG_ACTIVE_MIN]);
+  rows.forEach((r) => ids.add(Number(r.user_id)));
+  if (!activeOnly) { try { (await ctx.telegram.getChatAdministrators(ctx.chat.id)).forEach((a) => { if (!a.user.is_bot) ids.add(a.user.id); }); } catch (_) {} }
+  ids.delete(ctx.from.id);
+  if (!ids.size) return ctx.reply(activeOnly ? `Nobody else was active in the last ${TAG_ACTIVE_MIN} minutes.` : 'I have not seen any members here yet. They will be tagged once they send a message.', trep(ctx));
+  const list = [...ids];
+  const PER = 5, GAP = 3000; // 5 emojis per message, one message after another (group limit is ~20 msgs/min)
+  const key = String(ctx.chat.id);
+  if (tagRuns.has(key)) return ctx.reply('A tag is already running. Send /stop to stop it.', trep(ctx));
+  const run = { stop: false };
+  tagRuns.set(key, run);
+  let i = 0, first = true, n = 0, sentCount = 0;
+  try {
+    while (i < list.length && !run.stop) {
+      const part = list.slice(i, i + PER); i += PER;
+      let text = first ? (body ? body + '\n\n' : '') : '';
+      const es = first ? ents.slice() : [];
+      part.forEach((uid, k) => {
+        const em = TAG_EMOJIS[(n++) % TAG_EMOJIS.length];
+        es.push({ type: 'text_mention', offset: text.length, length: em.length, user: { id: uid } });
+        text += em + (k < part.length - 1 ? ' ' : '');
+      });
+      const opt = { entities: es, disable_web_page_preview: true };
+      if (first) { opt.reply_to_message_id = ctx.message.message_id; opt.allow_sending_without_reply = true; }
+      first = false;
+      await ctx.telegram.sendMessage(ctx.chat.id, text, opt).then(() => { sentCount += part.length; }).catch((e) => console.error('tag:', e.message));
+      if (i < list.length && !run.stop) await new Promise((r) => setTimeout(r, GAP));
+    }
+  } finally { tagRuns.delete(key); }
+  if (run.stop) await ctx.telegram.sendMessage(ctx.chat.id, `Tagging stopped after ${sentCount} of ${list.length}.`).catch(() => {});
+}
+bot.command('stop', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const run = tagRuns.get(String(ctx.chat.id));
+  if (!run) return;
+  if (!(isAdmin(ctx.from.id) || (await isGroupAdmin(ctx.chat.id, ctx.from.id)))) return ctx.reply('Only group admins can stop the tagging.', trep(ctx));
+  run.stop = true;
+});
+bot.command('tagall', (ctx) => runTag(ctx, false));
+bot.command('tagactive', (ctx) => runTag(ctx, true));
+
 async function main() {
   await q('SELECT 1');
   await q('ALTER TABLE pending_balls ADD COLUMN IF NOT EXISTS batting_message_id BIGINT');
@@ -12326,6 +12788,8 @@ async function main() {
   await initThemes();
   fixMpForeignKeys().catch(() => {});
   await initR50();
+  await initR72();
+  try { await initTagSeen(); } catch (e) { console.error('tagseen:', e.message); }
   await relaxNegativeRunConstraints();
   try {
     const { rows } = await q(`SELECT id FROM matches WHERE vs_bot=TRUE AND status NOT IN ('completed','cancelled')`);
@@ -12343,6 +12807,7 @@ async function main() {
   BOT_USERNAME = me.username;
   console.log(`Bot @${me.username}`);
   try { startMiniApp(); } catch (e) { console.error('miniapp:', e.message); }
+  try { startGrowthTicks(); } catch (e) { console.error(e.message); }
   await bot.launch();
   
 console.log(`Running… (version ${BOT_VERSION})`);
