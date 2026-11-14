@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r82-2026-11-04-bowler-ticks'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r88-2026-11-14-auchelp'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 // /Store, /SHOP, /Bat … → the command word is read in lower case
@@ -56,6 +56,7 @@ bot.use(async (ctx, next) => {
 });
 
 bot.use((ctx, next) => { try { trackSeen(ctx); } catch (_) {} return next(); });
+bot.use((ctx, next) => tourTextMw(ctx, next));
 
 // per-command cooldown (spam control): a command can be reused only after 10s.
 // Exempt: host, team captains, striker / non-striker / bowler of the running match, bot admins.
@@ -3917,6 +3918,7 @@ async function addPlayers(ctx, label, viaAdd = false) {
 
     const invited = [];
     const problems = [];
+    const started = await matchStarted(m);
     for (const t of targets) {
       const info = await resolveTarget(ctx, t);
       if (!info) {
@@ -3937,6 +3939,18 @@ async function addPlayers(ctx, label, viaAdd = false) {
         break;
       }
       const display = info.username ? '@' + info.username : info.first_name || String(info.id);
+      if (!started) {
+        const { rows: nr } = await q(`SELECT COALESCE(MAX(roster_position),0)+1 AS n FROM match_players WHERE match_id=$1 AND team_label=$2`, [m.id, label]);
+        await q(
+          `INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [m.id, info.id, label, nr[0].n, info.username || null, info.first_name || null, info.last_name || null]
+        );
+        await upsertUser({ id: info.id, username: info.username, first_name: info.first_name }).catch(() => {});
+        await ctx.reply(`✅ ${mdEsc(display)} added to *${m.mode === 'solo' ? 'the solo lobby' : 'Team ' + label}* (#${nr[0].n})`, { parse_mode: 'Markdown' });
+        invited.push(display);
+        continue;
+      }
       const token = crypto.randomBytes(6).toString('base64url');
       const sent = await ctx.telegram.sendMessage(
         ctx.chat.id,
@@ -4047,6 +4061,7 @@ async function removePlayers(ctx) {
       );
     const removed = [];
     const problems = [];
+    let inPlay = false;
     for (const t of targets) {
       const info = await resolveTarget(ctx, t);
       if (!info) {
@@ -4072,6 +4087,7 @@ async function removePlayers(ctx) {
       }
       // if currently batting / bowling, clear from innings so game can continue
       const inn = await getInnings(m.id);
+      if (inn && (inn.striker_player_id === pl.id || inn.non_striker_player_id === pl.id || inn.current_bowler_id === pl.id)) inPlay = true;
       if (inn) {
         if (inn.striker_player_id === pl.id) await q(`UPDATE innings SET striker_player_id=NULL WHERE id=$1`, [inn.id]);
         if (inn.non_striker_player_id === pl.id) await q(`UPDATE innings SET non_striker_player_id=NULL WHERE id=$1`, [inn.id]);
@@ -4087,10 +4103,7 @@ async function removePlayers(ctx) {
     if (removed.length) msg += `🗑 Removed: ${removed.map(mdEsc).join(', ')}\n`;
     if (problems.length) msg += `⚠️ Skipped:\n${problems.map(mdEsc).join('\n')}`;
     await ctx.reply(msg || 'Nothing changed', { parse_mode: 'Markdown' });
-    if (removed.length && ['innings1', 'innings2'].includes(m.status)) {
-      // re-arm turn so the game does not stay stuck without striker/bowler
-      try { await ensureTurnClock(m.id); } catch (_) {}
-    }
+    if (removed.length) await afterRemoveFix(m, inPlay);
   } catch (e) {
     console.error(e);
     await ctx.reply('❌ ' + e.message);
@@ -4151,6 +4164,45 @@ async function delMatchPlayer(pl) {
     console.error('renumber:', e.message);
   }
 }
+async function matchStarted(m) {
+  if (!['innings1', 'innings2'].includes(m.status)) return false;
+  const inn = await getInnings(m.id);
+  return !!(inn && (inn.striker_player_id || inn.current_bowler_id || inn.balls_bowled > 0));
+}
+// team match: tag the captain when a batsman / bowler slot became empty
+async function promptMissing(m) {
+  try {
+    if (m.mode === 'solo' || !['innings1', 'innings2'].includes(m.status)) return;
+    const inn = await getInnings(m.id);
+    if (!inn) return;
+    const gid = Number(m.group_chat_id);
+    if (!inn.striker_player_id)
+      await bot.telegram.sendMessage(gid, `👑 ${await capTagOf(m, inn.batting_team)} — send your *new batsman*: /bat <no.>`, { parse_mode: 'Markdown' });
+    if (!inn.current_bowler_id && inn.ball_state === 'idle' && (inn.balls_bowled === 0 || inn.balls_bowled % 6 !== 0))
+      await bot.telegram.sendMessage(gid, `👑 ${await capTagOf(m, inn.bowling_team)} — send your *new bowler*: /ball <no.>`, { parse_mode: 'Markdown' });
+  } catch (e) { console.error('promptMissing:', e.message); }
+}
+// after a manual removal: keep the game alive (solo: re-pick batsman/bowler, or end if too few left)
+async function afterRemoveFix(m, hadPlayerInPlay) {
+  try {
+    if (!['innings1', 'innings2'].includes(m.status)) return;
+    const inn = await getInnings(m.id);
+    if (!inn) return;
+    if (m.mode === 'solo') {
+      const left = await getPlayers(m.id, 'A');
+      if (left.length < 2) return await endSoloTooFew(m, inn);
+      if (hadPlayerInPlay) {
+        await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE innings_id=$1 AND is_resolved=FALSE`, [inn.id]);
+        await q(`UPDATE innings SET ball_state='idle' WHERE id=$1`, [inn.id]).catch(() => {});
+        await soloAutoSetup(m, inn);
+      }
+    }
+    if (m.mode !== 'solo' && hadPlayerInPlay) await promptMissing(m);
+    await ensureTurnClock(m.id);
+  } catch (e) {
+    console.error('afterRemoveFix:', e.message);
+  }
+}
 bot.command(['remove', 'kick', 'rmplayer'], removePlayers);
 
 // /remove_b2  /remove_a1  /rm_b3  — remove Team X player at roster position N (no request)
@@ -4181,6 +4233,7 @@ bot.hears(/^\/(?:remove|rm|kick)_([ab])(\d+)(?:@\w+)?(?:\s|$)/i, async (ctx) => 
       return ctx.reply('❌ Cannot remove the host');
 
     const inn = await getInnings(m.id);
+    const inPlay1 = !!(inn && (inn.striker_player_id === pl.id || inn.non_striker_player_id === pl.id || inn.current_bowler_id === pl.id));
     if (inn) {
       if (inn.striker_player_id === pl.id) await q(`UPDATE innings SET striker_player_id=NULL WHERE id=$1`, [inn.id]);
       if (inn.non_striker_player_id === pl.id) await q(`UPDATE innings SET non_striker_player_id=NULL WHERE id=$1`, [inn.id]);
@@ -4194,13 +4247,89 @@ bot.hears(/^\/(?:remove|rm|kick)_([ab])(\d+)(?:@\w+)?(?:\s|$)/i, async (ctx) => 
       `🗑 Removed *Team ${label} #${pos}* — ${mdEsc(display)}`,
       { parse_mode: 'Markdown' }
     );
-    if (['innings1', 'innings2'].includes(m.status)) {
-      try { await ensureTurnClock(m.id); } catch (_) {}
-    }
+    await afterRemoveFix(m, inPlay1);
   } catch (e) {
     console.error(e);
     await ctx.reply('❌ ' + e.message);
   }
+});
+
+// /swap_a3  /swap_b2 : move a roster player to the other team (lobby = direct, mid-game = request)
+bot.hears(/^\/swap_([ab])(\d+)(?:@\w+)?(?:\s|$)/i, async (ctx) => {
+  if (!isGroup(ctx)) return;
+  try {
+    const label = String(ctx.match[1]).toUpperCase();
+    const other = label === 'A' ? 'B' : 'A';
+    const pos = parseInt(ctx.match[2], 10);
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m) return ctx.reply('❌ No active match');
+    if (m.mode === 'solo') return ctx.reply('ℹ️ Solo has only one list, so swapping teams is not possible.');
+    if (!['waiting', 'captains', 'toss', 'innings1', 'innings2'].includes(m.status)) return ctx.reply('⚠️ Match is already finished');
+    const isHost = Number(m.host_telegram_id) === ctx.from.id;
+    if (!isHost && !isAdmin(ctx.from.id)) {
+      const team = await getTeam(m.id, label);
+      if (!team || Number(team.captain_id) !== ctx.from.id) return ctx.reply(`❌ Only the host or Team ${label} captain can swap this player.`);
+    }
+    const pl = await getPlayerByPos(m.id, label, pos);
+    if (!pl) return ctx.reply(`❌ No player at Team ${label} #${pos}`);
+    const disp = pl.username ? '@' + pl.username : name(pl);
+    const started = await matchStarted(m);
+    if (!started) {
+      await doSwap(m, pl, other);
+      return ctx.reply(`🔄 ${mdEsc(disp)} moved to *Team ${other}*.`, { parse_mode: 'Markdown' });
+    }
+    await ctx.reply(
+      `🔄 ${mdEsc(disp)}, you are asked to join *Team ${other}*.\nOnly you can accept.`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[
+          { text: '✅ Accept', callback_data: `sw:${m.id}:${pl.id}:${other}:y` },
+          { text: '❌ Decline', callback_data: `sw:${m.id}:${pl.id}:${other}:n` },
+        ]] },
+      }
+    );
+  } catch (e) {
+    console.error(e);
+    await ctx.reply('❌ ' + e.message);
+  }
+});
+async function doSwap(m, pl, other) {
+  const inn = await getInnings(m.id);
+  if (inn) {
+    if (inn.striker_player_id === pl.id) await q(`UPDATE innings SET striker_player_id=NULL WHERE id=$1`, [inn.id]);
+    if (inn.non_striker_player_id === pl.id) await q(`UPDATE innings SET non_striker_player_id=NULL WHERE id=$1`, [inn.id]);
+    if (inn.current_bowler_id === pl.id) await q(`UPDATE innings SET current_bowler_id=NULL WHERE id=$1`, [inn.id]);
+    await q(`UPDATE innings SET last_bowler_id=NULL WHERE last_bowler_id=$1`, [pl.id]).catch(() => {});
+  }
+  await q(`UPDATE match_teams SET captain_id=NULL WHERE match_id=$1 AND captain_id=$2`, [m.id, pl.telegram_id]);
+  const { rows } = await q(`SELECT COALESCE(MAX(roster_position),0)+1 AS n FROM match_players WHERE match_id=$1 AND team_label=$2`, [m.id, other]);
+  await q(`UPDATE match_players SET team_label=$2, roster_position=$3, is_captain=FALSE WHERE id=$1`, [pl.id, other, rows[0].n]);
+  await renumberRoster(m.id, pl.team_label);
+  await renumberRoster(m.id, other);
+  if (['innings1', 'innings2'].includes(m.status)) { try { await promptMissing(m); await ensureTurnClock(m.id); } catch (_) {} }
+}
+bot.action(/^sw:(\d+):(\d+):([AB]):([yn])$/, async (ctx) => {
+  try {
+    const [, mid, pid, other, ans] = ctx.match;
+    const pl = await getPlayer(Number(pid));
+    if (!pl) return ctx.answerCbQuery('Player not found', { show_alert: true });
+    if (Number(pl.telegram_id) !== ctx.from.id) return ctx.answerCbQuery('Only that player can answer this.', { show_alert: true });
+    const m = await getMatch(Number(mid));
+    if (!m || !['waiting', 'captains', 'toss', 'innings1', 'innings2'].includes(m.status)) {
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+      return ctx.answerCbQuery('Match is over.');
+    }
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+    const disp = pl.username ? '@' + pl.username : name(pl);
+    if (ans === 'n') {
+      await ctx.answerCbQuery('Declined');
+      return ctx.reply(`❌ ${mdEsc(disp)} declined to join Team ${other}.`, { parse_mode: 'Markdown' });
+    }
+    if (pl.team_label === other) return ctx.answerCbQuery('Already in that team.');
+    await doSwap(m, pl, other);
+    await ctx.answerCbQuery('Joined');
+    await ctx.reply(`✅ ${mdEsc(disp)} joined *Team ${other}*.`, { parse_mode: 'Markdown' });
+  } catch (e) { console.error(e); }
 });
 
 // ─── /lang /setlang en|hi : choose default commentary language for this group ───
@@ -5164,7 +5293,7 @@ async function sendPickList(ctx, m, inn, kind) {
     const out = new Set(rows.filter((r) => r.is_out).map((r) => r.player_id));
     const live = new Set([inn.striker_player_id, inn.non_striker_player_id].filter(Boolean));
     body = pl
-      .map((p) => `${p.roster_position}. ${escapeHtml(shortName(p, 22))} ${out.has(p.id) ? pe('no', '❌') : live.has(p.id) ? pe('bat', '🏏') : ''}`.trimEnd())
+      .map((p) => `${p.roster_position}. ${escapeHtml(shortName(p, 22))} ${out.has(p.id) ? pe('no', '❌') : live.has(p.id) ? pe('bat', '🏏') : pe('ok', '✅')}`.trimEnd())
       .join('\n');
   } else {
     const { rows } = await q(`SELECT player_id, balls_bowled FROM bowling_stats WHERE innings_id=$1`, [inn.id]);
@@ -9618,6 +9747,7 @@ bot.action(/^bt:(.+):(A|B):(\d+)$/, async (ctx) => {
 });
 
 bot.command(['wallet', 'balance', 'coins', 'purse'], async (ctx) => {
+  if (/^\/purse\b/i.test(String((ctx.message && ctx.message.text) || '')) && (await tourPurseHook(ctx))) return;
   const w = await walletOf(ctx.from.id);
   return ctx.reply(`🏦 *WALLET* — ${mtag(ctx.from)}\n> 🪙 Coins: *${fmtCoins(w.coins)}*\n> Bonus: /daily (+${DAILY_COINS})`, {
     parse_mode: 'Markdown',
@@ -12410,74 +12540,233 @@ function startGrowthTicks() {
   setTimeout(() => { run(weeklyTick, 'weekly'); run(refTick, 'ref'); }, 20000);
   setInterval(() => run(weeklyTick, 'weekly'), 10 * 60 * 1000).unref();
   setInterval(() => run(refTick, 'ref'), 5 * 60 * 1000).unref();
+  setTimeout(() => { run(tunnelWatch, 'tunnel'); run(tourTick, 'tour'); }, 30000);
+  setInterval(() => run(tourTick, 'tour'), 60 * 1000).unref();
+  setInterval(() => run(tunnelWatch, 'tunnel'), 3 * 60 * 1000).unref();
 }
 
-// ── tournaments: /tournament, /register, /addcaptain, /abid (auction, 15s per player) ──
+// ── tournaments (r83): setup flow, registration, auction in sets of 10, schedule, points, Orange / Purple / MVP ──
+const AUC_SET = 10; // players per set
 const tourAuc = new Map(); // tournament id -> live auction state
+const tourSetup = new Map(); // `${chat}:${user}` -> { tid, step }
 const tName = (r) => String(r.name || (r.username ? '@' + r.username : 'Player')).slice(0, 24);
 const tTag = (r) => `<a href="tg://user?id=${Number(r.telegram_id)}">${escapeHtml(tName(r))}</a>`;
 const fullName = (u) => [u.first_name, u.last_name].filter(Boolean).join(' ').trim();
 const trep = (ctx) => ({ parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
+const tbtn = (text, data, style) => btn(text, data, null, style);
+const ROLE_LABEL = { bat: 'Batsman', bowl: 'Bowler', ar: 'All-rounder' };
+const ROLE_ICON = { bat: '🏏', bowl: '🎯', ar: '⚡' };
+const parseRole = (w) => { w = String(w || '').toLowerCase().replace(/[^a-z]/g, ''); if (/^(bat|batsman|batter|batting)$/.test(w)) return 'bat'; if (/^(bowl|bowler|bowling)$/.test(w)) return 'bowl'; if (/^(ar|allrounder|all|alr|allround)$/.test(w)) return 'ar'; return null; };
+const tm = (c) => (c && c.team_name ? String(c.team_name).slice(0, 24) : c ? tName(c) : '-');
+const slugOf = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const titleCase = (x) => String(x || '').replace(/_/g, ' ').trim().replace(/\b\w/g, (m) => m.toUpperCase()).slice(0, 24);
+async function findTeam(t, key) {
+  const caps = (await tourPlayers(t.id)).filter((r) => r.role === 'captain');
+  key = String(key || '').replace(/^@/, '');
+  if (/^\d+$/.test(key)) return caps.find((c) => Number(c.team_no) === Number(key)) || null;
+  return caps.find((c) => slugOf(c.team_name) === slugOf(key)) || null;
+}
+const tSay = (tg, chat, text, extra = {}) => tg.sendMessage(chat, text, { parse_mode: 'HTML', disable_web_page_preview: true, ...extra }).catch((e) => { console.error('tour send:', e.message); return null; });
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 async function activeTour(chatId) {
-  const { rows } = await q(`SELECT * FROM tournaments WHERE group_chat_id=$1 AND status IN ('registration','auction','ready') ORDER BY id DESC LIMIT 1`, [chatId]);
+  const { rows } = await q(`SELECT * FROM tournaments WHERE (group_chat_id=$1 OR auction_chat_id=$1) AND status NOT IN ('cancelled','done') ORDER BY id DESC LIMIT 1`, [chatId]);
   return rows[0] || null;
 }
+async function getTour(id) { return (await q(`SELECT * FROM tournaments WHERE id=$1`, [id])).rows[0] || null; }
+async function setTourStatus(id, status, extra = '') { await q(`UPDATE tournaments SET status=$2${extra} WHERE id=$1`, [id, status]); return getTour(id); }
 async function canManageTour(ctx, t) {
-  return Number(t.host_id) === ctx.from.id || isAdmin(ctx.from.id) || (await isGroupAdmin(ctx.chat.id, ctx.from.id));
+  return Number(t.host_id) === ctx.from.id || isAdmin(ctx.from.id) || (await isGroupAdmin(Number(t.group_chat_id), ctx.from.id));
 }
+const tourPlayers = async (tid) => (await q(`SELECT * FROM tournament_players WHERE tid=$1 ORDER BY role DESC, telegram_id`, [tid])).rows;
 async function tourText(t) {
-  const { rows } = await q(`SELECT * FROM tournament_players WHERE tid=$1 ORDER BY role DESC, telegram_id`, [t.id]);
-  const caps = rows.filter((r) => r.role === 'captain');
+  const rows = await tourPlayers(t.id);
+  const caps = rows.filter((r) => r.role === 'captain').sort((a, b) => (a.team_no || 99) - (b.team_no || 99));
   const pl = rows.filter((r) => r.role !== 'captain');
-  let s = `🏆 <b>${escapeHtml(t.name)}</b>\n<i>${t.status === 'registration' ? 'Registration open' : t.status === 'auction' ? 'Auction in progress' : 'Teams are set'} · squad ${t.team_size} · purse ${t.purse} · base ${t.base_price}</i>\n\n`;
-  s += `<b>Registered:</b> ${pl.length}   <b>Captains:</b> ${caps.length}\n`;
-  if (t.status === 'registration') {
-    s += caps.length ? `<blockquote>${caps.map((c) => '👑 ' + escapeHtml(tName(c))).join('\n')}</blockquote>` : '<i>No captains yet. Host: /addcaptain @user</i>\n';
-    s += `\n/register to join · /abid to start the auction`;
-  } else {
+  const phase = { setup: 'Setting up', caps_manual: 'Adding captains', caps_reg: 'Captain registration', registration: 'Player registration', awaiting_group: 'Waiting for the auction group', ready_auction: 'Ready for the auction', auction: 'Auction in progress', ready: 'Teams are set' }[t.status] || t.status;
+  let s = `🏆 <b>${escapeHtml(t.name)}</b>\n<i>${phase} · squad ${t.team_size} · purse ${t.purse} · base ${t.base_price}</i>\n\n`;
+  s += `<b>Teams:</b> ${caps.length}   <b>Players:</b> ${pl.filter((p) => !p.owner_id).length} in the pool\n`;
+  const nm = (id) => { const r = rows.find((x) => Number(x.telegram_id) === Number(id)); return r ? tName(r) : ''; };
+  if (['auction', 'ready'].includes(t.status) || pl.some((p) => p.owner_id)) {
     for (const c of caps) {
       const mine = pl.filter((p) => Number(p.owner_id) === Number(c.telegram_id));
-      s += `<blockquote><b>${escapeHtml(tName(c))}</b> (C) · purse ${c.purse ?? 0}\n${mine.length ? mine.map((p) => `${escapeHtml(tName(p))} · ${p.price ?? 0}`).join('\n') : '—'}</blockquote>`;
+      s += `<blockquote><b>${c.team_no || '-'}. ${escapeHtml(tm(c))}</b>\nC: ${escapeHtml(tName(c))}${c.vc_id ? ' · VC: ' + escapeHtml(nm(c.vc_id)) : ''}\nPurse ${c.purse ?? 0} · squad ${mine.length + 1}/${t.team_size}\n${mine.length ? mine.map((p) => `${ROLE_ICON[p.prole] || ''} ${escapeHtml(tName(p))}${Number(c.vc_id) === Number(p.telegram_id) ? ' (VC)' : ' · ' + (p.price ?? 0)}`).join('\n') : '—'}</blockquote>`;
     }
     const un = pl.filter((p) => !p.owner_id);
-    if (un.length) s += `<i>Unsold: ${un.map((p) => escapeHtml(tName(p))).join(', ')}</i>`;
-  }
+    if (un.length && t.status !== 'registration') s += `<i>Not sold yet: ${un.map((p) => escapeHtml(tName(p))).join(', ')}</i>`;
+  } else if (caps.length) s += `<blockquote>${caps.map((c) => `${c.team_no || '-'}. 👑 <b>${escapeHtml(tm(c))}</b>${c.team_name ? ' · ' + escapeHtml(tName(c)) : ''}`).join('\n')}</blockquote>`;
   return s;
+}
+
+// ── setup flow ──
+const setupKey = (chat, user) => `${chat}:${user}`;
+async function sendPhase(tg, chatId, t) {
+  const hostKey = setupKey(Number(t.group_chat_id), Number(t.host_id));
+  if (t.status === 'setup') {
+    return tSay(tg, chatId, `🏆 <b>${escapeHtml(t.name)}</b>\nHow do you want to add the captains?`, {
+      reply_markup: Markup.inlineKeyboard([[tbtn('𝗔𝗗𝗗 𝗠𝗔𝗡𝗨𝗔𝗟𝗟𝗬', `tr:cm:${t.id}:m`, 'primary'), tbtn('𝗖𝗔𝗣𝗧𝗔𝗜𝗡 𝗥𝗘𝗚𝗜𝗦𝗧𝗥𝗔𝗧𝗜𝗢𝗡', `tr:cm:${t.id}:r`, 'success')]]).reply_markup,
+    });
+  }
+  if (t.status === 'caps_manual') {
+    tourSetup.set(hostKey, { tid: t.id, step: 'caps' });
+    return tSay(tg, chatId, `<b>ADD CAPTAINS</b>\nHost, send the captain IDs or @usernames separated by spaces. You can also tag them.\nAt least 2 and at most 8 captains. They must have started this bot once.`);
+  }
+  if (t.status === 'caps_reg') {
+    return tSay(tg, chatId, `<b>CAPTAIN REGISTRATION</b>\nCaptains, tap the button below or send /registercap.\nHost, tap <b>Close</b> when all the captains have joined.`, {
+      reply_markup: Markup.inlineKeyboard([[tbtn('𝗥𝗘𝗚𝗜𝗦𝗧𝗘𝗥 𝗔𝗦 𝗖𝗔𝗣𝗧𝗔𝗜𝗡', `tr:cap:${t.id}`, 'success')], [tbtn('𝗖𝗟𝗢𝗦𝗘 𝗖𝗔𝗣𝗧𝗔𝗜𝗡 𝗥𝗘𝗚𝗜𝗦𝗧𝗥𝗔𝗧𝗜𝗢𝗡', `tr:cc:${t.id}`, 'danger')]]).reply_markup,
+    });
+  }
+  if (t.status === 'registration') {
+    return tSay(tg, chatId, `<b>PLAYER REGISTRATION</b> · ${escapeHtml(t.name)}\nPlayers, choose your role below or send /register bat, /register bowl or /register ar.\nHost, tap <b>Close</b> when registration is over.`, {
+      reply_markup: Markup.inlineKeyboard([[tbtn('🏏 𝗕𝗔𝗧𝗦𝗠𝗔𝗡', `tr:reg:${t.id}:bat`, 'primary'), tbtn('🎯 𝗕𝗢𝗪𝗟𝗘𝗥', `tr:reg:${t.id}:bowl`, 'danger')], [tbtn('⚡ 𝗔𝗟𝗟-𝗥𝗢𝗨𝗡𝗗𝗘𝗥', `tr:reg:${t.id}:ar`, 'success')], [tbtn('𝗖𝗟𝗢𝗦𝗘 𝗥𝗘𝗚𝗜𝗦𝗧𝗥𝗔𝗧𝗜𝗢𝗡', `tr:cr:${t.id}`, 'danger')]]).reply_markup,
+    });
+  }
+  if (t.status === 'awaiting_group') {
+    tourSetup.set(hostKey, { tid: t.id, step: 'agroup' });
+    return tSay(tg, chatId, `<b>AUCTION GROUP</b>\nHost, send your auction group ID.\nUse /id from Rose to get the group ID, then send it here.\nI must be a member of that group and allowed to send messages.`, {
+      reply_markup: Markup.inlineKeyboard([[tbtn('𝗨𝗦𝗘 𝗧𝗛𝗜𝗦 𝗚𝗥𝗢𝗨𝗣', `tr:ag:${t.id}`, 'primary')]]).reply_markup,
+    });
+  }
+  if (t.status === 'ready_auction') {
+    return tSay(tg, chatId, (await tourText(t)) + `\n<blockquote>Auction group: <b>${escapeHtml(String(t.auction_chat_title || t.auction_chat_id))}</b>\nPlayers come in sets of ${AUC_SET}. Each player is sold automatically after ${AUC_SECONDS}s without a higher bid.</blockquote>`, {
+      reply_markup: Markup.inlineKeyboard([[tbtn('𝗦𝗧𝗔𝗥𝗧 𝗔𝗨𝗖𝗧𝗜𝗢𝗡', `tr:go:${t.id}`, 'success')]]).reply_markup,
+    });
+  }
+  return tSay(tg, chatId, await tourText(t));
 }
 bot.command(['tournament', 'tourney'], async (ctx) => {
   if (!isGroup(ctx)) return ctx.reply('Use this command in a group.');
   const ex = await activeTour(ctx.chat.id);
-  if (ex) return ctx.reply(await tourText(ex), trep(ctx));
+  if (ex) return sendPhase(ctx.telegram, ctx.chat.id, ex);
   if (!(isAdmin(ctx.from.id) || (await isGroupAdmin(ctx.chat.id, ctx.from.id)))) return ctx.reply('Only a group admin can start a tournament.', trep(ctx));
-  const name = (cmdArgs(ctx) || 'Cric Monster Cup').slice(0, 40);
-  const { rows } = await q(`INSERT INTO tournaments (group_chat_id, group_title, name, host_id) VALUES ($1,$2,$3,$4) RETURNING *`, [ctx.chat.id, ctx.chat.title || null, name, ctx.from.id]);
+  const given = cmdArgs(ctx).slice(0, 40);
+  const { rows } = await q(`INSERT INTO tournaments (group_chat_id, group_title, name, host_id, status) VALUES ($1,$2,$3,$4,'setup') RETURNING *`, [ctx.chat.id, ctx.chat.title || null, given || 'Tournament', ctx.from.id]);
   const t = rows[0];
-  return ctx.reply(
-    `🏆 <b>${escapeHtml(t.name)}</b>\nRegistration is open.\n<blockquote><b>/register</b> — join (set automatically)\n<b>/unregister</b> — leave\n<b>/addcaptain @user</b> — host adds captains\n<b>/abid</b> — host starts the auction, every player is sold automatically (${AUC_SECONDS}s per player)\n<b>/tlist</b> — players and teams\n<b>/tset size 6 purse 1000 base 50</b> — settings\n<b>/endtour</b> — cancel</blockquote>`,
-    trep(ctx)
-  );
+  if (!given) {
+    tourSetup.set(setupKey(ctx.chat.id, ctx.from.id), { tid: t.id, step: 'name' });
+    return ctx.reply('🏆 <b>NEW TOURNAMENT</b>\nSend the tournament name.', trep(ctx));
+  }
+  return sendPhase(ctx.telegram, ctx.chat.id, t);
 });
-bot.command('tlist', async (ctx) => {
-  if (!isGroup(ctx)) return;
-  const t = await activeTour(ctx.chat.id);
-  return ctx.reply(t ? await tourText(t) : 'No tournament here. An admin can start one with /tournament.', trep(ctx));
-});
+function tourTextMw(ctx, next) {
+  const text = ctx.message && ctx.message.text;
+  if (!text || text.startsWith('/') || !ctx.from || !ctx.chat || /^[0-6]$/.test(text.trim())) return next();
+  const st = tourSetup.get(setupKey(ctx.chat.id, ctx.from.id));
+  if (!st) return next();
+  return handleSetupText(ctx, st, text).catch((e) => console.error('tour setup:', e.message));
+}
+async function resolveUsers(ctx, text) {
+  const ids = new Set(), names = new Set();
+  for (const e of ctx.message.entities || []) if (e.type === 'text_mention' && e.user && !e.user.is_bot) ids.add(e.user.id);
+  for (const tok of text.split(/[\s,]+/)) {
+    if (/^-?\d{5,}$/.test(tok)) ids.add(Number(tok));
+    else if (/^@[A-Za-z0-9_]{3,}$/.test(tok)) names.add(tok.slice(1).toLowerCase());
+  }
+  if (!ids.size && !names.size) return { found: [], missing: [] };
+  const { rows } = await q(`SELECT telegram_id, username, first_name, last_name FROM users WHERE telegram_id = ANY($1::bigint[]) OR LOWER(username) = ANY($2::text[])`, [[...ids], [...names]]);
+  const found = rows.map((r) => ({ id: Number(r.telegram_id), username: r.username, name: fullName(r) || r.username || String(r.telegram_id) }));
+  const missing = [...ids].filter((i) => !found.some((f) => f.id === i)).map(String).concat([...names].filter((n) => !found.some((f) => (f.username || '').toLowerCase() === n)).map((n) => '@' + n));
+  return { found, missing };
+}
+async function addCaptain(t, u, teamName) {
+  const ex = (await q(`SELECT team_no FROM tournament_players WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id])).rows[0];
+  const no = (ex && ex.team_no) || (await q(`SELECT COALESCE(MAX(team_no),0)::int+1 AS n FROM tournament_players WHERE tid=$1`, [t.id])).rows[0].n;
+  await q(`INSERT INTO tournament_players (tid, telegram_id, name, username, role, purse, team_no, team_name) VALUES ($1,$2,$3,$4,'captain',$5,$6,$7)
+           ON CONFLICT (tid, telegram_id) DO UPDATE SET role='captain', purse=EXCLUDED.purse, owner_id=NULL, price=NULL, team_no=EXCLUDED.team_no, team_name=COALESCE(EXCLUDED.team_name, tournament_players.team_name)`,
+    [t.id, u.id, u.name || null, u.username || null, t.purse, no, teamName || null]);
+}
+async function handleSetupText(ctx, st, text) {
+  const t = await getTour(st.tid);
+  const key = setupKey(ctx.chat.id, ctx.from.id);
+  if (!t || ['cancelled', 'done'].includes(t.status)) { tourSetup.delete(key); return; }
+  if (Number(t.host_id) !== ctx.from.id) return;
+  if (st.step === 'name') {
+    const name = text.trim().slice(0, 40);
+    if (!name) return;
+    tourSetup.delete(key);
+    await q(`UPDATE tournaments SET name=$2 WHERE id=$1`, [t.id, name]);
+    return sendPhase(ctx.telegram, ctx.chat.id, await getTour(t.id));
+  }
+  if (st.step === 'caps') {
+    const { found, missing } = await resolveUsers(ctx, text);
+    const have = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='captain'`, [t.id])).rows[0].c;
+    const out = [];
+    let n = have;
+    for (const u of found) { if (n >= 8) { out.push('Maximum 8 captains.'); break; } await addCaptain(t, u); n++; out.push(`👑 ${escapeHtml(u.name)} is a captain`); }
+    if (missing.length) out.push(`Not found (they must start this bot first): ${escapeHtml(missing.join(', '))}`);
+    if (!found.length && !missing.length) out.push('I could not read any ID or @username. Send them again.');
+    if (n >= 2) {
+      tourSetup.delete(key);
+      await tSay(ctx.telegram, ctx.chat.id, out.join('\n') + `\n\n<b>${n}</b> captains added.`);
+      return sendPhase(ctx.telegram, ctx.chat.id, await setTourStatus(t.id, 'registration'));
+    }
+    return tSay(ctx.telegram, ctx.chat.id, out.join('\n') + '\n\nSend at least 2 captains. Send more IDs.');
+  }
+  if (st.step === 'agroup') {
+    const m = text.trim().match(/^-?\d{5,}$/);
+    if (!m) return tSay(ctx.telegram, ctx.chat.id, 'That is not a group ID. Group IDs look like <code>-1001234567890</code>. Use /id from Rose and send it again.');
+    return linkAuctionGroup(ctx.telegram, t, Number(m[0]), ctx.chat.id, key);
+  }
+}
+async function linkAuctionGroup(tg, t, gid, replyChat, key) {
+  try {
+    const chat = await tg.getChat(gid);
+    if (!['group', 'supergroup'].includes(chat.type)) throw new Error('not a group');
+    await tg.sendMessage(gid, `🏆 <b>${escapeHtml(t.name)}</b>\nThis group is now the auction group.`, { parse_mode: 'HTML' });
+    tourSetup.delete(key);
+    await q(`UPDATE tournaments SET auction_chat_id=$2, auction_chat_title=$3 WHERE id=$1`, [t.id, gid, chat.title || null]);
+    return sendPhase(tg, replyChat, await setTourStatus(t.id, 'ready_auction'));
+  } catch (e) {
+    return tSay(tg, replyChat, `I cannot post in that group. Add me to the group, allow me to send messages, then send the ID again.\n<i>${escapeHtml(String(e.message || e).slice(0, 120))}</i>`);
+  }
+}
+
+// ── registration ──
+async function registerPlayer(t, u, role) {
+  if (t.status !== 'registration') return { ok: false, msg: 'Player registration is not open.' };
+  role = role || 'ar';
+  const ex = await q(`SELECT role FROM tournament_players WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id]);
+  const who = tTag({ telegram_id: u.id, name: fullName(u), username: u.username });
+  if (ex.rows.length) {
+    if (ex.rows[0].role === 'captain') return { ok: false, msg: 'You are a captain, so you do not need to register.' };
+    await q(`UPDATE tournament_players SET prole=$3 WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id, role]);
+    return { ok: true, silent: true, msg: `${who} is already registered. Role changed to <b>${ROLE_LABEL[role]}</b>.` };
+  }
+  await q(`INSERT INTO tournament_players (tid, telegram_id, name, username, prole) VALUES ($1,$2,$3,$4,$5)`, [t.id, u.id, fullName(u) || null, u.username || null, role]);
+  const n = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='player'`, [t.id])).rows[0].c;
+  return { ok: true, n, msg: `✅ ${who} is registered as <b>${ROLE_ICON[role]} ${ROLE_LABEL[role]}</b> for <b>${escapeHtml(t.name)}</b>. Players so far: <b>${n}</b>` };
+}
+const roleKb = (tid) => Markup.inlineKeyboard([[tbtn('🏏 𝗕𝗔𝗧𝗦𝗠𝗔𝗡', `tr:reg:${tid}:bat`, 'primary'), tbtn('🎯 𝗕𝗢𝗪𝗟𝗘𝗥', `tr:reg:${tid}:bowl`, 'danger'), tbtn('⚡ 𝗔𝗟𝗟-𝗥𝗢𝗨𝗡𝗗𝗘𝗥', `tr:reg:${tid}:ar`, 'success')]]);
+async function registerCaptain(t, u) {
+  if (t.status !== 'caps_reg') return { ok: false, msg: 'Captain registration is not open.' };
+  const ex = await q(`SELECT role FROM tournament_players WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id]);
+  if (ex.rows.length && ex.rows[0].role === 'captain') return { ok: false, msg: 'You are already a captain.' };
+  const n = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='captain'`, [t.id])).rows[0].c;
+  if (n >= 8) return { ok: false, msg: 'There are already 8 captains.' };
+  await addCaptain(t, { id: u.id, name: fullName(u), username: u.username });
+  return { ok: true, n: n + 1, msg: `👑 ${tTag({ telegram_id: u.id, name: fullName(u), username: u.username })} is a captain. Captains so far: <b>${n + 1}</b>` };
+}
 bot.command('register', async (ctx) => {
   if (!isGroup(ctx)) return ctx.reply('Use /register in the tournament group.');
   const t = await activeTour(ctx.chat.id);
   if (!t) return ctx.reply('No tournament is open. An admin can start one with /tournament.', trep(ctx));
-  if (t.status !== 'registration') return ctx.reply('Registration is closed. The auction has started.', trep(ctx));
-  const me = { telegram_id: ctx.from.id, name: fullName(ctx.from), username: ctx.from.username || null };
-  const ins = await q(`INSERT INTO tournament_players (tid, telegram_id, name, username) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING 1`, [t.id, me.telegram_id, me.name || null, me.username]);
-  const n = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='player'`, [t.id])).rows[0].c;
-  if (!ins.rows.length) return ctx.reply(`❌ ${tTag(me)} you are already registered.`, trep(ctx));
-  return ctx.reply(`✅ ${tTag(me)} registered for <b>${escapeHtml(t.name)}</b> · ${n} player${n === 1 ? '' : 's'}`, trep(ctx));
+  if (t.status !== 'registration') return ctx.reply('❌ Player registration is not open.', trep(ctx));
+  const role = parseRole(cmdArgs(ctx).split(/\s+/)[0]);
+  if (!role) return ctx.reply('Choose your role to register:', { ...trep(ctx), reply_markup: roleKb(t.id).reply_markup });
+  const r = await registerPlayer(t, ctx.from, role);
+  return ctx.reply(r.ok ? r.msg : '❌ ' + r.msg, trep(ctx));
+});
+bot.command(['registercap', 'regcap'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t) return ctx.reply('No tournament is open.', trep(ctx));
+  const r = await registerCaptain(t, ctx.from);
+  return ctx.reply(r.ok ? r.msg : '❌ ' + r.msg, trep(ctx));
 });
 bot.command('unregister', async (ctx) => {
   if (!isGroup(ctx)) return;
   const t = await activeTour(ctx.chat.id);
   if (!t || t.status !== 'registration') return ctx.reply('Nothing to leave right now.', trep(ctx));
-  const d = await q(`DELETE FROM tournament_players WHERE tid=$1 AND telegram_id=$2 RETURNING 1`, [t.id, ctx.from.id]);
+  const d = await q(`DELETE FROM tournament_players WHERE tid=$1 AND telegram_id=$2 AND role='player' RETURNING 1`, [t.id, ctx.from.id]);
   return ctx.reply(d.rows.length ? 'You are out of the tournament.' : 'You were not registered.', trep(ctx));
 });
 bot.command(['addcaptain', 'addcap'], async (ctx) => {
@@ -12485,47 +12774,41 @@ bot.command(['addcaptain', 'addcap'], async (ctx) => {
   const t = await activeTour(ctx.chat.id);
   if (!t) return ctx.reply('No tournament is open.', trep(ctx));
   if (!(await canManageTour(ctx, t))) return ctx.reply('Only the host or a group admin can add captains.', trep(ctx));
-  if (t.status !== 'registration') return ctx.reply('Captains can only be added before the auction.', trep(ctx));
-  const targets = parseAddTargets(ctx);
-  if (!targets.length) return ctx.reply('Usage: /addcaptain @user  (or reply to someone, or send a user id)', trep(ctx));
-  const out = [];
-  for (const tg of targets) {
-    const u = await resolveTarget(ctx, tg);
-    if (!u) { out.push(`❌ ${escapeHtml(tg.username ? '@' + tg.username : String(tg.id))} not found (they must have used the bot)`); continue; }
-    const cnt = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='captain' AND telegram_id<>$2`, [t.id, u.id])).rows[0].c;
-    if (cnt >= 8) { out.push('❌ Maximum 8 captains'); break; }
-    await q(`INSERT INTO tournament_players (tid, telegram_id, name, username, role, purse) VALUES ($1,$2,$3,$4,'captain',$5)
-             ON CONFLICT (tid, telegram_id) DO UPDATE SET role='captain', purse=EXCLUDED.purse`, [t.id, u.id, fullName(u) || null, u.username || null, t.purse]);
-    out.push(`👑 ${tTag({ telegram_id: u.id, name: fullName(u), username: u.username })} is a captain`);
+  if (!['setup', 'caps_manual', 'caps_reg', 'registration'].includes(t.status)) return ctx.reply('Captains can only be added before the auction.', trep(ctx));
+  const { found, missing } = await resolveUsers(ctx, cmdArgs(ctx));
+  if (!found.length && !missing.length && ctx.message.reply_to_message && ctx.message.reply_to_message.from) {
+    const f = ctx.message.reply_to_message.from;
+    found.push({ id: f.id, username: f.username, name: fullName(f) || f.username || String(f.id) });
   }
+  if (!found.length && !missing.length) return ctx.reply('Usage: /addcaptain @user  (or reply to a user, or send a user ID)', trep(ctx));
+  const out = [];
+  for (const u of found) { await addCaptain(t, u); out.push(`👑 ${escapeHtml(u.name)} is a captain`); }
+  if (missing.length) out.push(`Not found (they must start this bot first): ${escapeHtml(missing.join(', '))}`);
   return ctx.reply(out.join('\n'), trep(ctx));
 });
 bot.command(['remcaptain', 'removecaptain'], async (ctx) => {
   if (!isGroup(ctx)) return;
   const t = await activeTour(ctx.chat.id);
-  if (!t || t.status !== 'registration') return;
-  if (!(await canManageTour(ctx, t))) return;
-  for (const tg of parseAddTargets(ctx)) {
-    const u = await resolveTarget(ctx, tg);
-    if (u) await q(`UPDATE tournament_players SET role='player', purse=NULL WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id]);
-  }
-  return ctx.reply('Captain list updated. See /tlist', trep(ctx));
+  if (!t || !(await canManageTour(ctx, t)) || t.status === 'auction' || t.status === 'ready') return;
+  const { found } = await resolveUsers(ctx, cmdArgs(ctx));
+  for (const u of found) await q(`UPDATE tournament_players SET role='player', purse=NULL WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id]);
+  return ctx.reply('Captain list updated. See /teamlist', trep(ctx));
 });
 bot.command('tset', async (ctx) => {
   if (!isGroup(ctx)) return;
   const t = await activeTour(ctx.chat.id);
   if (!t) return;
   if (!(await canManageTour(ctx, t))) return ctx.reply('Only the host or a group admin can change settings.', trep(ctx));
-  if (t.status !== 'registration') return ctx.reply('Settings are locked once the auction starts.', trep(ctx));
+  if (['auction', 'ready'].includes(t.status)) return ctx.reply('Settings are locked once the auction starts.', trep(ctx));
   const a = cmdArgs(ctx).toLowerCase().split(/\s+/);
   const lim = { size: ['team_size', 2, 15], purse: ['purse', 100, 100000], base: ['base_price', 10, 10000] };
   for (let i = 0; i + 1 < a.length; i += 2) {
     const L = lim[a[i]]; const v = parseInt(a[i + 1], 10);
     if (L && v >= L[1] && v <= L[2]) await q(`UPDATE tournaments SET ${L[0]}=$2 WHERE id=$1`, [t.id, v]);
   }
-  const t2 = (await q(`SELECT * FROM tournaments WHERE id=$1`, [t.id])).rows[0];
+  const t2 = await getTour(t.id);
   await q(`UPDATE tournament_players SET purse=$2 WHERE tid=$1 AND role='captain'`, [t.id, t2.purse]);
-  return ctx.reply(`Settings: squad <b>${t2.team_size}</b> · purse <b>${t2.purse}</b> · base price <b>${t2.base_price}</b>`, trep(ctx));
+  return ctx.reply(`Settings: squad <b>${t2.team_size}</b> (captain included) · purse <b>${t2.purse}</b> · base price <b>${t2.base_price}</b>\nChange them with: /tset size 6 purse 1000 base 50`, trep(ctx));
 });
 bot.command(['endtour', 'canceltour'], async (ctx) => {
   if (!isGroup(ctx)) return;
@@ -12534,41 +12817,204 @@ bot.command(['endtour', 'canceltour'], async (ctx) => {
   if (!(await canManageTour(ctx, t))) return ctx.reply('Only the host or a group admin can cancel.', trep(ctx));
   const S = tourAuc.get(String(t.id));
   if (S) { clearTimeout(S.timer); clearTimeout(S.warn); tourAuc.delete(String(t.id)); }
+  tourSetup.delete(setupKey(Number(t.group_chat_id), Number(t.host_id)));
   await q(`UPDATE tournaments SET status='cancelled' WHERE id=$1`, [t.id]);
-  return ctx.reply(`Tournament <b>${escapeHtml(t.name)}</b> cancelled.`, trep(ctx));
+  return ctx.reply(`Tournament <b>${escapeHtml(t.name)}</b> is cancelled.`, trep(ctx));
+});
+bot.command(['teamlist', 'teams', 'tlist'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  return ctx.reply(t ? await tourText(t) : 'No tournament here. An admin can start one with /tournament.', trep(ctx));
 });
 
-// the auction
-function aucStep(S) { return Math.max(10, S.t.base_price); }
+// panel buttons
+bot.action(/^tr:(\w+):(\d+)(?::(\w+))?$/, async (ctx) => {
+  try {
+    const act = ctx.match[1], t = await getTour(ctx.match[2]), arg = ctx.match[3];
+    if (!t || ['cancelled', 'done'].includes(t.status)) return ctx.answerCbQuery('This tournament is closed.', { show_alert: true });
+    const chatId = ctx.chat.id;
+    if (act === 'cap') {
+      const r = await registerCaptain(t, ctx.from);
+      await ctx.answerCbQuery(r.ok ? 'You are a captain' : r.msg, { show_alert: !r.ok });
+      if (r.ok) await tSay(ctx.telegram, chatId, r.msg);
+      return;
+    }
+    if (act === 'reg') {
+      const r = await registerPlayer(t, ctx.from, parseRole(arg) || 'ar');
+      await ctx.answerCbQuery(r.ok ? (r.silent ? 'Role changed' : 'Registered') : r.msg, { show_alert: !r.ok });
+      if (r.ok && !r.silent) await tSay(ctx.telegram, chatId, r.msg);
+      return;
+    }
+    if (!(await canManageTour(ctx, t))) return ctx.answerCbQuery('Only the host can use this button.', { show_alert: true });
+    await ctx.answerCbQuery().catch(() => {});
+    if (act === 'cm' && t.status === 'setup') {
+      await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+      return sendPhase(ctx.telegram, chatId, await setTourStatus(t.id, arg === 'm' ? 'caps_manual' : 'caps_reg'));
+    }
+    if (act === 'cc' && t.status === 'caps_reg') {
+      const n = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='captain'`, [t.id])).rows[0].c;
+      if (n < 2) return tSay(ctx.telegram, chatId, 'At least 2 captains are needed before you can close captain registration.');
+      await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+      return sendPhase(ctx.telegram, chatId, await setTourStatus(t.id, 'registration'));
+    }
+    if (act === 'cr' && t.status === 'registration') {
+      const rows = await tourPlayers(t.id);
+      const caps = rows.filter((r) => r.role === 'captain').length, pl = rows.filter((r) => r.role !== 'captain').length;
+      if (caps < 2) return tSay(ctx.telegram, chatId, 'You need at least 2 captains. Use /addcaptain @user');
+      if (!pl) return tSay(ctx.telegram, chatId, 'No players are registered yet.');
+      await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+      await tSay(ctx.telegram, chatId, `Registration is closed with <b>${pl}</b> players and <b>${caps}</b> captains.`);
+      return sendPhase(ctx.telegram, chatId, await setTourStatus(t.id, 'awaiting_group'));
+    }
+    if (act === 'ag' && t.status === 'awaiting_group') {
+      await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+      return linkAuctionGroup(ctx.telegram, t, Number(t.group_chat_id), chatId, setupKey(Number(t.group_chat_id), Number(t.host_id)));
+    }
+    if (act === 'go' && t.status === 'ready_auction') {
+      await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+      return startAuction(ctx.telegram, t);
+    }
+  } catch (e) { console.error('tr action:', e.message); await ctx.answerCbQuery('Error').catch(() => {}); }
+});
+
+// ── the auction ──
+const aucGifs = new Map();
+let aucGifsLoaded = false;
+async function loadAucGifs() { const { rows } = await q(`SELECT k, file_id, kind FROM auction_gifs`); aucGifs.clear(); rows.forEach((r) => aucGifs.set(r.k, r)); aucGifsLoaded = true; }
+async function aucGif(kind, role) {
+  if (!aucGifsLoaded) { try { await loadAucGifs(); } catch (_) { return null; } }
+  return aucGifs.get(`${kind}_${role || 'ar'}`) || null;
+}
+// ── custom auction card (sharp): DP, name, @username, role, live bid / sold ──
+const AUC_ROLE_STYLE = { bat: ['BATSMAN', '#e11d2e'], bowl: ['BOWLER', '#2563eb'], ar: ['ALL-ROUNDER', '#16a34a'] };
+async function aucCard(S, mode) {
+  try {
+    needSharp();
+    const W = 1080, p = S.cur, role = p.prole || 'ar';
+    const [roleTxt, roleCol] = AUC_ROLE_STYLE[role] || AUC_ROLE_STYLE.ar;
+    const bidder = S.bidder ? S.caps.get(S.bidder) : null;
+    const teamName = cleanName(bidder ? tm(bidder) : '', '').toUpperCase().slice(0, 22);
+    const sold = mode === 'sold', unsold = mode === 'unsold';
+    const accent = sold ? '#22c55e' : unsold ? '#9ca3af' : '#f5c242';
+    const bg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${W}">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#14070b"/><stop offset="1" stop-color="#050507"/></linearGradient>
+        <radialGradient id="r" cx="50%" cy="34%" r="55%"><stop offset="0" stop-color="#e11d2e" stop-opacity="0.55"/><stop offset="1" stop-color="#e11d2e" stop-opacity="0"/></radialGradient>
+        <linearGradient id="f" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f8d777"/><stop offset="1" stop-color="#b9791f"/></linearGradient>
+      </defs>
+      <rect width="${W}" height="${W}" fill="url(#g)"/><rect width="${W}" height="${W}" fill="url(#r)"/>
+      <rect x="22" y="22" width="${W - 44}" height="${W - 44}" rx="38" fill="none" stroke="url(#f)" stroke-width="6"/>
+      <rect x="40" y="40" width="${W - 80}" height="${W - 80}" rx="28" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+      <circle cx="540" cy="372" r="232" fill="none" stroke="url(#f)" stroke-width="12"/>
+      <circle cx="540" cy="372" r="248" fill="none" stroke="#e11d2e" stroke-opacity="0.5" stroke-width="4"/>
+      <rect x="70" y="838" width="${W - 140}" height="172" rx="30" fill="#ffffff" fill-opacity="0.07" stroke="${accent}" stroke-opacity="0.8" stroke-width="3"/>
+      <rect x="${540 - 170}" y="626" width="340" height="62" rx="31" fill="${roleCol}"/>
+    </svg>`);
+    const dpBuf = S.dpFor === p.telegram_id ? S.dpBuf : await miniAvatar(Number(p.telegram_id)).catch(() => null);
+    S.dpFor = p.telegram_id; S.dpBuf = dpBuf;
+    const dp = await circleImage(dpBuf, 440);
+    const L = [{ input: dp, left: 540 - 220, top: 372 - 220 }];
+    const add = (img, cx, cy) => L.push(centered(img, cx, cy));
+    add(await popFit('CRIC MONSTER AUCTION', 34, 700, '#f5c242'), 540, 78);
+    add(await popFit(`SET ${S.setNo}  |  PLAYER ${S.n}/${S.total}`, 26, 700, '#c9c9d1', false), 540, 118);
+    add(await popFit(roleTxt, 34, 300, '#ffffff'), 540, 657);
+    add(await goldText(cleanName(tName(p), 'Player').toUpperCase(), 84, 920, { pop: true, squeeze: 0.85 }), 540, 740);
+    if (p.username) add(await popFit('@' + cleanName(p.username, ''), 36, 800, '#d1d5db', false), 540, 800);
+    const money = (v) => String(v);
+    if (sold) {
+      add(await popFit('SOLD', 64, 300, '#22c55e'), 300, 898);
+      add(await popFit(money(S.price) + ' COINS', 64, 460, '#f5c242'), 760, 898);
+      add(await popFit('to ' + (teamName || 'TEAM'), 40, 940, '#ffffff'), 540, 970);
+    } else if (unsold) {
+      add(await popFit('UNSOLD', 72, 600, '#9ca3af'), 540, 924);
+    } else if (bidder) {
+      add(await popFit('CURRENT BID', 32, 360, '#c9c9d1', false), 300, 884);
+      add(await popFit(money(S.price), 86, 440, '#f5c242'), 300, 950);
+      add(await popFit('HIGHEST BIDDER', 32, 400, '#c9c9d1', false), 790, 884);
+      add(await popFit(teamName || 'TEAM', 52, 380, '#ffffff'), 790, 950);
+    } else {
+      add(await popFit('BASE PRICE', 32, 400, '#c9c9d1', false), 540, 884);
+      add(await popFit(money(S.price) + ' COINS', 86, 900, '#f5c242'), 540, 950);
+    }
+    return await sharp(bg).composite(L).jpeg({ quality: 88 }).toBuffer();
+  } catch (e) {
+    console.error('aucCard:', e.message);
+    return null;
+  }
+}
+const sendMedia = (tg, chat, g, caption, extra) => { const o = { caption, parse_mode: 'HTML', ...extra }; return g.kind === 'video' ? tg.sendVideo(chat, g.file_id, o) : g.kind === 'photo' ? tg.sendPhoto(chat, g.file_id, o) : tg.sendAnimation(chat, g.file_id, o); };
+const mediaOf = (g, caption) => ({ type: g.kind === 'video' ? 'video' : g.kind === 'photo' ? 'photo' : 'animation', media: g.file_id, caption, parse_mode: 'HTML' });
+const aucStep = (S) => Math.max(10, S.t.base_price);
 function aucAsk(S) {
   const st = aucStep(S);
   return S.bidder ? [S.price + st, S.price + st * 2, S.price + st * 4] : [S.price, S.price + st, S.price + st * 2];
 }
 function aucText(S, warn) {
   const c = S.bidder ? S.caps.get(S.bidder) : null;
-  return `🔨 <b>PLAYER ON THE BLOCK</b>  ·  ${S.sold + S.unsold.length + 1}/${S.total}\n<blockquote><b>${escapeHtml(tName(S.cur))}</b></blockquote>` +
-    (c ? `Highest bid: <b>${S.price}</b> by <b>${escapeHtml(tName(c))}</b>` : `Base price: <b>${S.price}</b> · no bids yet`) +
-    `\n${warn ? '⏳ <b>5 seconds left!</b>' : `⏱ Sold automatically after ${AUC_SECONDS}s without a higher bid`}`;
+  const inSet = ((S.n - 1) % AUC_SET) + 1;
+  const role = S.cur.prole || 'ar';
+  return `🔨 <b>PLAYER ON THE BLOCK</b>\n<i>Set ${S.setNo}/${S.setTotal} · player ${inSet}/${Math.min(AUC_SET, S.total - (S.setNo - 1) * AUC_SET)} · overall ${S.n}/${S.total}</i>\n<blockquote><b>${escapeHtml(tName(S.cur))}</b>${S.cur.username ? ' · @' + escapeHtml(S.cur.username) : ''}\n${ROLE_ICON[role]} ${ROLE_LABEL[role]}</blockquote>` +
+    (c ? `Highest bid: <b>${S.price}</b> by <b>${escapeHtml(tm(c))}</b>` : `Base price: <b>${S.price}</b> · no bids yet`) +
+    `\n${warn ? '⏳ <b>5 seconds left!</b>' : `⏱ Sold automatically after ${AUC_SECONDS}s without a higher bid`}\n<i>Captains and vice captains: tap a button or send /bid &lt;amount&gt;</i>`;
 }
-function aucKb(S) {
-  return Markup.inlineKeyboard([aucAsk(S).map((p) => btn(`BID ${p}`, `ab:${S.tid}:${S.seq}:${p}`, null, 'success'))]);
+const aucKb = (S) => Markup.inlineKeyboard([aucAsk(S).map((p) => tbtn(`BID ${p}`, `ab:${S.tid}:${S.seq}:${p}`, 'success'))]);
+function aucEdit(S, warn) {
+  const extra = { parse_mode: 'HTML', reply_markup: aucKb(S).reply_markup };
+  const text = aucText(S, warn);
+  return (S.media ? S.tg.editMessageCaption(S.chatId, S.msgId, undefined, text, extra) : S.tg.editMessageText(S.chatId, S.msgId, undefined, text, extra)).catch(() => {});
+}
+async function aucAfterBid(S) {
+  if (S.media && S.card) {
+    const buf = await aucCard(S, 'bid');
+    if (buf) { try { await S.tg.editMessageMedia(S.chatId, S.msgId, undefined, { type: 'photo', media: { source: buf }, caption: aucText(S), parse_mode: 'HTML' }, { reply_markup: aucKb(S).reply_markup }); return; } catch (e) { if (!/not modified/i.test(e.message)) console.error('auc bid card:', e.message); } }
+  }
+  if (S.media && !S.bidMedia && !S.card) {
+    S.bidMedia = true;
+    const g = await aucGif('bid', S.cur.prole);
+    if (g) { try { await S.tg.editMessageMedia(S.chatId, S.msgId, undefined, mediaOf(g, aucText(S)), { reply_markup: aucKb(S).reply_markup }); return; } catch (_) {} }
+  }
+  return aucEdit(S, false);
+}
+async function aucFinalEdit(S, kind, text) {
+  if (S.media && S.card) {
+    const buf = await aucCard(S, kind === 'sold' ? 'sold' : 'unsold');
+    if (buf) { try { await S.tg.editMessageMedia(S.chatId, S.msgId, undefined, { type: 'photo', media: { source: buf }, caption: text, parse_mode: 'HTML' }); return; } catch (e) { console.error('auc final card:', e.message); } }
+  }
+  if (S.media) {
+    const g = kind === 'sold' ? await aucGif('sold', S.cur.prole) : null;
+    if (g && !S.card) { try { await S.tg.editMessageMedia(S.chatId, S.msgId, undefined, mediaOf(g, text)); return; } catch (_) {} }
+    return S.tg.editMessageCaption(S.chatId, S.msgId, undefined, text, { parse_mode: 'HTML' }).catch(() => {});
+  }
+  return S.tg.editMessageText(S.chatId, S.msgId, undefined, text, { parse_mode: 'HTML' }).catch(() => {});
 }
 function aucArm(S) {
   clearTimeout(S.timer); clearTimeout(S.warn);
   const seq = S.seq;
-  S.warn = setTimeout(() => {
-    if (S.seq !== seq) return;
-    S.tg.editMessageText(S.chatId, S.msgId, undefined, aucText(S, true), { parse_mode: 'HTML', reply_markup: aucKb(S).reply_markup }).catch(() => {});
-  }, (AUC_SECONDS - 5) * 1000);
+  S.warn = setTimeout(() => { if (S.seq === seq) aucEdit(S, true); }, (AUC_SECONDS - 5) * 1000);
   S.timer = setTimeout(() => aucClose(S, seq).catch((e) => console.error('auction close:', e.message)), AUC_SECONDS * 1000);
 }
 async function aucNext(S) {
   if (!tourAuc.has(String(S.tid))) return;
   const open = [...S.caps.values()].filter((c) => c.count < S.t.team_size - 1);
   if (!open.length || !S.queue.length) return aucFinish(S);
-  S.cur = S.queue.shift();
-  S.seq++; S.price = S.t.base_price; S.bidder = null;
-  const m = await S.tg.sendMessage(S.chatId, aucText(S), { parse_mode: 'HTML', reply_markup: aucKb(S).reply_markup });
+  if (S.n % AUC_SET === 0) {
+    S.setNo = Math.floor(S.n / AUC_SET) + 1;
+    S.setSold = 0; S.setUnsold = 0;
+    await S.tg.sendMessage(S.chatId, `📦 <b>SET ${S.setNo}/${S.setTotal}</b> — ${Math.min(AUC_SET, S.total - S.n)} players`, { parse_mode: 'HTML' }).catch(() => {});
+    await sleepMs(2500);
+  }
+  S.cur = S.queue.shift(); S.n++;
+  S.seq++; S.price = S.t.base_price; S.bidder = null; S.bidMedia = false;
+  const caption = aucText(S);
+  const g = await aucGif('entry', S.cur.prole);
+  let m = null;
+  S.card = false;
+  if (!g) {
+    const buf = await aucCard(S, 'entry');
+    if (buf) { try { m = await S.tg.sendPhoto(S.chatId, { source: buf }, { caption, parse_mode: 'HTML', reply_markup: aucKb(S).reply_markup }); S.media = true; S.card = true; } catch (e) { console.error('auction card send:', e.message); } }
+  }
+  if (g) { try { m = await sendMedia(S.tg, S.chatId, g, caption, { reply_markup: aucKb(S).reply_markup }); S.media = true; } catch (e) { console.error('auction gif:', e.message); } }
+  if (!m) { m = await S.tg.sendMessage(S.chatId, caption, { parse_mode: 'HTML', reply_markup: aucKb(S).reply_markup }); S.media = false; }
   S.msgId = m.message_id;
   aucArm(S);
 }
@@ -12579,21 +13025,29 @@ async function aucAssign(S, p, capId, price) {
   await q(`UPDATE tournament_players SET purse=$3 WHERE tid=$1 AND telegram_id=$2`, [S.tid, capId, c.purse]);
 }
 async function aucClose(S, seq) {
-  if (S.seq !== seq || !tourAuc.has(String(S.tid))) return;
+  if (S.seq !== seq || !tourAuc.has(String(S.tid)) || S.closing) return;
+  S.closing = true;
   clearTimeout(S.timer); clearTimeout(S.warn);
-  const p = S.cur;
+  const p = S.cur, role = p.prole || 'ar';
   if (S.bidder) {
-    await aucAssign(S, p, S.bidder, S.price);
-    S.sold++;
-    const c = S.caps.get(S.bidder);
-    await S.tg.editMessageText(S.chatId, S.msgId, undefined, `🔨 <b>SOLD</b>\n<blockquote><b>${escapeHtml(tName(p))}</b></blockquote>`, { parse_mode: 'HTML' }).catch(() => {});
-    await S.tg.sendMessage(S.chatId, `🔨 <b>SOLD!</b> ${escapeHtml(tName(p))} goes to <b>${escapeHtml(tName(c))}</b> for <b>${S.price}</b>\n<i>Purse left: ${c.purse}</i>`, { parse_mode: 'HTML' });
+    const capId = S.bidder, price = S.price;
+    await aucAssign(S, p, capId, price);
+    S.sold++; S.setSold++;
+    const c = S.caps.get(capId);
+    await aucFinalEdit(S, 'sold', `🔨 <b>SOLD</b>\n<blockquote><b>${escapeHtml(tName(p))}</b>${p.username ? ' · @' + escapeHtml(p.username) : ''}\n${ROLE_ICON[role]} ${ROLE_LABEL[role]}</blockquote>to <b>${escapeHtml(tm(c))}</b> for <b>${price}</b>`);
+    await S.tg.sendMessage(S.chatId, `🔨 <b>SOLD!</b> ${tTag(p)} goes to <b>${escapeHtml(tm(c))}</b> (${tTag(c)}) for <b>${price}</b>\n<i>Purse left: ${c.purse} · squad ${c.count + 1}/${S.t.team_size}</i>`, { parse_mode: 'HTML' }).catch(() => {});
   } else {
-    S.unsold.push(p);
+    S.unsold.push(p); S.setUnsold++;
     await q(`UPDATE tournament_players SET state='unsold' WHERE tid=$1 AND telegram_id=$2`, [S.tid, p.telegram_id]);
-    await S.tg.editMessageText(S.chatId, S.msgId, undefined, `❌ <b>UNSOLD</b>\n<blockquote><b>${escapeHtml(tName(p))}</b></blockquote>`, { parse_mode: 'HTML' }).catch(() => {});
+    await aucFinalEdit(S, 'unsold', `❌ <b>UNSOLD</b>\n<blockquote><b>${escapeHtml(tName(p))}</b></blockquote>`);
   }
-  setTimeout(() => aucNext(S).catch((e) => console.error('auction next:', e.message)), AUC_GAP_MS);
+  S.closing = false;
+  let wait = AUC_GAP_MS;
+  if (S.n % AUC_SET === 0 && S.queue.length) {
+    await S.tg.sendMessage(S.chatId, `✅ <b>SET ${S.setNo} COMPLETE</b>\nSold: <b>${S.setSold}</b> · Unsold: <b>${S.setUnsold}</b>\nThe next set starts in 10 seconds.`, { parse_mode: 'HTML' }).catch(() => {});
+    wait = 10000;
+  }
+  setTimeout(() => aucNext(S).catch((e) => console.error('auction next:', e.message)), wait);
 }
 async function aucFinish(S) {
   // leftover players are sold automatically to the teams that still have room (smallest squad first)
@@ -12605,9 +13059,32 @@ async function aucFinish(S) {
     await aucAssign(S, p, open[0][0], Math.min(S.t.base_price, Math.max(0, open[0][1].purse)));
   }
   tourAuc.delete(String(S.tid));
-  await q(`UPDATE tournaments SET status='ready' WHERE id=$1`, [S.tid]);
-  const t = (await q(`SELECT * FROM tournaments WHERE id=$1`, [S.tid])).rows[0];
-  await S.tg.sendMessage(S.chatId, `🏁 <b>AUCTION COMPLETE</b>\n\n` + (await tourText(t)), { parse_mode: 'HTML' });
+  const t = await setTourStatus(S.tid, 'ready', ', league_at=NOW()');
+  await announceTeamsAndSchedule(S.tg, t);
+}
+async function startAuction(tg, t) {
+  if (tourAuc.has(String(t.id))) return;
+  const chatId = Number(t.auction_chat_id || t.group_chat_id);
+  const all = await tourPlayers(t.id);
+  const capRows = all.filter((r) => r.role === 'captain');
+  const pool = all.filter((r) => r.role !== 'captain' && !r.owner_id);
+  if (capRows.length < 2) return tSay(tg, Number(t.group_chat_id), 'You need at least 2 teams.');
+  if (!pool.length) return tSay(tg, Number(t.group_chat_id), 'No players are registered yet.');
+  for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+  const caps = new Map(), bidMap = new Map();
+  for (const c of capRows) {
+    const id = Number(c.telegram_id);
+    caps.set(id, { telegram_id: id, name: c.name, username: c.username, team_no: c.team_no, team_name: c.team_name, purse: c.purse == null ? t.purse : Number(c.purse), count: all.filter((p) => Number(p.owner_id) === id).length });
+    bidMap.set(id, id);
+    if (c.vc_id) bidMap.set(Number(c.vc_id), id);
+  }
+  await setTourStatus(t.id, 'auction');
+  const S = { tid: t.id, chatId, t, tg, seq: 0, queue: pool, total: pool.length, n: 0, setNo: 1, setTotal: Math.ceil(pool.length / AUC_SET), setSold: 0, setUnsold: 0, sold: 0, unsold: [], cur: null, price: 0, bidder: null, caps, bidMap, media: false, bidMedia: false, timer: null, warn: null, msgId: null, closing: false };
+  tourAuc.set(String(t.id), S);
+  await tSay(tg, chatId,
+    `🔨 <b>AUCTION STARTS</b> · <b>${escapeHtml(t.name)}</b>\n<blockquote>${pool.length} players in ${S.setTotal} set${S.setTotal === 1 ? '' : 's'} of ${AUC_SET} · ${capRows.length} teams\nSquad ${t.team_size} · base ${t.base_price}\nCaptains and vice captains bid with the buttons or with /bid &lt;amount&gt;. Each player is sold automatically after ${AUC_SECONDS}s without a higher bid.\nHost: /next (next player) · /nextset (skip this set) · /sold (sell now)</blockquote>\n` +
+    capRows.map((c) => `${c.team_no || ''}. <b>${escapeHtml(tm(c))}</b> — ${tTag(c)}`).join('\n'));
+  setTimeout(() => aucNext(S).catch((e) => console.error('auction next:', e.message)), 5000);
 }
 bot.command(['abid', 'auction', 'startauction'], async (ctx) => {
   if (!isGroup(ctx)) return;
@@ -12615,40 +13092,515 @@ bot.command(['abid', 'auction', 'startauction'], async (ctx) => {
   if (!t) return ctx.reply('No tournament is open. An admin can start one with /tournament.', trep(ctx));
   if (!(await canManageTour(ctx, t))) return ctx.reply('Only the host or a group admin can start the auction.', trep(ctx));
   if (tourAuc.has(String(t.id))) return ctx.reply('The auction is already running.', trep(ctx));
-  if (t.status === 'ready') return ctx.reply('The auction is finished. See /tlist', trep(ctx));
-  const all = (await q(`SELECT * FROM tournament_players WHERE tid=$1`, [t.id])).rows;
-  const capRows = all.filter((r) => r.role === 'captain');
-  const pool = all.filter((r) => r.role !== 'captain' && !r.owner_id);
-  if (capRows.length < 2) return ctx.reply('You need at least 2 captains. Use /addcaptain @user', trep(ctx));
-  if (!pool.length) return ctx.reply('No players are registered yet. Players can use /register', trep(ctx));
-  for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
-  const caps = new Map();
-  for (const c of capRows) caps.set(Number(c.telegram_id), { telegram_id: Number(c.telegram_id), name: c.name, username: c.username, purse: c.purse == null ? t.purse : Number(c.purse), count: all.filter((p) => Number(p.owner_id) === Number(c.telegram_id)).length });
-  await q(`UPDATE tournaments SET status='auction' WHERE id=$1`, [t.id]);
-  const S = { tid: t.id, chatId: ctx.chat.id, t, tg: ctx.telegram, seq: 0, queue: pool, total: pool.length, sold: 0, unsold: [], cur: null, price: 0, bidder: null, caps, timer: null, warn: null, msgId: null };
-  tourAuc.set(String(t.id), S);
-  await ctx.reply(
-    `🔨 <b>AUCTION STARTS</b> · <b>${escapeHtml(t.name)}</b>\n<blockquote>${pool.length} players · ${capRows.length} captains\nSquad ${t.team_size} · purse ${t.purse} · base ${t.base_price}\nCaptains bid with the buttons. Each player is sold automatically after ${AUC_SECONDS}s without a higher bid.</blockquote>`,
-    trep(ctx)
-  );
-  setTimeout(() => aucNext(S).catch((e) => console.error('auction next:', e.message)), 4000);
+  if (t.status === 'ready') return ctx.reply('The auction is finished. See /teamlist', trep(ctx));
+  if (t.status === 'auction' || t.status === 'ready_auction') return startAuction(ctx.telegram, t);
+  return ctx.reply('Finish the setup first: captains, player registration and the auction group ID. Send /tournament to continue.', trep(ctx));
 });
+function placeBid(S, uid, price) {
+  const capId = S.bidMap.get(uid), cap = capId && S.caps.get(capId);
+  if (!cap) return 'Only captains and vice captains can bid.';
+  if (S.closing) return 'This player is already closed.';
+  if (cap.count >= S.t.team_size - 1) return 'Your squad is full.';
+  const min = S.bidder ? S.price + 1 : S.price;
+  if (price < min) return `The minimum bid is ${min}.`;
+  if (S.bidder === capId) return 'Your team already holds the highest bid.';
+  if (price > cap.purse) return `Not enough purse. Your team has ${cap.purse}.`;
+  S.price = price; S.bidder = capId;
+  aucArm(S);
+  aucAfterBid(S).catch(() => {});
+  return null;
+}
 bot.action(/^ab:(\d+):(\d+):(\d+)$/, async (ctx) => {
   const S = tourAuc.get(ctx.match[1]);
   if (!S) return ctx.answerCbQuery('The auction is not running', { show_alert: true });
   if (Number(ctx.match[2]) !== S.seq) return ctx.answerCbQuery('This player is already closed');
-  const cap = S.caps.get(ctx.from.id);
-  if (!cap) return ctx.answerCbQuery('Only captains can bid', { show_alert: true });
-  if (cap.count >= S.t.team_size - 1) return ctx.answerCbQuery('Your squad is full', { show_alert: true });
-  const price = Number(ctx.match[3]);
-  if (price < (S.bidder ? S.price + 1 : S.price)) return ctx.answerCbQuery('Someone already bid higher');
-  if (S.bidder === ctx.from.id) return ctx.answerCbQuery('You already hold the highest bid');
-  if (price > cap.purse) return ctx.answerCbQuery(`Not enough purse. You have ${cap.purse}`, { show_alert: true });
-  S.price = price; S.bidder = ctx.from.id;
-  aucArm(S);
-  await ctx.answerCbQuery(`You bid ${price}`);
-  await ctx.telegram.editMessageText(S.chatId, S.msgId, undefined, aucText(S), { parse_mode: 'HTML', reply_markup: aucKb(S).reply_markup }).catch(() => {});
+  const err = placeBid(S, ctx.from.id, Number(ctx.match[3]));
+  return ctx.answerCbQuery(err || `Your team bids ${ctx.match[3]}`, { show_alert: !!err && err.startsWith('Not enough') });
 });
+async function runningAuction(ctx, needHost) {
+  if (!isGroup(ctx)) return null;
+  const t = await activeTour(ctx.chat.id);
+  const S = t && tourAuc.get(String(t.id));
+  if (!S || S.chatId !== ctx.chat.id) { await ctx.reply('No auction is running here.', trep(ctx)); return null; }
+  if (needHost && !(await canManageTour(ctx, t))) { await ctx.reply('Only the host can use this command.', trep(ctx)); return null; }
+  return S;
+}
+bot.command('bid', async (ctx) => {
+  const S = await runningAuction(ctx, false);
+  if (!S) return;
+  const price = parseInt(cmdArgs(ctx), 10) || aucAsk(S)[0];
+  const err = placeBid(S, ctx.from.id, price);
+  if (err) return ctx.reply('❌ ' + err, trep(ctx));
+  return ctx.reply(`💰 <b>${escapeHtml(tm(S.caps.get(S.bidder)))}</b> bids <b>${price}</b> for ${escapeHtml(tName(S.cur))}`, trep(ctx));
+});
+bot.command('sold', async (ctx) => {
+  const S = await runningAuction(ctx, true);
+  if (!S) return;
+  if (!S.bidder) return ctx.reply('There is no bid on this player yet. Use /next to skip the player.', trep(ctx));
+  return aucClose(S, S.seq);
+});
+bot.command(['next', 'nextplayer'], async (ctx) => {
+  const S = await runningAuction(ctx, true);
+  if (!S) return;
+  return aucClose(S, S.seq); // sold to the highest bidder, or unsold when nobody bid
+});
+bot.command(['nextset', 'skipset'], async (ctx) => {
+  const S = await runningAuction(ctx, true);
+  if (!S) return;
+  const rem = Math.min((AUC_SET - (S.n % AUC_SET)) % AUC_SET, S.queue.length);
+  if (!rem) return ctx.reply('This is the last player of the set. Send /next to go to the next set.', trep(ctx));
+  const skipped = S.queue.splice(0, rem);
+  S.queue.push(...skipped);
+  S.n += rem; S.total += rem; S.setTotal = Math.ceil(S.total / AUC_SET);
+  await ctx.reply(`⏭ <b>${rem}</b> player${rem === 1 ? '' : 's'} of this set are skipped. They come back at the end of the auction.`, trep(ctx));
+  return aucClose(S, S.seq);
+});
+
+// ── teams: purse, names, captain / vice captain / retention, role GIFs ──
+const BEFORE_AUCTION = ['setup', 'caps_manual', 'caps_reg', 'registration', 'awaiting_group', 'ready_auction'];
+async function hostTour(ctx) {
+  if (!isGroup(ctx)) return null;
+  const t = await activeTour(ctx.chat.id);
+  if (!t) { await ctx.reply('No tournament is open here.', trep(ctx)); return null; }
+  if (!(await canManageTour(ctx, t))) { await ctx.reply('Only the host can use this command.', trep(ctx)); return null; }
+  return t;
+}
+async function purseText(t) {
+  const rows = await tourPlayers(t.id);
+  const caps = rows.filter((r) => r.role === 'captain').sort((a, b) => (a.team_no || 99) - (b.team_no || 99));
+  let s = `💰 <b>PURSE</b> · ${escapeHtml(t.name)}\n\n`;
+  if (!caps.length) return s + 'No teams yet.';
+  for (const c of caps) s += `<blockquote>${c.team_no || '-'}. <b>${escapeHtml(tm(c))}</b>\nPurse <b>${c.purse ?? t.purse}</b> · squad ${rows.filter((p) => Number(p.owner_id) === Number(c.telegram_id)).length + 1}/${t.team_size}</blockquote>`;
+  return s;
+}
+async function tourPurseHook(ctx) { // /purse shows the tournament purses in a tournament group, the wallet everywhere else
+  if (!isGroup(ctx)) return false;
+  const t = await activeTour(ctx.chat.id);
+  if (!t) return false;
+  await ctx.reply(await purseText(t), trep(ctx));
+  return true;
+}
+async function setPurse(t, c, amt) {
+  amt = Math.max(0, Math.round(amt));
+  await q(`UPDATE tournament_players SET purse=$3 WHERE tid=$1 AND telegram_id=$2`, [t.id, c.telegram_id, amt]);
+  const S = tourAuc.get(String(t.id));
+  if (S && S.caps.get(Number(c.telegram_id))) S.caps.get(Number(c.telegram_id)).purse = amt;
+  return amt;
+}
+bot.command('setpurse', async (ctx) => {
+  const t = await hostTour(ctx); if (!t) return;
+  const a = cmdArgs(ctx).split(/\s+/).filter(Boolean);
+  if (a.length === 1 && /^\d+$/.test(a[0])) {
+    const amt = Math.max(100, parseInt(a[0], 10));
+    await q(`UPDATE tournaments SET purse=$2 WHERE id=$1`, [t.id, amt]);
+    for (const c of (await tourPlayers(t.id)).filter((r) => r.role === 'captain')) await setPurse(t, c, amt);
+    return ctx.reply(`Purse of every team is set to <b>${amt}</b>.`, trep(ctx));
+  }
+  const team = a.length === 2 && /^\d+$/.test(a[1]) ? await findTeam(t, a[0]) : null;
+  if (!team) return ctx.reply('Usage: /setpurse 1500  (all teams) or /setpurse <team no or name> 1500\nSee the team numbers in /teamlist', trep(ctx));
+  const amt = await setPurse(t, team, parseInt(a[1], 10));
+  return ctx.reply(`Purse of <b>${escapeHtml(tm(team))}</b> is set to <b>${amt}</b>.`, trep(ctx));
+});
+bot.command(['addpurse', 'pluspurse'], async (ctx) => {
+  const t = await hostTour(ctx); if (!t) return;
+  const a = cmdArgs(ctx).split(/\s+/).filter(Boolean);
+  const num = (x) => (/^[+-]?\d+$/.test(x || '') ? parseInt(x, 10) : null);
+  if (a.length === 1 && num(a[0]) !== null) {
+    for (const c of (await tourPlayers(t.id)).filter((r) => r.role === 'captain')) await setPurse(t, c, Number(c.purse ?? t.purse) + num(a[0]));
+    return ctx.reply(`Every team purse changed by <b>${num(a[0]) > 0 ? '+' : ''}${num(a[0])}</b>.`, trep(ctx));
+  }
+  const team = a.length === 2 && num(a[1]) !== null ? await findTeam(t, a[0]) : null;
+  if (!team) return ctx.reply('Usage: /addpurse <team no or name> +200  or  /addpurse <team no or name> -100', trep(ctx));
+  const amt = await setPurse(t, team, Number(team.purse ?? t.purse) + num(a[1]));
+  return ctx.reply(`Purse of <b>${escapeHtml(tm(team))}</b> is now <b>${amt}</b>.`, trep(ctx));
+});
+bot.command(['tname', 'setteam'], async (ctx) => {
+  const t = await hostTour(ctx); if (!t) return;
+  const a = cmdArgs(ctx).split(/\s+/).filter(Boolean);
+  const team = a.length >= 2 ? await findTeam(t, a[0]) : null;
+  if (!team) return ctx.reply('Usage: /tname <team no or name> <new name>\nExample: /tname 2 Delhi Kings', trep(ctx));
+  const name = a.slice(1).join(' ').slice(0, 24);
+  await q(`UPDATE tournament_players SET team_name=$3 WHERE tid=$1 AND telegram_id=$2`, [t.id, team.telegram_id, name]);
+  const S = tourAuc.get(String(t.id));
+  if (S && S.caps.get(Number(team.telegram_id))) S.caps.get(Number(team.telegram_id)).team_name = name;
+  return ctx.reply(`Team ${team.team_no} is now called <b>${escapeHtml(name)}</b>.`, trep(ctx));
+});
+async function targetUser(ctx, text) {
+  const { found } = await resolveUsers(ctx, text);
+  if (found[0]) return found[0];
+  const rf = ctx.message.reply_to_message && ctx.message.reply_to_message.from;
+  if (rf && !rf.is_bot) return { id: rf.id, username: rf.username, name: fullName(rf) || rf.username || String(rf.id) };
+  return null;
+}
+// /addcap_<team> @user · /add_vc_<team> @user · /rtm_<team> @player [price]
+bot.hears(/^\/(addcap|add_vc|addvc|rtm)_([A-Za-z0-9_]+)(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (ctx) => {
+  const kind = ctx.match[1].toLowerCase().replace('addvc', 'add_vc'), key = ctx.match[2];
+  let args = (ctx.match[3] || '').trim();
+  const t = await hostTour(ctx); if (!t) return;
+  if (tourAuc.has(String(t.id))) return ctx.reply('Wait for the auction to finish before changing teams.', trep(ctx));
+  if (kind === 'rtm' && !BEFORE_AUCTION.includes(t.status)) return ctx.reply('Retention is possible only before the auction starts.', trep(ctx));
+  let price = t.base_price;
+  if (kind === 'rtm') {
+    const parts = args.split(/\s+/).filter(Boolean);
+    if (parts.length > 1 && /^\d{1,6}$/.test(parts[parts.length - 1])) { price = parseInt(parts.pop(), 10); args = parts.join(' '); }
+  }
+  const u = await targetUser(ctx, args);
+  if (!u) return ctx.reply(`Usage: /${kind}_${key} @user  (or reply to the user${kind === 'rtm' ? ', add a price at the end' : ''})\nThe user must have started this bot once.`, trep(ctx));
+  const rows = await tourPlayers(t.id);
+  const mine = rows.find((r) => Number(r.telegram_id) === Number(u.id));
+  const team = await findTeam(t, key);
+  if (kind === 'addcap') {
+    if (mine && mine.role === 'captain') return ctx.reply('❌ That user is already a captain.', trep(ctx));
+    if (mine && mine.owner_id) return ctx.reply('❌ That user is already in a team.', trep(ctx));
+    if (team) {
+      await q(`DELETE FROM tournament_players WHERE tid=$1 AND telegram_id=$2 AND role<>'captain'`, [t.id, u.id]);
+      await q(`UPDATE tournament_players SET owner_id=$3 WHERE tid=$1 AND owner_id=$2`, [t.id, team.telegram_id, u.id]);
+      await q(`UPDATE tournament_players SET telegram_id=$3, name=$4, username=$5 WHERE tid=$1 AND telegram_id=$2 AND role='captain'`, [t.id, team.telegram_id, u.id, u.name || null, u.username || null]);
+      return ctx.reply(`👑 ${escapeHtml(u.name)} is now the captain of <b>${escapeHtml(tm(team))}</b>.`, trep(ctx));
+    }
+    if (/^\d+$/.test(key)) return ctx.reply(`Team ${key} does not exist. Use a name to create a new team, for example /addcap_delhi @user`, trep(ctx));
+    if (rows.filter((r) => r.role === 'captain').length >= 16) return ctx.reply('There are already 16 teams.', trep(ctx));
+    await q(`DELETE FROM tournament_players WHERE tid=$1 AND telegram_id=$2 AND role<>'captain'`, [t.id, u.id]);
+    await addCaptain(t, u, titleCase(key));
+    const no = (await q(`SELECT team_no FROM tournament_players WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id])).rows[0].team_no;
+    return ctx.reply(`👑 ${escapeHtml(u.name)} is the captain of the new team <b>${escapeHtml(titleCase(key))}</b> (team ${no}).`, trep(ctx));
+  }
+  if (!team) return ctx.reply(`Team "${escapeHtml(key)}" was not found. See /teamlist`, trep(ctx));
+  if (mine && mine.role === 'captain') return ctx.reply('❌ A captain cannot be added to a team as a player.', trep(ctx));
+  if (mine && mine.owner_id && Number(mine.owner_id) !== Number(team.telegram_id)) return ctx.reply('❌ That user is already in another team.', trep(ctx));
+  const squad = rows.filter((p) => Number(p.owner_id) === Number(team.telegram_id)).length + 1;
+  if (kind === 'add_vc') {
+    if (team.vc_id && Number(team.vc_id) !== Number(u.id)) await q(`UPDATE tournament_players SET owner_id=NULL, price=NULL, state='registered' WHERE tid=$1 AND telegram_id=$2`, [t.id, team.vc_id]);
+    await q(`INSERT INTO tournament_players (tid, telegram_id, name, username, role, owner_id, price, state, prole) VALUES ($1,$2,$3,$4,'player',$5,0,'sold','ar')
+             ON CONFLICT (tid, telegram_id) DO UPDATE SET owner_id=EXCLUDED.owner_id, price=0, state='sold'`, [t.id, u.id, u.name || null, u.username || null, team.telegram_id]);
+    await q(`UPDATE tournament_players SET vc_id=$3 WHERE tid=$1 AND telegram_id=$2`, [t.id, team.telegram_id, u.id]);
+    return ctx.reply(`🛡 ${escapeHtml(u.name)} is the vice captain of <b>${escapeHtml(tm(team))}</b>. The vice captain can bid for the team.`, trep(ctx));
+  }
+  // rtm: retain a player for this team before the auction
+  if (squad >= t.team_size) return ctx.reply('❌ That squad is already full.', trep(ctx));
+  const purse = Number(team.purse ?? t.purse);
+  if (price > purse) return ctx.reply(`❌ Not enough purse. <b>${escapeHtml(tm(team))}</b> has ${purse}.`, trep(ctx));
+  await q(`INSERT INTO tournament_players (tid, telegram_id, name, username, role, owner_id, price, state, prole) VALUES ($1,$2,$3,$4,'player',$5,$6,'sold','ar')
+           ON CONFLICT (tid, telegram_id) DO UPDATE SET owner_id=EXCLUDED.owner_id, price=EXCLUDED.price, state='sold'`, [t.id, u.id, u.name || null, u.username || null, team.telegram_id, price]);
+  await setPurse(t, team, purse - price);
+  return ctx.reply(`🔒 <b>RETAINED</b>\n<blockquote>${escapeHtml(u.name)} stays with <b>${escapeHtml(tm(team))}</b> for <b>${price}</b>\nPurse left: ${purse - price}</blockquote>`, trep(ctx));
+});
+// role GIFs (owner only): /setaucgif <entry|bid|sold|all> <bat|bowl|ar|all>  (reply to a GIF, video or photo)
+bot.command('setaucgif', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Only the bot owner can set auction GIFs.');
+  const [k, r] = cmdArgs(ctx).toLowerCase().split(/\s+/);
+  const kinds = k === 'all' ? ['entry', 'bid', 'sold'] : ['entry', 'bid', 'sold'].includes(k) ? [k] : [];
+  const roles = r === 'all' ? ['bat', 'bowl', 'ar'] : parseRole(r) ? [parseRole(r)] : [];
+  const rm = ctx.message.reply_to_message;
+  const g = rm && (rm.animation ? { kind: 'animation', id: rm.animation.file_id } : rm.video ? { kind: 'video', id: rm.video.file_id } : rm.photo ? { kind: 'photo', id: rm.photo[rm.photo.length - 1].file_id } : null);
+  if (!kinds.length || !roles.length || !g) return ctx.reply('Usage: reply to a GIF, video or photo with\n/setaucgif <entry|bid|sold|all> <bat|bowl|ar|all>\nExample: /setaucgif entry bat\n/setaucgif all all  (same media for everything)');
+  for (const kk of kinds) for (const rr of roles) await q(`INSERT INTO auction_gifs (k, file_id, kind) VALUES ($1,$2,$3) ON CONFLICT (k) DO UPDATE SET file_id=EXCLUDED.file_id, kind=EXCLUDED.kind`, [`${kk}_${rr}`, g.id, g.kind]);
+  await loadAucGifs();
+  return ctx.reply(`Saved for ${kinds.join(', ')} · ${roles.map((x) => ROLE_LABEL[x]).join(', ')}. Check with /aucgifs`);
+});
+bot.command('aucgifs', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  await loadAucGifs().catch(() => {});
+  let t = '<b>AUCTION GIFS</b>\n<blockquote>';
+  for (const kk of ['entry', 'bid', 'sold']) t += `${kk.toUpperCase()}:  ` + ['bat', 'bowl', 'ar'].map((rr) => `${ROLE_ICON[rr]} ${aucGifs.has(`${kk}_${rr}`) ? '✅' : '❌'}`).join('   ') + '\n';
+  return ctx.reply(t + '</blockquote>', { parse_mode: 'HTML' });
+});
+bot.command('delaucgif', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const [k, r] = cmdArgs(ctx).toLowerCase().split(/\s+/);
+  if (!['entry', 'bid', 'sold'].includes(k) || !parseRole(r)) return ctx.reply('Usage: /delaucgif <entry|bid|sold> <bat|bowl|ar>');
+  await q(`DELETE FROM auction_gifs WHERE k=$1`, [`${k}_${parseRole(r)}`]);
+  await loadAucGifs();
+  return ctx.reply('Removed.');
+});
+bot.command(['auchelp', 'auctionhelp', 'auchelp_cmds'], (ctx) => ctx.reply(
+  '<b>AUCTION HELP</b>\n\n' +
+  '<b>1. Setup (organizer / host)</b>\n<blockquote>/tournament — create the tournament (name, then Manual or Register Captains)\n' +
+  '/addcap_&lt;team&gt; @user — add a captain. A new team name creates a new team (example: /addcap_delhi @user)\n' +
+  '/add_vc_&lt;team&gt; @user — add a vice captain (can bid for the team)\n' +
+  '/rtm_&lt;team&gt; @player [price] — retain a player before the auction\n' +
+  '/tname &lt;team&gt; &lt;name&gt; — rename a team\n' +
+  '/tset size 6 purse 1000 base 50 — team size, purse and base price\n' +
+  '/setpurse [team] &lt;amt&gt; — set a purse\n' +
+  '/addpurse [team] +500 or -200 — add or reduce a purse</blockquote>\n' +
+  '<b>2. Players</b>\n<blockquote>/register bat|bowl|ar — join the auction as a Batsman, Bowler or All-rounder\n/unregister — leave\n/registercap — join as a captain (when captain registration is open)</blockquote>\n' +
+  '<b>3. Run the auction (host)</b>\n<blockquote>/abid (or /auction, /startauction) — start the auction in the linked auction group\n' +
+  '/next — bring the next player now\n/nextset — skip to the next set (10 players per set)\n/sold — sell the current player now\n' +
+  'The bot sells automatically if nobody bids higher for ' + AUC_SECONDS + ' seconds.</blockquote>\n' +
+  '<b>4. Bidding (captains and vice captains)</b>\n<blockquote>Tap a BID button on the player card, or send /bid &lt;amount&gt; (example: /bid 250). The amount must be higher than the current bid and within your purse.</blockquote>\n' +
+  '<b>5. Info</b>\n<blockquote>/teamlist — all teams and players\n/purse — team purses\n/schedule · /points · /orange · /purple · /mvp</blockquote>\n' +
+  '<b>6. Card / GIF (owner)</b>\n<blockquote>The bot makes a player card automatically. To use your own GIF instead: reply to a GIF with /setaucgif entry|bid|sold bat|bowl|ar\n/aucgifs — list GIFs · /delaucgif entry|bid|sold bat|bowl|ar — remove</blockquote>\n' +
+  '<i>More: /tourhelp</i>',
+  { parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true }));
+
+bot.command(['tourhelp', 'tournamenthelp'], (ctx) => ctx.reply(
+  '<b>TOURNAMENT COMMANDS</b>\n<blockquote>/tournament — start or continue the setup\n/register bat|bowl|ar — join as a player\n/registercap — join as a captain\n/teamlist — teams with numbers\n/purse — team purses\n\n<b>Host</b>\n/addcap_&lt;team&gt; @user — add or change a captain (new name = new team)\n/add_vc_&lt;team&gt; @user — vice captain (can bid)\n/rtm_&lt;team&gt; @player [price] — retention before the auction\n/tname &lt;team&gt; &lt;name&gt; — rename a team\n/setpurse [team] &lt;amt&gt; · /addpurse [team] +/-&lt;amt&gt;\n/tset size 6 purse 1000 base 50\n/abid — start the auction\n/bid &lt;amt&gt; — captains and vice captains\n/next — next player · /nextset — skip the set · /sold — sell now\n/addmatch · /delmatch · /schedule · /points\n/orange · /purple · /mvp · /finishtour · /endtour</blockquote>',
+  { parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true }));
+
+// ── schedule, results, points ──
+const capName = (caps, id) => { const c = caps.find((x) => Number(x.telegram_id) === Number(id)); return c ? tm(c) : String(id); };
+async function addFixture(t, a, b) {
+  const no = ((await q(`SELECT COALESCE(MAX(no),0)::int AS m FROM tour_fixtures WHERE tid=$1`, [t.id])).rows[0].m) + 1;
+  await q(`INSERT INTO tour_fixtures (tid, no, round, t1, t2) VALUES ($1,$2,0,$3,$4)`, [t.id, no, a, b]);
+  return no;
+}
+const tourChats = (t) => [...new Set([Number(t.auction_chat_id || t.group_chat_id), Number(t.group_chat_id)])];
+// the schedule is built by the organizer: newest match on top, results shown on the same line
+async function scheduleText(t) {
+  const caps = (await tourPlayers(t.id)).filter((r) => r.role === 'captain');
+  const fx = (await q(`SELECT * FROM tour_fixtures WHERE tid=$1 ORDER BY no DESC`, [t.id])).rows;
+  let s = `📅 <b>SCHEDULE</b> · ${escapeHtml(t.name)}\n\n`;
+  if (!fx.length) return s + 'No match is scheduled yet. The organizer will add matches here.';
+  for (const f of fx) {
+    const res = f.status === 'done' ? (f.winner ? `  ✅ ${escapeHtml(capName(caps, f.winner))} won` : '  🤝 tied') : '  ⏳ upcoming';
+    s += `<blockquote>#${f.no}  <b>${escapeHtml(capName(caps, f.t1))}</b> vs <b>${escapeHtml(capName(caps, f.t2))}</b>${res}</blockquote>`;
+  }
+  return s + `<i>Play your match in any group. The result is linked automatically when it ends. If needed, the organizer can link it with /tlink &lt;no&gt; inside the match group.</i>`;
+}
+async function announceTeamsAndSchedule(tg, t) {
+  const teams = await tourText(t);
+  for (const c of tourChats(t)) await tSay(tg, c, `🏁 <b>AUCTION COMPLETE</b>\n\n${teams}\n<i>The organizer will schedule the matches with /addmatch. Captains get a notification for every match.</i>`);
+  const caps = (await tourPlayers(t.id)).filter((r) => r.role === 'captain');
+  for (const c of caps) await tSay(tg, Number(c.telegram_id), `🏆 <b>${escapeHtml(t.name)}</b>\n${tTag(c)}, your team is ready. You will get a message here when the organizer schedules your match.`);
+}
+bot.command(['schedule', 'fixtures'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t || t.status !== 'ready') return ctx.reply('The schedule is available after the auction.', trep(ctx));
+  return ctx.reply(await scheduleText(t), trep(ctx));
+});
+async function notifyMatch(tg, t, no, a, b) {
+  const caps = (await tourPlayers(t.id)).filter((r) => r.role === 'captain');
+  const ca = caps.find((c) => Number(c.telegram_id) === Number(a)), cb = caps.find((c) => Number(c.telegram_id) === Number(b));
+  const text = `📣 <b>MATCH SCHEDULED · #${no}</b>\n<blockquote><b>${escapeHtml(tm(ca))}</b>  vs  <b>${escapeHtml(tm(cb))}</b></blockquote>${tTag(ca)} and ${tTag(cb)}, your match is scheduled. Please get your teams ready and start the match.`;
+  for (const c of tourChats(t)) await tSay(tg, c, text);
+  for (const id of [Number(a), Number(b)]) await tSay(tg, id, `🏆 <b>${escapeHtml(t.name)}</b>\n${text}`);
+}
+bot.command(['addmatch', 'newmatch'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t || t.status !== 'ready') return ctx.reply('You can add matches after the auction is complete.', trep(ctx));
+  if (!(await canManageTour(ctx, t))) return ctx.reply('Only the organizer can add matches.', trep(ctx));
+  const caps = (await tourPlayers(t.id)).filter((r) => r.role === 'captain');
+  return ctx.reply('<b>ADD MATCH</b>\nChoose the first team:', {
+    parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true,
+    reply_markup: Markup.inlineKeyboard(caps.map((c) => [tbtn(tm(c), `tm:${t.id}:a:${c.telegram_id}`, 'primary')])).reply_markup,
+  });
+});
+bot.action(/^tm:(\d+):(a|b):(\d+)(?::(\d+))?$/, async (ctx) => {
+  try {
+    const t = await getTour(ctx.match[1]);
+    if (!t || t.status !== 'ready') return ctx.answerCbQuery('The tournament is closed.', { show_alert: true });
+    if (!(await canManageTour(ctx, t))) return ctx.answerCbQuery('Only the organizer can do this.', { show_alert: true });
+    const caps = (await tourPlayers(t.id)).filter((r) => r.role === 'captain');
+    const first = Number(ctx.match[3]);
+    if (ctx.match[2] === 'a') {
+      await ctx.answerCbQuery().catch(() => {});
+      return ctx.editMessageText(`<b>ADD MATCH</b>\n<b>${escapeHtml(capName(caps, first))}</b> vs ...\nChoose the second team:`, {
+        parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard(caps.filter((c) => Number(c.telegram_id) !== first).map((c) => [tbtn(tm(c), `tm:${t.id}:b:${first}:${c.telegram_id}`, 'success')])).reply_markup,
+      }).catch(() => {});
+    }
+    const second = Number(ctx.match[4]);
+    if (!second || second === first) return ctx.answerCbQuery('Choose two different teams.', { show_alert: true });
+    const dup = await q(`SELECT 1 FROM tour_fixtures WHERE tid=$1 AND status='pending' AND ((t1=$2 AND t2=$3) OR (t1=$3 AND t2=$2)) LIMIT 1`, [t.id, first, second]);
+    if (dup.rows.length) return ctx.answerCbQuery('This match is already scheduled and not played yet.', { show_alert: true });
+    const no = await addFixture(t, first, second);
+    await ctx.answerCbQuery('Match added').catch(() => {});
+    await ctx.editMessageText(`✅ Match <b>#${no}</b> added: <b>${escapeHtml(capName(caps, first))}</b> vs <b>${escapeHtml(capName(caps, second))}</b>`, { parse_mode: 'HTML' }).catch(() => {});
+    return notifyMatch(ctx.telegram, t, no, first, second);
+  } catch (e) { console.error('addmatch:', e.message); await ctx.answerCbQuery('Error').catch(() => {}); }
+});
+bot.command(['delmatch', 'removematch'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t || t.status !== 'ready' || !(await canManageTour(ctx, t))) return;
+  const no = parseInt(cmdArgs(ctx), 10);
+  if (!no) return ctx.reply('Usage: /delmatch <match number>', trep(ctx));
+  const d = await q(`DELETE FROM tour_fixtures WHERE tid=$1 AND no=$2 AND status='pending' RETURNING 1`, [t.id, no]);
+  return ctx.reply(d.rows.length ? `Match #${no} is removed from the schedule.` : 'That match does not exist or is already played.', trep(ctx));
+});
+async function finalizeTour(t) {
+  const tt = await setTourStatus(t.id, 'done');
+  const tb = await pointsTable(tt);
+  const st = await tourStats(tt);
+  const best = (k) => st.slice().sort((x, y) => y[k] - x[k])[0];
+  const o = best('runs'), p = best('wkts'), v = best('mvp');
+  const text = `🏆 <b>${escapeHtml(tt.name)} IS COMPLETE</b>\n\n👑 Champions: <b>${escapeHtml(tb[0] ? tb[0].name : '-')}</b>\n` +
+    (o && o.runs ? `🟠 Orange Cap: <b>${escapeHtml(o.name)}</b> · ${o.runs} runs\n` : '') + (p && p.wkts ? `🟣 Purple Cap: <b>${escapeHtml(p.name)}</b> · ${p.wkts} wickets\n` : '') + (v && v.mvp ? `⭐ MVP: <b>${escapeHtml(v.name)}</b> · ${v.mvp} pts\n` : '') + `\nSee /points for the final table.`;
+  for (const c of tourChats(tt)) await tSay(bot.telegram, c, text);
+}
+bot.command(['finishtour', 'endleague'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t || t.status !== 'ready') return ctx.reply('There is no running tournament to finish.', trep(ctx));
+  if (!(await canManageTour(ctx, t))) return ctx.reply('Only the organizer can finish the tournament.', trep(ctx));
+  const pend = (await q(`SELECT COUNT(*)::int AS c FROM tour_fixtures WHERE tid=$1 AND status='pending'`, [t.id])).rows[0].c;
+  if (pend) return ctx.reply(`${pend} scheduled match${pend === 1 ? ' is' : 'es are'} not played yet. Remove them with /delmatch or finish them first.`, trep(ctx));
+  return finalizeTour(t);
+});
+async function teamSets(tid) {
+  const rows = await tourPlayers(tid);
+  const m = new Map();
+  for (const c of rows.filter((r) => r.role === 'captain')) m.set(Number(c.telegram_id), new Set([Number(c.telegram_id)]));
+  for (const p of rows.filter((r) => r.role !== 'captain' && r.owner_id)) { const s = m.get(Number(p.owner_id)); if (s) s.add(Number(p.telegram_id)); }
+  return m;
+}
+// which match label (A / B) belongs to which fixture team; null when the players do not match
+function labelsFor(mps, s1, s2) {
+  const cnt = { A: [0, 0, 0], B: [0, 0, 0] };
+  for (const p of mps) { const L = cnt[p.team_label]; if (!L) continue; L[2]++; if (s1.has(Number(p.telegram_id))) L[0]++; if (s2.has(Number(p.telegram_id))) L[1]++; }
+  const ok = (L, i) => L[2] > 0 && L[i] / L[2] >= 0.6;
+  if (ok(cnt.A, 0) && ok(cnt.B, 1)) return { t1: 'A', t2: 'B' };
+  if (ok(cnt.A, 1) && ok(cnt.B, 0)) return { t1: 'B', t2: 'A' };
+  return null;
+}
+async function findMatchFor(t, f, teams) {
+  const s1 = teams.get(Number(f.t1)), s2 = teams.get(Number(f.t2));
+  if (!s1 || !s2) return null;
+  const { rows: ms } = await q(
+    `SELECT m.id FROM matches m WHERE m.status='completed' AND m.mode='team' AND m.created_at >= $1
+       AND m.id NOT IN (SELECT match_id FROM tour_fixtures WHERE match_id IS NOT NULL) ORDER BY m.id DESC LIMIT 60`, [f.created_at || t.league_at || t.created_at]);
+  for (const m of ms) {
+    const { rows: mps } = await q(`SELECT telegram_id, team_label FROM match_players WHERE match_id=$1`, [m.id]);
+    if (labelsFor(mps, s1, s2)) return m.id;
+  }
+  return null;
+}
+async function finishFixture(t, f, m, teams) {
+  const { rows: mps } = await q(`SELECT telegram_id, team_label FROM match_players WHERE match_id=$1`, [m.id]);
+  const lb = labelsFor(mps, teams.get(Number(f.t1)), teams.get(Number(f.t2)));
+  let winner = null, text = '';
+  const caps = (await tourPlayers(t.id)).filter((r) => r.role === 'captain');
+  if (lb && m.winner_team === lb.t1) winner = Number(f.t1);
+  else if (lb && m.winner_team === lb.t2) winner = Number(f.t2);
+  const { rows: inn } = await q(`SELECT batting_team, total_runs, total_wickets, balls_bowled FROM innings WHERE match_id=$1 ORDER BY innings_number`, [m.id]);
+  const sc = (label) => { const i = inn.find((x) => x.batting_team === label); return i ? `${i.total_runs}/${i.total_wickets} (${Math.floor(i.balls_bowled / 6)}.${i.balls_bowled % 6})` : '-'; };
+  const n1 = capName(caps, f.t1), n2 = capName(caps, f.t2);
+  text = `🏁 <b>RESULT · #${f.no}</b>\n<blockquote>${escapeHtml(n1)}  ${lb ? sc(lb.t1) : ''}\n${escapeHtml(n2)}  ${lb ? sc(lb.t2) : ''}</blockquote>` +
+    (winner ? `🏆 <b>${escapeHtml(capName(caps, winner))}</b> won the match.` : '🤝 The match ended without a winner. One point each.');
+  const upd = await q(`UPDATE tour_fixtures SET status='done', winner=$2 WHERE id=$1 AND status='pending' RETURNING 1`, [f.id, winner]);
+  if (!upd.rowCount) return;
+  const chats = [...new Set([Number(t.auction_chat_id || t.group_chat_id), Number(t.group_chat_id)])];
+  for (const c of chats) await tSay(bot.telegram, c, text);
+  for (const id of [Number(f.t1), Number(f.t2)]) await tSay(bot.telegram, id, text);
+}
+async function pointsTable(t) {
+  const caps = (await tourPlayers(t.id)).filter((r) => r.role === 'captain');
+  const fx = (await q(`SELECT * FROM tour_fixtures WHERE tid=$1 AND status='done'`, [t.id])).rows;
+  const tb = new Map(caps.map((c) => [Number(c.telegram_id), { id: Number(c.telegram_id), name: tm(c), p: 0, w: 0, l: 0, t: 0, pts: 0 }]));
+  for (const f of fx) {
+    const a = tb.get(Number(f.t1)), b = tb.get(Number(f.t2));
+    if (!a || !b) continue;
+    a.p++; b.p++;
+    if (!f.winner) { a.t++; b.t++; a.pts++; b.pts++; }
+    else { const w = Number(f.winner) === a.id ? a : b, l = w === a ? b : a; w.w++; w.pts += 2; l.l++; }
+  }
+  return [...tb.values()].sort((x, y) => y.pts - x.pts || y.w - x.w || x.p - y.p);
+}
+bot.command(['points', 'ptable', 'standings'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id) || (await q(`SELECT * FROM tournaments WHERE (group_chat_id=$1 OR auction_chat_id=$1) AND status='done' ORDER BY id DESC LIMIT 1`, [ctx.chat.id])).rows[0];
+  if (!t) return ctx.reply('There is no tournament here.', trep(ctx));
+  const tb = await pointsTable(t);
+  let s = `📊 <b>POINTS TABLE</b> · ${escapeHtml(t.name)}\n<i>Win = 2 points · tie = 1 point</i>\n\n`;
+  tb.forEach((r, i) => { s += `<blockquote>${i + 1}. <b>${escapeHtml(r.name)}</b>\nP ${r.p} · W ${r.w} · L ${r.l} · T ${r.t} · <b>${r.pts} pts</b></blockquote>`; });
+  return ctx.reply(s, trep(ctx));
+});
+async function tourStats(t) {
+  const ids = (await q(`SELECT match_id FROM tour_fixtures WHERE tid=$1 AND status='done' AND match_id IS NOT NULL`, [t.id])).rows.map((r) => Number(r.match_id));
+  if (!ids.length) return [];
+  const bat = (await q(`SELECT mp.telegram_id AS id, SUM(bs.runs)::int AS runs FROM batting_stats bs JOIN match_players mp ON mp.id=bs.player_id JOIN innings i ON i.id=bs.innings_id WHERE i.match_id = ANY($1::bigint[]) AND mp.telegram_id>0 GROUP BY 1`, [ids])).rows;
+  const bwl = (await q(`SELECT mp.telegram_id AS id, SUM(x.wickets)::int AS wkts FROM bowling_stats x JOIN match_players mp ON mp.id=x.player_id JOIN innings i ON i.id=x.innings_id WHERE i.match_id = ANY($1::bigint[]) AND mp.telegram_id>0 GROUP BY 1`, [ids])).rows;
+  const names = new Map((await tourPlayers(t.id)).map((p) => [Number(p.telegram_id), tName(p)]));
+  const m = new Map();
+  const get = (id) => { id = Number(id); if (!m.has(id)) m.set(id, { id, name: names.get(id) || 'Player', runs: 0, wkts: 0 }); return m.get(id); };
+  bat.forEach((r) => { get(r.id).runs = Number(r.runs); });
+  bwl.forEach((r) => { get(r.id).wkts = Number(r.wkts); });
+  return [...m.values()].map((x) => ({ ...x, mvp: x.runs + x.wkts * 25 }));
+}
+async function statsCmd(ctx, kind) {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id) || (await q(`SELECT * FROM tournaments WHERE (group_chat_id=$1 OR auction_chat_id=$1) AND status='done' ORDER BY id DESC LIMIT 1`, [ctx.chat.id])).rows[0];
+  if (!t) return ctx.reply('There is no tournament here.', trep(ctx));
+  const st = await tourStats(t);
+  const meta = { orange: ['🟠 <b>ORANGE CAP</b> · most runs', 'runs', 'runs'], purple: ['🟣 <b>PURPLE CAP</b> · most wickets', 'wkts', 'wkts'], mvp: ['⭐ <b>MVP</b> · runs + 25 per wicket', 'mvp', 'pts'] }[kind];
+  const top = st.filter((x) => x[meta[1]] > 0).sort((a, b) => b[meta[1]] - a[meta[1]]).slice(0, 10);
+  let s = `${meta[0]}\n<i>${escapeHtml(t.name)}</i>\n\n`;
+  if (!top.length) s += 'No tournament match is finished yet.';
+  top.forEach((x, i) => { s += `<blockquote>${i === 0 ? '👑' : i + 1 + '.'} <b>${escapeHtml(x.name)}</b> · ${x[meta[1]]} ${meta[2]}</blockquote>`; });
+  return ctx.reply(s, trep(ctx));
+}
+bot.command(['orange', 'orangecap'], (ctx) => statsCmd(ctx, 'orange'));
+bot.command(['purple', 'purplecap'], (ctx) => statsCmd(ctx, 'purple'));
+bot.command('mvp', (ctx) => statsCmd(ctx, 'mvp'));
+bot.command('tlink', async (ctx) => {
+  const no = parseInt(cmdArgs(ctx), 10);
+  if (!no) return ctx.reply('Usage: /tlink <fixture number>  (send it inside the match group)', trep(ctx));
+  const m = isGroup(ctx) ? await getActiveMatch(ctx.chat.id) : null;
+  if (!m) return ctx.reply('There is no active match in this group.', trep(ctx));
+  const { rows } = await q(`SELECT t.* FROM tournaments t WHERE t.status='ready' AND (t.host_id=$1 OR EXISTS (SELECT 1 FROM tournament_players p WHERE p.tid=t.id AND p.telegram_id=$1 AND p.role='captain')) ORDER BY t.id DESC LIMIT 1`, [ctx.from.id]);
+  const t = rows[0];
+  if (!t && !isAdmin(ctx.from.id)) return ctx.reply('Only a tournament host or captain can link a match.', trep(ctx));
+  const tt = t || (await q(`SELECT * FROM tournaments WHERE status='ready' ORDER BY id DESC LIMIT 1`)).rows[0];
+  if (!tt) return ctx.reply('No tournament is running.', trep(ctx));
+  const f = (await q(`SELECT * FROM tour_fixtures WHERE tid=$1 AND no=$2 AND status='pending'`, [tt.id, no])).rows[0];
+  if (!f) return ctx.reply('That fixture does not exist or is already finished.', trep(ctx));
+  await q(`UPDATE tour_fixtures SET match_id=$2 WHERE id=$1`, [f.id, m.id]);
+  return ctx.reply(`Match linked to fixture <b>#${no}</b>. The result is posted when the match ends.`, trep(ctx));
+});
+async function tourTick() {
+  const { rows: ts } = await q(`SELECT * FROM tournaments WHERE status='ready'`);
+  for (const t of ts) {
+    const teams = await teamSets(t.id);
+    const fx = (await q(`SELECT * FROM tour_fixtures WHERE tid=$1 ORDER BY no`, [t.id])).rows;
+    for (const f of fx.filter((x) => x.status === 'pending')) {
+      let mid = f.match_id;
+      if (!mid) mid = await findMatchFor(t, f, teams);
+      if (!mid) continue;
+      const m = (await q(`SELECT * FROM matches WHERE id=$1`, [mid])).rows[0];
+      if (!m) continue;
+      if (!f.match_id) await q(`UPDATE tour_fixtures SET match_id=$2 WHERE id=$1`, [f.id, mid]);
+      if (m.status === 'completed') await finishFixture(t, f, m, teams);
+    }
+  }
+}
+async function initR83() {
+  await q(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS auction_chat_id BIGINT`);
+  await q(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS auction_chat_title TEXT`);
+  await q(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS league_at TIMESTAMPTZ`);
+  await q(`ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS prole TEXT`);
+  await q(`ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS team_no INT`);
+  await q(`ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS team_name TEXT`);
+  await q(`ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS vc_id BIGINT`);
+  await q(`CREATE TABLE IF NOT EXISTS auction_gifs (k TEXT PRIMARY KEY, file_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'animation')`);
+  await q(`UPDATE tournament_players tp SET team_no = x.rn FROM (SELECT tid, telegram_id, ROW_NUMBER() OVER (PARTITION BY tid ORDER BY telegram_id) AS rn FROM tournament_players WHERE role='captain') x WHERE tp.tid=x.tid AND tp.telegram_id=x.telegram_id AND tp.team_no IS NULL`);
+  await q(`CREATE TABLE IF NOT EXISTS tour_fixtures (id BIGSERIAL PRIMARY KEY, tid BIGINT NOT NULL, no INT NOT NULL, round INT NOT NULL, t1 BIGINT NOT NULL, t2 BIGINT NOT NULL, match_id BIGINT, status TEXT NOT NULL DEFAULT 'pending', winner BIGINT)`);
+  await q(`ALTER TABLE tour_fixtures ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`).catch(() => {});
+}
+
+// ── tunnel link watcher: DMs the bot admins when the quick-tunnel link changes ──
+async function tunnelWatch() {
+  const _fs = require('fs'), _path = require('path'), _os = require('os');
+  const dir = _path.join(_os.homedir(), '.pm2', 'logs');
+  let best = '', bestT = 0;
+  for (const f of ['tunnel-error.log', 'tunnel-out.log']) {
+    try {
+      const p = _path.join(dir, f), st = _fs.statSync(p), size = Math.min(st.size, 300000);
+      const fd = _fs.openSync(p, 'r'), buf = Buffer.alloc(size);
+      _fs.readSync(fd, buf, 0, size, st.size - size); _fs.closeSync(fd);
+      const all = buf.toString('utf8').match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/g);
+      if (all && st.mtimeMs > bestT) { best = all[all.length - 1]; bestT = st.mtimeMs; }
+    } catch (_) {}
+  }
+  if (!best) return;
+  const prev = await kvGet('tunnel_url');
+  if (prev === best) return;
+  await kvSet('tunnel_url', best);
+  if (!prev) return; // first run: just remember it
+  const text = `<b>MINI APP LINK CHANGED</b>\nThe tunnel got a new link, so the mini app is down until you update it in BotFather.\n\n<code>${best}</code>\n\n1. /myapps, choose the app, then Edit Web App URL.\n2. /mybots, choose this bot, Bot Settings, Configure Mini App, then Edit Mini App URL.\nPaste the link above in both places.`;
+  for (const id of [...new Set(BOT_ADMIN_IDS.map(Number).filter((n) => n > 0))]) await rDm(id, text);
+}
+
 async function miniTours() {
   const { rows } = await q(`SELECT * FROM tournaments WHERE status<>'cancelled' ORDER BY id DESC LIMIT 20`);
   const out = [];
@@ -13031,6 +13983,7 @@ async function main() {
   fixMpForeignKeys().catch(() => {});
   await initR50();
   await initR72();
+  await initR83();
   try { await initTagSeen(); } catch (e) { console.error('tagseen:', e.message); }
   await relaxNegativeRunConstraints();
   try {
