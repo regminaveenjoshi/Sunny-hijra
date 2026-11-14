@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r88-2026-11-14-auchelp'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r89-2026-11-14-auction-squads'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 // /Store, /SHOP, /Bat … → the command word is read in lower case
@@ -12954,6 +12954,7 @@ function aucText(S, warn) {
   const inSet = ((S.n - 1) % AUC_SET) + 1;
   const role = S.cur.prole || 'ar';
   return `🔨 <b>PLAYER ON THE BLOCK</b>\n<i>Set ${S.setNo}/${S.setTotal} · player ${inSet}/${Math.min(AUC_SET, S.total - (S.setNo - 1) * AUC_SET)} · overall ${S.n}/${S.total}</i>\n<blockquote><b>${escapeHtml(tName(S.cur))}</b>${S.cur.username ? ' · @' + escapeHtml(S.cur.username) : ''}\n${ROLE_ICON[role]} ${ROLE_LABEL[role]}</blockquote>` +
+    (S.statTxt || '') +
     (c ? `Highest bid: <b>${S.price}</b> by <b>${escapeHtml(tm(c))}</b>` : `Base price: <b>${S.price}</b> · no bids yet`) +
     `\n${warn ? '⏳ <b>5 seconds left!</b>' : `⏱ Sold automatically after ${AUC_SECONDS}s without a higher bid`}\n<i>Captains and vice captains: tap a button or send /bid &lt;amount&gt;</i>`;
 }
@@ -12997,7 +12998,8 @@ async function aucNext(S) {
   if (!tourAuc.has(String(S.tid))) return;
   const open = [...S.caps.values()].filter((c) => c.count < S.t.team_size - 1);
   if (!open.length || !S.queue.length) return aucFinish(S);
-  if (S.n % AUC_SET === 0) {
+  if (S.noSetMsg) S.noSetMsg = false;
+  else if (S.n % AUC_SET === 0) {
     S.setNo = Math.floor(S.n / AUC_SET) + 1;
     S.setSold = 0; S.setUnsold = 0;
     await S.tg.sendMessage(S.chatId, `📦 <b>SET ${S.setNo}/${S.setTotal}</b> — ${Math.min(AUC_SET, S.total - S.n)} players`, { parse_mode: 'HTML' }).catch(() => {});
@@ -13005,6 +13007,7 @@ async function aucNext(S) {
   }
   S.cur = S.queue.shift(); S.n++;
   S.seq++; S.price = S.t.base_price; S.bidder = null; S.bidMedia = false;
+  S.statTxt = await aucStats(S.cur);
   const caption = aucText(S);
   const g = await aucGif('entry', S.cur.prole);
   let m = null;
@@ -13128,6 +13131,14 @@ async function runningAuction(ctx, needHost) {
 bot.command('bid', async (ctx) => {
   const S = await runningAuction(ctx, false);
   if (!S) return;
+  const a0 = cmdArgs(ctx).trim().split(/\s+/)[0] || '';
+  if (/^@/.test(a0) || /^\d{6,}$/.test(a0)) { // /bid @user or /bid 123456789 = host brings a player on the block
+    const t = await activeTour(ctx.chat.id);
+    if (!(await canManageTour(ctx, t))) return ctx.reply('Only the host can bring a player with /bid @user.', trep(ctx));
+    const p = await findTourPlayer(ctx, t, a0);
+    if (!p) return ctx.reply('That player is not registered in this tournament.', trep(ctx));
+    return aucBring(ctx, t, p);
+  }
   const price = parseInt(cmdArgs(ctx), 10) || aucAsk(S)[0];
   const err = placeBid(S, ctx.from.id, price);
   if (err) return ctx.reply('❌ ' + err, trep(ctx));
@@ -13154,6 +13165,120 @@ bot.command(['nextset', 'skipset'], async (ctx) => {
   S.n += rem; S.total += rem; S.setTotal = Math.ceil(S.total / AUC_SET);
   await ctx.reply(`⏭ <b>${rem}</b> player${rem === 1 ? '' : 's'} of this set are skipped. They come back at the end of the auction.`, trep(ctx));
   return aucClose(S, S.seq);
+});
+
+
+// ── career stats shown with every player on the block ──
+async function aucStats(p) {
+  try {
+    const c = await userCareer(Number(p.telegram_id));
+    const m = Math.max(c.bat.matches || 0, c.bowl.matches || 0);
+    const ov = Math.floor((c.bowl.balls || 0) / 6) + '.' + ((c.bowl.balls || 0) % 6);
+    return `<blockquote><b>Career</b> · Level ${c.level} · ${m} matches\n` +
+      `🏏 Runs ${c.bat.runs} · SR ${Number(c.bat.sr || 0).toFixed(1)} · HS ${c.hs.runs}\n` +
+      `🎯 Wickets ${c.bowl.wkts} · Overs ${ov} · Eco ${Number(c.bowl.eco || 0).toFixed(1)}</blockquote>`;
+  } catch (e) { return ''; }
+}
+// find a registered (non-captain) tournament player from @username, id or a replied message
+async function findTourPlayer(ctx, t, arg) {
+  const rows = (await tourPlayers(t.id)).filter((r) => r.role !== 'captain');
+  const rep = ctx.message && ctx.message.reply_to_message && ctx.message.reply_to_message.from;
+  const key = String(arg || '').trim().replace(/^@/, '').toLowerCase();
+  if (key) return rows.find((r) => String(r.username || '').toLowerCase() === key || String(r.telegram_id) === key) || null;
+  if (rep) return rows.find((r) => Number(r.telegram_id) === Number(rep.id)) || null;
+  return null;
+}
+async function unsoldRows(t) {
+  const S = tourAuc.get(String(t.id));
+  if (S) return S.unsold.slice();
+  return (await tourPlayers(t.id)).filter((r) => r.role !== 'captain' && !r.owner_id && r.state === 'unsold');
+}
+// bring one chosen player on the block (host command)
+async function aucBring(ctx, t, p) {
+  const nm = escapeHtml(tName(p));
+  if (p.owner_id) {
+    const owner = (await tourPlayers(t.id)).find((r) => Number(r.telegram_id) === Number(p.owner_id));
+    return ctx.reply(`❌ <b>${nm}</b> is already sold${owner ? ' to <b>' + escapeHtml(tm(owner)) + '</b>' : ''}${p.price ? ' for ' + p.price : ''}.`, trep(ctx));
+  }
+  const S = tourAuc.get(String(t.id));
+  if (!S || S.chatId !== ctx.chat.id) return ctx.reply('The auction is not running here. Start it with /abid first.', trep(ctx));
+  if (S.cur && Number(S.cur.telegram_id) === Number(p.telegram_id)) return ctx.reply(`<b>${nm}</b> is already on the block.`, trep(ctx));
+  S.queue = S.queue.filter((x) => Number(x.telegram_id) !== Number(p.telegram_id));
+  S.unsold = S.unsold.filter((x) => Number(x.telegram_id) !== Number(p.telegram_id));
+  S.queue.unshift(p);
+  if (S.cur && !S.closing && !S.bidder) {
+    // nobody has bid on the current player: he waits, the chosen player comes now
+    clearTimeout(S.timer); clearTimeout(S.warn); S.seq++;
+    const old = S.cur;
+    S.queue.splice(1, 0, old);
+    S.n -= 1; S.noSetMsg = true;
+    const t0 = `↩️ <b>${escapeHtml(tName(old))}</b> goes back to the queue. <b>${nm}</b> comes now.`;
+    (S.media ? S.tg.editMessageCaption(S.chatId, S.msgId, undefined, t0, { parse_mode: 'HTML' }) : S.tg.editMessageText(S.chatId, S.msgId, undefined, t0, { parse_mode: 'HTML' })).catch(() => {});
+    await ctx.reply(`✅ <b>${nm}</b> is coming up for bid.`, trep(ctx));
+    return aucNext(S);
+  }
+  return ctx.reply(`✅ <b>${nm}</b> will be the next player on the block.`, trep(ctx));
+}
+bot.hears(/^\/bid_start(?:@\w+)?(?:\s+(\S+))?\s*$/i, async (ctx) => {
+  const S = await runningAuction(ctx, true);
+  if (!S) return;
+  const t = await activeTour(ctx.chat.id);
+  const p = await findTourPlayer(ctx, t, ctx.match[1]);
+  if (!p) return ctx.reply('Usage: /bid_start @username  or  /bid_start 123456789  (or reply to the player). The player must be registered.', trep(ctx));
+  return aucBring(ctx, t, p);
+});
+bot.hears(/^\/unsold_(\d+)(?:@\w+)?\s*$/i, async (ctx) => {
+  const S = await runningAuction(ctx, true);
+  if (!S) return;
+  const t = await activeTour(ctx.chat.id);
+  const list = await unsoldRows(t);
+  const p = list[Number(ctx.match[1]) - 1];
+  if (!p) return ctx.reply('No such player in the /unsold list.', trep(ctx));
+  return aucBring(ctx, t, p);
+});
+bot.command('unsold', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t) return ctx.reply('No tournament is open here.', trep(ctx));
+  const list = await unsoldRows(t);
+  if (!list.length) return ctx.reply('There are no unsold players.', trep(ctx));
+  const body = list.map((p, i) => `${i + 1}. ${escapeHtml(tName(p))}${p.username ? ' (@' + escapeHtml(p.username) + ')' : ''} · ${ROLE_LABEL[p.prole || 'ar']}\n    /unsold_${i + 1}`).join('\n');
+  return ctx.reply(`<b>UNSOLD LIST</b> (${list.length})\n<blockquote expandable>${body}</blockquote>\n<i>Host: tap a /unsold_number to bring that player on the block.</i>`, trep(ctx));
+});
+function squadBlock(t, c, rows) {
+  const mine = rows.filter((p) => p.role !== 'captain' && Number(p.owner_id) === Number(c.telegram_id));
+  const vc = c.vc_id ? rows.find((x) => Number(x.telegram_id) === Number(c.vc_id)) : null;
+  const ln = (r) => `${escapeHtml(tName(r))}${r.username ? ' (@' + escapeHtml(r.username) + ')' : ''}`;
+  return `<b>#${c.team_no || '-'} ${escapeHtml(tm(c))}</b>\n💰 Purse remaining: <b>${c.purse ?? 0}</b>\n👑 Captain: ${ln(c)}\n` +
+    (vc ? `🎖 Vice captain: ${ln(vc)}\n` : '') +
+    `👥 <b>Squad</b> (${mine.length + 1}/${t.team_size})\n<blockquote expandable>${mine.length ? mine.map((p, i) => `${i + 1}. ${escapeHtml(tName(p))} ➼ ${p.price || 0}\n    ${p.username ? '(@' + escapeHtml(p.username) + ')' : ''}`).join('\n') : 'No players yet'}</blockquote>`;
+}
+bot.command('squads', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t) return ctx.reply('No tournament is open here.', trep(ctx));
+  const rows = await tourPlayers(t.id);
+  const caps = rows.filter((r) => r.role === 'captain').sort((a, b) => (a.team_no || 99) - (b.team_no || 99));
+  if (!caps.length) return ctx.reply('No teams yet.', trep(ctx));
+  let msg = `🏆 <b>${escapeHtml(t.name)} · ALL SQUADS</b>\n\n`;
+  for (const c of caps) {
+    const b = squadBlock(t, c, rows) + '\n\n';
+    if ((msg + b).length > 3800) { await ctx.reply(msg, trep(ctx)); msg = ''; }
+    msg += b;
+  }
+  if (msg.trim()) await ctx.reply(msg, trep(ctx));
+});
+bot.command('squad', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t) return ctx.reply('No tournament is open here.', trep(ctx));
+  const rows = await tourPlayers(t.id);
+  const uid = ctx.from.id, arg = cmdArgs(ctx);
+  let c = arg ? await findTeam(t, arg) : null;
+  if (!c) c = rows.find((r) => r.role === 'captain' && (Number(r.telegram_id) === uid || Number(r.vc_id) === uid));
+  if (!c) { const me = rows.find((r) => Number(r.telegram_id) === uid && r.owner_id); if (me) c = rows.find((r) => r.role === 'captain' && Number(r.telegram_id) === Number(me.owner_id)); }
+  if (!c) return ctx.reply('You are not in a team. Use /squads to see every team, or /squad <team no or name>.', trep(ctx));
+  return ctx.reply(squadBlock(t, c, rows), trep(ctx));
 });
 
 // ── teams: purse, names, captain / vice captain / retention, role GIFs ──
@@ -13328,7 +13453,8 @@ bot.command(['auchelp', 'auctionhelp', 'auchelp_cmds'], (ctx) => ctx.reply(
   '/next — bring the next player now\n/nextset — skip to the next set (10 players per set)\n/sold — sell the current player now\n' +
   'The bot sells automatically if nobody bids higher for ' + AUC_SECONDS + ' seconds.</blockquote>\n' +
   '<b>4. Bidding (captains and vice captains)</b>\n<blockquote>Tap a BID button on the player card, or send /bid &lt;amount&gt; (example: /bid 250). The amount must be higher than the current bid and within your purse.</blockquote>\n' +
-  '<b>5. Info</b>\n<blockquote>/teamlist — all teams and players\n/purse — team purses\n/schedule · /points · /orange · /purple · /mvp</blockquote>\n' +
+  '<b>3b. Pick a player (host)</b>\n<blockquote>/bid @username or /bid 123456789 — bring that registered player on the block now (also /bid_start @username, or reply to the player). If he is already sold, the bot tells you which team has him.\n/unsold — list of unsold players\n/unsold_3 — bring unsold player number 3 on the block</blockquote>\n' +
+  '<b>5. Info</b>\n<blockquote>/teamlist — all teams and players\n/squads — every team squad\n/squad — your own team squad (or /squad &lt;team&gt;)\n/purse — purses of all teams\n/unsold — unsold players\n/schedule · /points · /orange · /purple · /mvp</blockquote>\n' +
   '<b>6. Card / GIF (owner)</b>\n<blockquote>The bot makes a player card automatically. To use your own GIF instead: reply to a GIF with /setaucgif entry|bid|sold bat|bowl|ar\n/aucgifs — list GIFs · /delaucgif entry|bid|sold bat|bowl|ar — remove</blockquote>\n' +
   '<i>More: /tourhelp</i>',
   { parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true }));
