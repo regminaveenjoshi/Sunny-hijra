@@ -40,8 +40,24 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r98-2026-11-16-tunnel-auto'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r100b-2026-11-16-tmatch-vc'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
+// Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
+// ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
+const LONE_SURR = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+const fixUtf = (v) => (typeof v === 'string' ? v.replace(LONE_SURR, '') : v);
+{
+  const rawCall = bot.telegram.callApi.bind(bot.telegram);
+  bot.telegram.callApi = (method, data = {}, ...rest) => {
+    if (data && typeof data === 'object') {
+      for (const k of ['text', 'caption', 'message', 'title', 'description']) if (typeof data[k] === 'string') data[k] = fixUtf(data[k]);
+      if (data.reply_markup && Array.isArray(data.reply_markup.inline_keyboard)) {
+        for (const row of data.reply_markup.inline_keyboard) for (const b of row) if (b && typeof b.text === 'string') b.text = fixUtf(b.text);
+      }
+    }
+    return rawCall(method, data, ...rest);
+  };
+}
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 // /Store, /SHOP, /Bat … → the command word is read in lower case
 bot.use(async (ctx, next) => {
@@ -13662,7 +13678,7 @@ bot.command(['auchelp', 'auctionhelp', 'auchelp_cmds'], (ctx) => ctx.reply(
   { parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true }));
 
 bot.command(['tourhelp', 'tournamenthelp'], (ctx) => ctx.reply(
-  '<b>TOURNAMENT COMMANDS</b>\n<blockquote>/tournament — start or continue the setup\n/cap, /vc, /sq — manual tournament teams (host)\n/win &lt;team&gt; [match no] — free win, also during a live match (host)\n/postpone [match no] [date] — postpone a match; send it inside the live match group (host)\n/pdate &lt;match no&gt; &lt;date&gt; — set the new date (host)\n/register bat|bowl|ar — join as a player\n/registercap — join as a captain\n/teamlist — teams with numbers\n/purse — team purses\n\n<b>Host</b>\n/addcap_&lt;team&gt; @user — add or change a captain (new name = new team)\n/add_vc_&lt;team&gt; @user — vice captain (can bid)\n/rtm_&lt;team&gt; @player [price] — retention before the auction\n/tname &lt;team&gt; &lt;name&gt; — rename a team\n/setpurse [team] &lt;amt&gt; · /addpurse [team] +/-&lt;amt&gt;\n/tset size 6 purse 1000 base 50\n/abid — start the auction\n/bid &lt;amt&gt; — captains and vice captains\n/next — next player · /nextset — skip the set · /sold — sell now\n/addmatch · /delmatch · /schedule · /points\n/orange · /purple · /mvp · /finishtour · /endtour</blockquote>',
+  '<b>TOURNAMENT COMMANDS</b>\n<blockquote>/tournament — start or continue the setup\n/cap, /vc, /sq — manual tournament teams (host)\n/tmatch [match no] — start a scheduled match: pick the playing XI, then the toss (captain, VC or host)\n/win &lt;team&gt; [match no] — free win, also during a live match (host)\n/postpone [match no] [date] — postpone a match; send it inside the live match group (host)\n/pdate &lt;match no&gt; &lt;date&gt; — set the new date (host)\n/register bat|bowl|ar — join as a player\n/registercap — join as a captain\n/teamlist — teams with numbers\n/purse — team purses\n\n<b>Host</b>\n/addcap_&lt;team&gt; @user — add or change a captain (new name = new team)\n/add_vc_&lt;team&gt; @user — vice captain (can bid)\n/rtm_&lt;team&gt; @player [price] — retention before the auction\n/tname &lt;team&gt; &lt;name&gt; — rename a team\n/setpurse [team] &lt;amt&gt; · /addpurse [team] +/-&lt;amt&gt;\n/tset size 6 purse 1000 base 50\n/abid — start the auction\n/bid &lt;amt&gt; — captains and vice captains\n/next — next player · /nextset — skip the set · /sold — sell now\n/addmatch · /delmatch · /schedule · /points\n/orange · /purple · /mvp · /finishtour · /endtour</blockquote>',
   { parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true }));
 
 // ── schedule, results, points ──
@@ -13814,6 +13830,150 @@ async function finishFixture(t, f, m, teams) {
   for (const c of chats) await tSay(bot.telegram, c, text);
   for (const id of [Number(f.t1), Number(f.t2)]) await tSay(bot.telegram, id, text);
 }
+
+
+// ── r100: /tmatch — start a tournament fixture in any group: pick the playing XI of both teams, confirm, then toss ──
+const tmSess = new Map(); // sid -> session
+const TM_MAX = 11;
+const sideKey = (x) => (x === 'a' ? 't1' : 't2');
+function tmCanAct(ctx, S, side) {
+  const cap = side === 'a' ? S.c1 : S.c2;
+  const id = ctx.from.id;
+  return id === Number(cap.telegram_id) || id === Number(cap.vc_id || 0) || id === S.starter || id === Number(S.t.host_id) || isAdmin(id);
+}
+function tmPanel(S, side) {
+  const cap = side === 'a' ? S.c1 : S.c2;
+  const sel = S.sel[side], pool = S.pool[side];
+  const done = S.ok[side];
+  const rows = [];
+  if (!done) {
+    for (let i = 0; i < pool.length; i += 2) {
+      rows.push(pool.slice(i, i + 2).map((p) => {
+        const on = sel.has(Number(p.telegram_id));
+        const tag = Number(p.telegram_id) === Number(cap.telegram_id) ? '👑 ' : Number(p.telegram_id) === Number(cap.vc_id || 0) ? '🎖 ' : '';
+        return tbtn(`${on ? '✅ ' : ''}${tag}${tName(p)}`.slice(0, 30), `tmx:${S.sid}:${side}:${p.telegram_id}`, on ? 'success' : undefined);
+      }));
+    }
+    rows.push([tbtn(`CONFIRM (${sel.size}/${TM_MAX})`, `tmc:${S.sid}:${side}`, 'primary')]);
+  } else rows.push([tbtn('EDIT TEAM', `tmu:${S.sid}:${side}`, 'danger')]);
+  const text = `${pe('people')} <b>${escapeHtml(tm(cap))}</b> · playing XI\n${done ? `${pe('ok')} <b>Confirmed</b> · ${sel.size} players\n<blockquote>${pool.filter((p) => sel.has(Number(p.telegram_id))).map((p) => escapeHtml(tName(p))).join('\n')}</blockquote>` : `Captain or VC: tap players to select up to ${TM_MAX}. Selected players turn green. If the captain is absent, unselect the captain and select the VC, who then leads the team. Then press CONFIRM.`}`;
+  return { text, kb: Markup.inlineKeyboard(rows) };
+}
+async function tmRefresh(telegram, S, side) {
+  const { text, kb } = tmPanel(S, side);
+  const mid = S.msg[side];
+  if (!mid) return;
+  await telegram.editMessageText(S.chatId, mid, undefined, text, { parse_mode: 'HTML', ...kb }).catch(() => {});
+}
+bot.command(['tmatch', 'tourmatch'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const { rows: ts } = await q(`SELECT * FROM tournaments WHERE status='ready' ORDER BY id DESC`);
+  if (!ts.length) return ctx.reply(`${pe('no')} There is no running tournament.`, trep(ctx));
+  if (await getActiveMatch(ctx.chat.id)) return ctx.reply(`${pe('warn')} A match is already running in this group. Host: /endmatch to cancel it first.`, trep(ctx));
+  const uid = ctx.from.id;
+  const no = parseInt(String(cmdArgs(ctx)).replace('#', ''), 10) || 0;
+  let pick = null; const mine = [];
+  for (const t of ts) {
+    const caps = (await tourPlayers(t.id)).filter((r) => r.role === 'captain');
+    const host = isAdmin(uid) || Number(t.host_id) === uid;
+    const myTeams = caps.filter((c) => Number(c.telegram_id) === uid || Number(c.vc_id || 0) === uid).map((c) => Number(c.telegram_id));
+    if (!host && !myTeams.length) continue;
+    const fx = (await q(`SELECT * FROM tour_fixtures WHERE tid=$1 AND status='pending' ORDER BY no`, [t.id])).rows
+      .filter((f) => host || myTeams.includes(Number(f.t1)) || myTeams.includes(Number(f.t2)));
+    for (const f of fx) mine.push({ t, f, caps });
+  }
+  if (!mine.length) return ctx.reply(`${pe('no')} You have no pending tournament match. Only a captain, VC or the host can start one. The host adds matches with /addmatch.`, trep(ctx));
+  if (no) pick = mine.find((x) => Number(x.f.no) === no);
+  else if (mine.length === 1) pick = mine[0];
+  if (!pick) {
+    const list = mine.slice(0, 15).map((x) => `#${x.f.no} ${escapeHtml(capName(x.caps, x.f.t1))} vs ${escapeHtml(capName(x.caps, x.f.t2))}`).join('\n');
+    return ctx.reply(`${pe('list')} <b>Choose the match</b>\n<blockquote>${list}</blockquote>Send /tmatch &lt;match no&gt;, for example /tmatch ${mine[0].f.no}`, trep(ctx));
+  }
+  const { t, f, caps } = pick;
+  const c1 = caps.find((c) => Number(c.telegram_id) === Number(f.t1)), c2 = caps.find((c) => Number(c.telegram_id) === Number(f.t2));
+  if (!c1 || !c2) return ctx.reply(`${pe('no')} One of the teams no longer exists.`, trep(ctx));
+  const all = await tourPlayers(t.id);
+  const poolOf = (c) => [c, ...all.filter((p) => p.role !== 'captain' && Number(p.owner_id) === Number(c.telegram_id))];
+  const sid = Math.random().toString(36).slice(2, 8);
+  const S = { sid, chatId: ctx.chat.id, t, f, c1, c2, starter: uid, pool: { a: poolOf(c1), b: poolOf(c2) },
+    sel: { a: new Set([Number(c1.telegram_id)]), b: new Set([Number(c2.telegram_id)]) }, ok: { a: false, b: false }, msg: {}, made: false };
+  for (const k of tmSess.keys()) if (tmSess.get(k).chatId === ctx.chat.id) tmSess.delete(k);
+  tmSess.set(sid, S);
+  setTimeout(() => tmSess.delete(sid), 60 * 60 * 1000).unref();
+  await ctx.reply(`${pe('swords')} <b>TOURNAMENT MATCH #${f.no}</b>\n<blockquote>${escapeHtml(tm(c1))} vs ${escapeHtml(tm(c2))}</blockquote>${pe('list')} Both captains (or VCs) select the playing XI below and confirm. After that the host gets the toss button.`, { parse_mode: 'HTML' });
+  for (const side of ['a', 'b']) {
+    const { text, kb } = tmPanel(S, side);
+    const m = await ctx.telegram.sendMessage(ctx.chat.id, text, { parse_mode: 'HTML', ...kb });
+    S.msg[side] = m.message_id;
+  }
+});
+bot.action(/^tm(x|c|u):(\w+):(a|b)(?::(\d+))?$/, async (ctx) => {
+  const [, kind, sid, side, pid] = ctx.match;
+  const S = tmSess.get(sid);
+  if (!S || S.made) return ctx.answerCbQuery('This selection is closed. Send /tmatch again.', { show_alert: true });
+  if (!tmCanAct(ctx, S, side)) return ctx.answerCbQuery('Only this team\'s captain, VC or the host can do this.', { show_alert: true });
+  const sel = S.sel[side], cap = side === 'a' ? S.c1 : S.c2;
+  if (kind === 'x') {
+    if (S.ok[side]) return ctx.answerCbQuery('Press EDIT TEAM first.');
+    const id = Number(pid);
+    if (sel.has(id)) sel.delete(id);
+    else { if (sel.size >= TM_MAX) return ctx.answerCbQuery(`Maximum ${TM_MAX} players.`, { show_alert: true }); sel.add(id); }
+    await ctx.answerCbQuery().catch(() => {});
+    return tmRefresh(ctx.telegram, S, side);
+  }
+  if (kind === 'u') { S.ok[side] = false; await ctx.answerCbQuery().catch(() => {}); return tmRefresh(ctx.telegram, S, side); }
+  if (sel.size < MIN_TEAM_PLAYERS) return ctx.answerCbQuery(`Select at least ${MIN_TEAM_PLAYERS} players.`, { show_alert: true });
+  if (!sel.has(Number(cap.telegram_id)) && !(cap.vc_id && sel.has(Number(cap.vc_id)))) return ctx.answerCbQuery('Select the captain, or the VC if the captain is absent. One of them must play.', { show_alert: true });
+  S.ok[side] = true;
+  await ctx.answerCbQuery('Confirmed').catch(() => {});
+  await tmRefresh(ctx.telegram, S, side);
+  if (S.ok.a && S.ok.b && !S.made) {
+    S.made = true;
+    try { await tmCreateMatch(ctx.telegram, S); } catch (e) { S.made = false; console.error('tmatch:', e.message); await tSay(ctx.telegram, S.chatId, `${pe('no')} Could not create the match: ${escapeHtml(e.message)}`); }
+  }
+});
+async function tmCreateMatch(telegram, S) {
+  if (await getActiveMatch(S.chatId)) throw new Error('a match is already running here');
+  const { rows } = await q(
+    `INSERT INTO matches (group_chat_id, group_title, mode, host_telegram_id, team_size, total_overs, max_overs_per_bowler, status, spam_free)
+     VALUES ($1,$2,'team',$3,$4,$5,$6,'captains',TRUE) RETURNING *`,
+    [S.chatId, null, S.starter, DEFAULT_TEAM_SIZE, DEFAULT_OVERS, MAX_BOWLER_OVERS]);
+  const m = rows[0];
+  for (const side of ['a', 'b']) {
+    const L = side === 'a' ? 'A' : 'B', cap0 = side === 'a' ? S.c1 : S.c2;
+    const leader = S.sel[side].has(Number(cap0.telegram_id)) ? Number(cap0.telegram_id) : Number(cap0.vc_id);
+    const cap = { ...cap0, telegram_id: leader };
+    await q(`INSERT INTO match_teams (match_id, team_label, team_name, captain_id) VALUES ($1,$2,$3,$4)`, [m.id, L, tm(cap0), leader]);
+    const players = S.pool[side].filter((p) => S.sel[side].has(Number(p.telegram_id)));
+    players.sort((x, y) => (Number(y.telegram_id) === Number(cap.telegram_id)) - (Number(x.telegram_id) === Number(cap.telegram_id)));
+    let pos = 0;
+    for (const p of players) {
+      pos++;
+      await q(`INSERT INTO match_players (match_id, telegram_id, team_label, roster_position, username, first_name, last_name, is_captain) VALUES ($1,$2,$3,$4,$5,$6,NULL,$7)`,
+        [m.id, p.telegram_id, L, pos, p.username || null, p.name || null, Number(p.telegram_id) === Number(cap.telegram_id)]);
+    }
+  }
+  await q(`UPDATE tour_fixtures SET match_id=$2 WHERE id=$1`, [S.f.id, m.id]);
+  const pl0 = await getPlayers(m.id);
+  startIdleWatch(m.id, ['captains', '', pl0.length, 0].join('|'));
+  touchMatch(m.id);
+  const hostTag = `<a href="tg://user?id=${S.starter}">${escapeHtml('Host')}</a>`;
+  await telegram.sendMessage(S.chatId,
+    `${pe('ok')} <b>BOTH TEAMS CONFIRMED</b>\n<blockquote>${escapeHtml(tm(S.c1))} (${S.sel.a.size}) vs ${escapeHtml(tm(S.c2))} (${S.sel.b.size})</blockquote>${hostTag}, press the button to start the toss.`,
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([[tbtn('START THE TOSS', `tmt:${m.id}`, 'success')]]) });
+}
+bot.action(/^tmt:(\d+)$/, async (ctx) => {
+  const m = await getMatch(ctx.match[1]);
+  if (!m || m.status !== 'captains') return ctx.answerCbQuery('The toss has already started.', { show_alert: true });
+  const { rows } = await q(`SELECT t.host_id FROM tour_fixtures f JOIN tournaments t ON t.id=f.tid WHERE f.match_id=$1`, [m.id]);
+  const tms = (await q(`SELECT captain_id FROM match_teams WHERE match_id=$1`, [m.id])).rows.map((r) => Number(r.captain_id));
+  const id = ctx.from.id;
+  if (!(id === Number(m.host_telegram_id) || isAdmin(id) || (rows[0] && Number(rows[0].host_id) === id) || tms.includes(id)))
+    return ctx.answerCbQuery('Only the host or a captain can start the toss.', { show_alert: true });
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+  return tryBeginToss(ctx.telegram, m.id);
+});
 
 // ── r97: /win (free win, also during a live match), /postpone, /pdate ──
 async function tourAuth(ctx, t) {
