@@ -40,15 +40,17 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r105-2026-11-16-lb-rich-fix'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r106-2026-11-16-utf-proto'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
 const LONE_SURR = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 const fixUtf = (v) => (typeof v === 'string' ? v.replace(LONE_SURR, '') : v);
 {
-  const rawCall = bot.telegram.callApi.bind(bot.telegram);
-  bot.telegram.callApi = (method, data = {}, ...rest) => {
+  // Telegraf builds a fresh Telegram object for every update, so the patch must sit on the class itself
+  const TgProto = Object.getPrototypeOf(bot.telegram);
+  const rawCall = TgProto.callApi;
+  TgProto.callApi = function (method, data = {}, ...rest) {
     if (data && typeof data === 'object') {
       const deep = (o, d) => {
         if (!o || typeof o !== 'object' || d > 4 || Buffer.isBuffer(o) || typeof o.pipe === 'function' || o.source) return;
@@ -60,7 +62,7 @@ const fixUtf = (v) => (typeof v === 'string' ? v.replace(LONE_SURR, '') : v);
         for (const row of data.reply_markup.inline_keyboard) for (const b of row) if (b && typeof b.text === 'string') b.text = fixUtf(b.text);
       }
     }
-    return rawCall(method, data, ...rest);
+    return rawCall.call(this, method, data, ...rest);
   };
 }
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
