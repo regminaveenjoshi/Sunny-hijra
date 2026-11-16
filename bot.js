@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r103-2026-11-16-bulk'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r105-2026-11-16-lb-rich-fix'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -50,6 +50,11 @@ const fixUtf = (v) => (typeof v === 'string' ? v.replace(LONE_SURR, '') : v);
   const rawCall = bot.telegram.callApi.bind(bot.telegram);
   bot.telegram.callApi = (method, data = {}, ...rest) => {
     if (data && typeof data === 'object') {
+      const deep = (o, d) => {
+        if (!o || typeof o !== 'object' || d > 4 || Buffer.isBuffer(o) || typeof o.pipe === 'function' || o.source) return;
+        for (const k of Object.keys(o)) { if (typeof o[k] === 'string') o[k] = fixUtf(o[k]); else deep(o[k], d + 1); }
+      };
+      if (data.rich_message) deep(data.rich_message, 0);
       for (const k of ['text', 'caption', 'message', 'title', 'description']) if (typeof data[k] === 'string') data[k] = fixUtf(data[k]);
       if (data.reply_markup && Array.isArray(data.reply_markup.inline_keyboard)) {
         for (const row of data.reply_markup.inline_keyboard) for (const b of row) if (b && typeof b.text === 'string') b.text = fixUtf(b.text);
@@ -1687,7 +1692,7 @@ async function sendRichPhoto(chatId, html, imgBuf, replyTo) {
       try {
         const fd = new FormData();
         fd.append('chat_id', String(chatId));
-        fd.append('rich_message', JSON.stringify({ html: h, media }));
+        fd.append('rich_message', JSON.stringify({ html: fixUtf(h), media }));
         if (withReply) fd.append('reply_parameters', JSON.stringify({ message_id: replyTo, allow_sending_without_reply: true }));
         fd.append('cardfile', new Blob([imgBuf], { type: 'image/jpeg' }), 'card.jpg');
         const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendRichMessage`, { method: 'POST', body: fd });
@@ -5773,18 +5778,6 @@ bot.command('score', async (ctx) => {
   const m = await getActiveMatch(ctx.chat.id);
   if (!m) return ctx.reply(`${pe('no','❌')} No active match`);
   await sendScoreboard(ctx.telegram, ctx.chat.id, m.id, true);
-});
-
-// /app -> link to the mini app, sent as a reply to the user's message
-bot.command(['app', 'miniapp'], async (ctx) => {
-  if (!BOT_USERNAME) return;
-  const kb = Markup.inlineKeyboard([[ubtn('𝗢𝗣𝗘𝗡 𝗠𝗜𝗡𝗜 𝗔𝗣𝗣', `https://t.me/${BOT_USERNAME}/app`, 'zap', 'success')]]);
-  return ctx.reply(`<b>CRIC MONSTER</b>\nProfile, ranks, trophies, store and live scores in one app.`, {
-    parse_mode: 'HTML',
-    reply_markup: kb.reply_markup,
-    reply_to_message_id: ctx.message?.message_id,
-    allow_sending_without_reply: true,
-  });
 });
 
 // ═════════════════ DISCIPLINE: 30s turn clock, 10s warning, penalties ═════════════════
@@ -14338,7 +14331,11 @@ bot.command(['weblink', 'miniapplink', 'link'], async (ctx) => {
 });
 // always opens the live link, so it works even when BotFather still has an old one
 bot.command(['app', 'miniapp'], async (ctx) => {
-  if (!ctx.chat || ctx.chat.type !== 'private') return ctx.reply('Send /app to me in private chat to open the mini app.', trep(ctx));
+  if (!ctx.chat || ctx.chat.type !== 'private') {
+    if (!BOT_USERNAME) return;
+    const kb = Markup.inlineKeyboard([[ubtn('𝗢𝗣𝗘𝗡 𝗠𝗜𝗡𝗜 𝗔𝗣𝗣', `https://t.me/${BOT_USERNAME}/app`, 'zap', 'success')]]);
+    return ctx.reply(`<b>CRIC MONSTER</b>\nProfile, ranks, trophies, store and live scores in one app.\n<i>If it does not open, send /app to me in private chat.</i>`, { parse_mode: 'HTML', reply_markup: kb.reply_markup, reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
+  }
   const u = tunnelUrlNow() || (await kvGet('tunnel_url'));
   if (!u || !(await tunnelAlive(u))) return ctx.reply('The mini app is offline for a moment. Please try again in a minute.');
   return ctx.reply('Tap the button to open the mini app.', Markup.inlineKeyboard([[Markup.button.webApp('Open Cric Monster', u)]]));
