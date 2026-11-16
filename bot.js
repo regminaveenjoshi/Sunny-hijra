@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r97-2026-11-16-win-postpone'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r98-2026-11-16-tunnel-auto'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
 // /Store, /SHOP, /Bat … → the command word is read in lower case
@@ -14065,7 +14065,8 @@ function tunnelUrlNow() {
       try {
         const p = _path.join(dir, f), st = _fs.statSync(p);
         if (st.mtimeMs <= bestT) continue;
-        const size = Math.min(st.size, 300000);
+        // the link is printed once at tunnel start, so a long log can push it far back: read up to 30 MB
+        const size = Math.min(st.size, 30 * 1024 * 1024);
         const fd = _fs.openSync(p, 'r'), buf = Buffer.alloc(size);
         _fs.readSync(fd, buf, 0, size, st.size - size); _fs.closeSync(fd);
         const all = buf.toString('utf8').match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/g);
@@ -14075,21 +14076,50 @@ function tunnelUrlNow() {
   }
   return best;
 }
+// is the mini app really reachable through this link right now
+async function tunnelAlive(url) {
+  try {
+    const r = await fetch(url + '/health', { signal: AbortSignal.timeout(8000) });
+    return r.status < 500;
+  } catch (_) { return false; }
+}
+// the menu button can be changed by the bot itself, so it follows the link automatically
+async function applyMenuButton(url) {
+  try {
+    await bot.telegram.callApi('setChatMenuButton', { menu_button: { type: 'web_app', text: 'Cric Monster', web_app: { url } } });
+    return true;
+  } catch (e) { console.error('setChatMenuButton:', e.message); return false; }
+}
+let tunnelApplied = '';
 async function tunnelWatch() {
   const best = tunnelUrlNow();
   if (!best) return;
   const prev = await kvGet('tunnel_url');
+  if (prev === best && tunnelApplied === best) return;
+  const alive = await tunnelAlive(best);
+  if (alive && tunnelApplied !== best) { if (await applyMenuButton(best)) tunnelApplied = best; }
   if (prev === best) return;
   await kvSet('tunnel_url', best);
-  const text = `<b>${prev ? 'MINI APP LINK CHANGED' : 'MINI APP LINK'}</b>\n${prev ? 'The tunnel got a new link, so the mini app is down until you update it in BotFather.' : 'This is the current mini app link.'}\n\n<code>${best}</code>\n\n1. /myapps, choose the app, then Edit Web App URL.\n2. /mybots, choose this bot, Bot Settings, Configure Mini App, then Edit Mini App URL.\nPaste the link above in both places.`;
-  for (const id of [...new Set(BOT_ADMIN_IDS.map(Number).filter((n) => n > 0))]) await rDm(id, text);
+  const text = `<b>${prev ? 'MINI APP LINK CHANGED' : 'MINI APP LINK'}</b>\n${alive ? 'The menu button of the bot is already updated. Send /app to the bot in private to open the mini app.' : 'This link is not answering yet. Wait a minute and send /weblink.'}\nFor the t.me/${BOT_USERNAME || 'bot'}/app link, set this URL in BotFather: /myapps, Edit Web App URL.\n\n<code>${best}</code>`;
+  for (const id of [...new Set(BOT_ADMIN_IDS.map(Number).filter((n) => n > 0))]) {
+    await bot.telegram.sendMessage(id, text, { parse_mode: 'HTML' }).catch((e) => console.error('tunnel dm', id, e.message));
+  }
 }
 
 bot.command(['weblink', 'miniapplink', 'link'], async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   const u = tunnelUrlNow() || (await kvGet('tunnel_url'));
   if (!u) return ctx.reply('No tunnel link found in the logs. Check: pm2 logs tunnel');
-  return ctx.reply(`<b>MINI APP LINK</b>\n<code>${u}</code>\n\nBotFather: /myapps, choose the app, Edit Web App URL. Also /mybots, Bot Settings, Menu Button or Configure Mini App.`, { parse_mode: 'HTML' });
+  const alive = await tunnelAlive(u);
+  if (alive) { await kvSet('tunnel_url', u); if (await applyMenuButton(u)) tunnelApplied = u; }
+  return ctx.reply(`<b>MINI APP LINK</b>\n<code>${u}</code>\n\nStatus: <b>${alive ? 'online' : 'NOT reachable (the tunnel is down or the link is old)'}</b>\n${alive ? 'The bot menu button is updated. ' : ''}For the t.me app link: BotFather, /myapps, choose the app, Edit Web App URL.`, { parse_mode: 'HTML' });
+});
+// always opens the live link, so it works even when BotFather still has an old one
+bot.command(['app', 'miniapp'], async (ctx) => {
+  if (!ctx.chat || ctx.chat.type !== 'private') return ctx.reply('Send /app to me in private chat to open the mini app.', trep(ctx));
+  const u = tunnelUrlNow() || (await kvGet('tunnel_url'));
+  if (!u || !(await tunnelAlive(u))) return ctx.reply('The mini app is offline for a moment. Please try again in a minute.');
+  return ctx.reply('Tap the button to open the mini app.', Markup.inlineKeyboard([[Markup.button.webApp('Open Cric Monster', u)]]));
 });
 
 // ── r90: tournament format (groups + knockout), team logos, mini app tournament pages ──
