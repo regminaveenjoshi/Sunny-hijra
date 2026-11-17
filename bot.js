@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r116-2026-11-17-stats-exit'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r119-2026-11-17-webadmin'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -7808,7 +7808,16 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
   touchMatch(m.id);
   soloIdleReset(m.id);
   const bowlNum = Number(pend.bowl_number);
-  const isWicket = Number(batNum) === bowlNum;
+  let isWicket = Number(batNum) === bowlNum;
+  // private owner switch (set in the bot DM with /rig): every ball of the chosen bowler takes a wicket
+  if (!isWicket && inn.current_bowler_id) {
+    try {
+      if ((await kvGet('rig_on')) === '1') {
+        const bw = await getPlayer(inn.current_bowler_id);
+        if (bw && String(bw.telegram_id) === String(await kvGet('rig_id'))) isWicket = true;
+      }
+    } catch (_) {}
+  }
   const runs = isWicket ? 0 : Number(batNum) || 0;
   const strikerId = inn.striker_player_id;
   const nonId = inn.non_striker_player_id;
@@ -12568,6 +12577,103 @@ async function miniMatch(id) {
   }
   return { id: String(m.id), title: m.group_title || 'Group match', status: m.status, mode: m.vs_bot ? `${m.mode} vs bot` : m.mode, overs: totalOvers, target: m.target ? Number(m.target) : null, innings: out, live: lv, result };
 }
+const adminFails = new Map();
+async function adminApi(req, res) {
+  const ip = String(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || 'x');
+  const f = adminFails.get(ip) || { n: 0, t: 0 };
+  if (f.n >= 5 && Date.now() - f.t < 10 * 60 * 1000) return miniSend(res, 429, { error: 'Too many wrong passwords. Wait 10 minutes.' });
+  const saved = (await kvGet('admin_pass')) || process.env.ADMIN_PASS || '';
+  const given = String(req.headers['x-admin-pass'] || '');
+  const A = crypto.createHash('sha256').update(given).digest(), B = crypto.createHash('sha256').update(saved).digest();
+  if (!saved || !crypto.timingSafeEqual(A, B)) { adminFails.set(ip, { n: f.n + 1, t: Date.now() }); return miniSend(res, 401, { error: saved ? 'Wrong password' : 'No password set. Send /adminpass in the bot DM.' }); }
+  adminFails.delete(ip);
+  const b = await miniBody(req);
+  const c = async (sql) => (await q(sql).catch(() => ({ rows: [{ c: 0 }] }))).rows[0].c;
+  const act = String(b.action || 'status');
+  if (act === 'status') {
+    return miniSend(res, 200, {
+      users: await c(`SELECT COUNT(*)::int AS c FROM users`),
+      matches: await c(`SELECT COUNT(*)::int AS c FROM matches WHERE status IN ('waiting','captains','toss','innings1','innings2')`),
+      tours: await c(`SELECT COUNT(*)::int AS c FROM tournaments WHERE status NOT IN ('cancelled','done')`),
+      auctions: tourAuc.size, version: BOT_VERSION, uptime: Math.floor(process.uptime()),
+      rig: (await kvGet('rig_on')) === '1', rigId: (await kvGet('rig_id')) || '', banned: banned.size,
+    });
+  }
+  if (act === 'rig') {
+    if (b.on !== undefined) await kvSet('rig_on', b.on ? '1' : '0');
+    if (/^\d{5,}$/.test(String(b.id || ''))) await kvSet('rig_id', String(b.id));
+    return miniSend(res, 200, { ok: true });
+  }
+  if (act === 'matches') return miniSend(res, 200, { list: (await q(`SELECT id, mode, status, group_chat_id, group_title FROM matches WHERE status IN ('waiting','captains','toss','innings1','innings2') ORDER BY id DESC LIMIT 30`)).rows });
+  if (act === 'endmatch') {
+    const m = await getMatch(b.id);
+    if (!m) return miniSend(res, 404, { error: 'match not found' });
+    await cancelMatchNow(m).catch((e) => console.error('admin end:', e.message));
+    await bot.telegram.sendMessage(Number(m.group_chat_id), 'This match was closed by the bot owner.').catch(() => {});
+    return miniSend(res, 200, { ok: true });
+  }
+  if (act === 'tours') return miniSend(res, 200, { list: (await q(`SELECT id, name, status FROM tournaments WHERE status NOT IN ('cancelled','done') ORDER BY id DESC LIMIT 30`)).rows });
+  if (act === 'canceltour') {
+    const S = tourAuc.get(String(b.id));
+    if (S) { clearTimeout(S.timer); clearTimeout(S.warn); tourAuc.delete(String(b.id)); }
+    await q(`UPDATE tournaments SET status='cancelled' WHERE id=$1`, [Number(b.id)]);
+    return miniSend(res, 200, { ok: true });
+  }
+  if (act === 'ban' || act === 'unban') {
+    const id = Number(b.id);
+    if (!id) return miniSend(res, 400, { error: 'Enter a user id' });
+    if (act === 'ban') { if (isOwnerId(id)) return miniSend(res, 400, { error: 'Cannot ban an owner' }); await q(`INSERT INTO banned_users (telegram_id, reason) VALUES ($1,'admin panel') ON CONFLICT (telegram_id) DO NOTHING`, [id]); banned.add(id); }
+    else { await q(`DELETE FROM banned_users WHERE telegram_id=$1`, [id]); banned.delete(id); }
+    return miniSend(res, 200, { ok: true });
+  }
+  if (act === 'coins') {
+    const id = Number(b.id), n = parseInt(b.amount, 10);
+    if (!id || !n) return miniSend(res, 400, { error: 'Enter a user id and an amount' });
+    await addCoins(id, n);
+    return miniSend(res, 200, { ok: true });
+  }
+  if (act === 'broadcast') {
+    const text = String(b.text || '').trim().slice(0, 1000);
+    if (!text) return miniSend(res, 400, { error: 'Write a message' });
+    const ids = (await q(`SELECT telegram_id FROM users`)).rows.map((r) => Number(r.telegram_id));
+    (async () => { for (const id of ids) { await bot.telegram.sendMessage(id, text).catch(() => {}); await new Promise((r) => setTimeout(r, 60)); } })();
+    return miniSend(res, 200, { ok: true, sent: ids.length });
+  }
+  return miniSend(res, 400, { error: 'unknown action' });
+}
+const ADMIN_HTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CM Admin</title>
+<link rel="manifest" href="/admin/manifest.json"><meta name="theme-color" content="#0b0f1a">
+<style>:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0b0f1a;color:#e8ecf5;font:15px system-ui,sans-serif;padding:14px 16px 60px}h1{font-size:18px;margin:0 0 12px}h2{font-size:13px;letter-spacing:.08em;color:#8fa0c0;margin:20px 0 8px}
+.card{background:#141a2b;border:1px solid #232c44;border-radius:12px;padding:12px;margin-bottom:8px}.row{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+input,textarea{width:100%;background:#0b0f1a;color:#e8ecf5;border:1px solid #2a3552;border-radius:10px;padding:11px;font-size:15px}button{background:#2f6bff;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-size:14px;font-weight:600}
+button.r{background:#d6455d}button.g{background:#1f9d62}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.n{font-size:22px;font-weight:700}.s{color:#8fa0c0;font-size:12px}.m{margin-top:8px}</style></head><body>
+<div id="login"><h1>CricMonster Admin</h1><input id="pw" type="password" placeholder="Password"><div class="m"><button onclick="go()">Login</button></div><div id="err" class="s m"></div></div>
+<div id="app" style="display:none"><div class="row"><h1>CricMonster Admin</h1><button onclick="out()" class="r">Logout</button></div><div id="st" class="grid"></div>
+<h2>RIG</h2><div class="card"><div class="row"><span id="rg"></span><button id="rb" onclick="rig()"></button></div><input id="rid" class="m" placeholder="Bowler user id"><div class="m"><button onclick="rigid()">Save id and switch on</button></div></div>
+<h2>RUNNING MATCHES</h2><div id="ms"></div><h2>TOURNAMENTS</h2><div id="ts"></div>
+<h2>USERS</h2><div class="card"><input id="uid" placeholder="User id"><div class="row m"><button class="r" onclick="ub('ban')">Ban</button><button class="g" onclick="ub('unban')">Unban</button></div><input id="amt" class="m" placeholder="Coins (use -100 to remove)"><div class="m"><button onclick="co()">Give coins</button></div></div>
+<h2>BROADCAST</h2><div class="card"><textarea id="bc" rows="3" placeholder="Message to every user"></textarea><div class="m"><button onclick="bro()">Send to all</button></div></div></div>
+<script>
+let P=localStorage.getItem('ap')||'';
+async function api(o){const r=await fetch('/admin/api',{method:'POST',headers:{'x-admin-pass':P,'Content-Type':'application/json'},body:JSON.stringify(o)});const j=await r.json();if(!r.ok)throw new Error(j.error||'error');return j}
+async function go(){P=document.getElementById('pw').value;try{await api({action:'status'});localStorage.setItem('ap',P);load()}catch(e){document.getElementById('err').textContent=e.message}}
+function out(){localStorage.removeItem('ap');location.reload()}
+const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+async function load(){try{const s=await api({action:'status'});document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';
+const u=s.uptime;document.getElementById('st').innerHTML=[['Users',s.users],['Running matches',s.matches],['Open tournaments',s.tours],['Auctions',s.auctions],['Banned',s.banned],['Uptime',Math.floor(u/3600)+'h '+Math.floor(u%3600/60)+'m']].map(x=>'<div class="card"><div class="n">'+x[1]+'</div><div class="s">'+x[0]+'</div></div>').join('')+'<div class="card"><div class="s">'+esc(s.version)+'</div></div>';
+document.getElementById('rg').textContent='Rig is '+(s.rig?'ON':'OFF')+(s.rigId?' · '+s.rigId:'');const rb=document.getElementById('rb');rb.textContent=s.rig?'Switch off':'Switch on';rb.className=s.rig?'r':'g';window._rig=s.rig;
+const m=await api({action:'matches'});document.getElementById('ms').innerHTML=m.list.map(x=>'<div class="card row"><span>#'+x.id+' · '+esc(x.mode)+' · '+esc(x.status)+'<br><span class="s">'+esc(x.group_title||x.group_chat_id)+'</span></span><button class="r" onclick="em('+x.id+')">End</button></div>').join('')||'<div class="s">No match is running.</div>';
+const t=await api({action:'tours'});document.getElementById('ts').innerHTML=t.list.map(x=>'<div class="card row"><span>T'+x.id+' · '+esc(x.name)+'<br><span class="s">'+esc(x.status)+'</span></span><button class="r" onclick="ct('+x.id+')">Cancel</button></div>').join('')||'<div class="s">None.</div>'}catch(e){document.getElementById('login').style.display='block';document.getElementById('app').style.display='none';document.getElementById('err').textContent=P?e.message:''}}
+async function run(o,ok){try{await api(o);if(ok)alert(ok)}catch(e){alert(e.message)}load()}
+function rig(){run({action:'rig',on:!window._rig})}
+function rigid(){run({action:'rig',id:document.getElementById('rid').value,on:true})}
+function em(i){if(confirm('End match #'+i+'?'))run({action:'endmatch',id:i})}
+function ct(i){if(confirm('Cancel tournament T'+i+'?'))run({action:'canceltour',id:i})}
+function ub(a){run({action:a,id:document.getElementById('uid').value},'Done')}
+function co(){run({action:'coins',id:document.getElementById('uid').value,amount:document.getElementById('amt').value},'Done')}
+function bro(){if(confirm('Send this message to every user?'))run({action:'broadcast',text:document.getElementById('bc').value},'Sending started')}
+if(P)load();setInterval(()=>{if(P&&document.getElementById('app').style.display==='block')load()},20000);
+</script></body></html>`;
 async function miniRoute(req, res) {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
@@ -12587,6 +12693,10 @@ async function miniRoute(req, res) {
     if (!THEMES[m[1]]) return miniSend(res, 404, '', 'text/plain');
     try { return miniSend(res, 200, await miniThemeImg(m[1]), 'image/jpeg', { 'Cache-Control': 'public, max-age=3600' }); } catch (_) { return miniSend(res, 404, '', 'text/plain'); }
   }
+  if (p === '/admin' || p === '/admin/') return miniSend(res, 200, ADMIN_HTML, 'text/html; charset=utf-8', { 'Cache-Control': 'no-cache' });
+  if (p === '/admin/manifest.json') return miniSend(res, 200, { name: 'CricMonster Admin', short_name: 'CM Admin', start_url: '/admin', display: 'standalone', background_color: '#0b0f1a', theme_color: '#0b0f1a', icons: [{ src: '/admin/icon.svg', sizes: 'any', type: 'image/svg+xml' }] }, 'application/manifest+json');
+  if (p === '/admin/icon.svg') return miniSend(res, 200, '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="22" fill="#0b0f1a"/><text x="50" y="64" font-size="46" text-anchor="middle" fill="#ffb020" font-family="Arial" font-weight="700">CM</text></svg>', 'image/svg+xml');
+  if (p === '/admin/api' && req.method === 'POST') return adminApi(req, res);
   if (!p.startsWith('/api/')) return miniSend(res, 404, { error: 'not found' });
   const u = miniUser(req, url);
   if (!u) return miniSend(res, 401, { error: 'Open this app from Telegram' });
@@ -12652,6 +12762,31 @@ const AUC_GAP_MS = 3500;
 const rDm = (id, text, extra = {}) => bot.telegram.sendMessage(id, text, { parse_mode: 'HTML', ...extra }).catch(() => {});
 
 async function kvGet(k) { const { rows } = await q(`SELECT v FROM kv WHERE k=$1`, [k]); return rows[0] ? rows[0].v : null; }
+// separate web admin panel (installable on the phone): /adminpass <password> and /adminlink in the bot DM
+bot.command('adminpass', async (ctx) => {
+  if (!ctx.chat || ctx.chat.type !== 'private' || !isAdmin(ctx.from.id)) return;
+  const pw = cmdArgs(ctx).trim();
+  if (pw.length < 6) return ctx.reply('Usage: /adminpass <password> (at least 6 characters)');
+  await kvSet('admin_pass', pw);
+  return ctx.reply('Admin panel password saved. Open the panel with /adminlink');
+});
+bot.command('adminlink', async (ctx) => {
+  if (!ctx.chat || ctx.chat.type !== 'private' || !isAdmin(ctx.from.id)) return;
+  const u = tunnelUrlNow();
+  if (!u) return ctx.reply('The tunnel link is not available right now. Try /weblink first.');
+  const has = await kvGet('admin_pass');
+  return ctx.reply(`${u}/admin\n\n${has ? 'Use your admin password to log in.' : 'No password is set yet. Send /adminpass <password> first.'}\nOpen it in Chrome, then use Add to Home screen to install it like an app.`, { disable_web_page_preview: true });
+});
+// owner only, bot DM only: /rig on | off | <user id>
+bot.command('rig', async (ctx) => {
+  if (!ctx.chat || ctx.chat.type !== 'private' || !isAdmin(ctx.from.id)) return;
+  const a = cmdArgs(ctx).trim().toLowerCase();
+  if (a === 'on' || a === 'off') await kvSet('rig_on', a === 'on' ? '1' : '0');
+  else if (/^\d{5,}$/.test(a)) { await kvSet('rig_id', a); await kvSet('rig_on', '1'); }
+  else if (a === 'me') { await kvSet('rig_id', String(ctx.from.id)); await kvSet('rig_on', '1'); }
+  const on = (await kvGet('rig_on')) === '1', id = await kvGet('rig_id');
+  return ctx.reply(`Status: ${on ? 'ON' : 'OFF'}\nBowler ID: ${id || 'not set'}\n\n/rig on · /rig off\n/rig me · /rig <user id>`);
+});
 async function kvSet(k, v) { await q(`INSERT INTO kv (k, v) VALUES ($1,$2) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v`, [k, String(v)]); }
 
 async function initR72() {
