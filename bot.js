@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r106-2026-11-16-utf-proto'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r111-2026-11-17-tstats'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -6148,6 +6148,7 @@ async function batTimeout({ m, inn, pend }) {
   if (isSolo) {
     // Solo: remove the timed-out player from the match entirely (no more game for them)
     await q(`DELETE FROM match_players WHERE id=$1`, [striker.id]);
+    await renumberRoster(striker.match_id, striker.team_label || 'A').catch(() => {});
     await tg.sendMessage(
       groupId,
       `🚪 ${mtag(striker)} timed out *${BAT_RETIRE_LIMIT}* times and is *removed from this solo match*.\n` +
@@ -6227,6 +6228,7 @@ async function bowlTimeout({ m, inn, pend }) {
       await q(`UPDATE innings SET last_bowler_id=NULL WHERE id=$1 AND last_bowler_id=$2`, [inn.id, bowler.id]);
       try {
         await q(`DELETE FROM match_players WHERE id=$1`, [bowler.id]);
+        await renumberRoster(bowler.match_id, bowler.team_label || 'A').catch(() => {});
       } catch (e) {
         console.error('solo bowler removal failed:', e.message);
       }
@@ -7130,8 +7132,15 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
   const maxBalls = so ? 6 : (m.total_overs || DEFAULT_OVERS) * 6;
   const wkCap = so ? Math.min(3, nBat - 1) : nBat - 1;
   const isChase = so ? Number(inn2.innings_number) % 2 === 0 : inn2.innings_number === 2;
+  // solo ends only when every player who is STILL in the match has been out. total_wickets also counts players who
+  // were removed (timeout / kick), which ended the game before the last player had batted.
+  let soloOut = 0;
+  if (isSolo && batSide.length) {
+    const { rows: so1 } = await q(`SELECT COUNT(*)::int AS c FROM batting_stats WHERE innings_id=$1 AND is_out=TRUE AND player_id = ANY($2::bigint[])`, [inn2.id, batSide.map((p) => p.id)]);
+    soloOut = so1[0].c;
+  }
   let ended = isSolo
-    ? inn2.total_wickets >= nBat
+    ? soloOut >= nBat
     : inn2.total_wickets >= wkCap || inn2.balls_bowled >= maxBalls;
   if (!isSolo && isChase && m.target && inn2.total_runs >= m.target) ended = true;
 
@@ -12786,17 +12795,25 @@ async function tourText(t) {
   const caps = rows.filter((r) => r.role === 'captain').sort((a, b) => (a.team_no || 99) - (b.team_no || 99));
   const pl = rows.filter((r) => r.role !== 'captain');
   const phase = { setup: 'Setting up', caps_manual: 'Adding captains', caps_reg: 'Captain registration', registration: 'Player registration', awaiting_group: 'Waiting for the auction group', ready_auction: 'Ready for the auction', auction: 'Auction in progress', ready: 'Teams are set' }[t.status] || t.status;
-  let s = `🏆 <b>${escapeHtml(t.name)}</b>\n<i>ID T${t.id} · ${phase} · squad ${t.team_size} · purse ${t.purse} · base ${t.base_price}</i>\n\n`;
-  s += `<b>Teams:</b> ${caps.length}   <b>Players:</b> ${pl.filter((p) => !p.owner_id).length} in the pool\n`;
+  let s = `🏆 <b>${escapeHtml(t.name).toUpperCase()}</b>\n<i>ID T${t.id} · ${phase}</i>\n<i>Squad ${t.team_size} · Purse ${t.purse} CM · Base ${t.base_price} CM</i>\n\n`;
+  s += `<b>Teams ${caps.length}</b>  ·  <b>Pool ${pl.filter((p) => !p.owner_id).length}</b>\n`;
   const nm = (id) => { const r = rows.find((x) => Number(x.telegram_id) === Number(id)); return r ? tName(r) : ''; };
   if (['auction', 'ready'].includes(t.status) || pl.some((p) => p.owner_id)) {
+    s += '\n';
     for (const c of caps) {
       const mine = pl.filter((p) => Number(p.owner_id) === Number(c.telegram_id));
-      s += `<blockquote><b>${c.team_no || '-'}. ${escapeHtml(tm(c))}</b>\nC: ${escapeHtml(tName(c))}${c.vc_id ? ' · VC: ' + escapeHtml(nm(c.vc_id)) : ''}\nPurse ${c.purse ?? 0} · squad ${mine.length + 1}/${t.team_size}\n${mine.length ? mine.map((p) => `${ROLE_ICON[p.prole] || ''} ${escapeHtml(tName(p))}${Number(c.vc_id) === Number(p.telegram_id) ? ' (VC)' : ' · ' + (p.price ?? 0)}`).join('\n') : '—'}</blockquote>`;
+      const vcRow = c.vc_id ? rows.find((x) => Number(x.telegram_id) === Number(c.vc_id)) : null;
+      const rest = mine.filter((p) => !vcRow || Number(p.telegram_id) !== Number(vcRow.telegram_id));
+      s += `<blockquote><b>${c.team_no || '-'} · ${escapeHtml(tm(c)).toUpperCase()}</b>\n` +
+        `👑 Captain: <b>${escapeHtml(tName(c))}</b>\n` +
+        (vcRow ? `🎖 Vice Captain: <b>${escapeHtml(tName(vcRow))}</b>\n` : '') +
+        `💰 Purse ${c.purse ?? 0} CM  ·  👥 Squad ${mine.length + 1}/${t.team_size}` +
+        (rest.length ? '\n' + rest.map((p, i) => `${i + 1}. ${ROLE_ICON[p.prole] || '•'} ${escapeHtml(tName(p))}${Number(p.price) > 0 ? ' · ' + p.price + ' CM' : ''}`).join('\n') : '') +
+        '</blockquote>\n';
     }
     const un = pl.filter((p) => !p.owner_id);
     if (un.length && t.status !== 'registration') s += `<i>Not sold yet: ${un.map((p) => escapeHtml(tName(p))).join(', ')}</i>`;
-  } else if (caps.length) s += `<blockquote>${caps.map((c) => `${c.team_no || '-'}. 👑 <b>${escapeHtml(tm(c))}</b>${c.team_name ? ' · ' + escapeHtml(tName(c)) : ''}`).join('\n')}</blockquote>`;
+  } else if (caps.length) s += `\n<blockquote>${caps.map((c) => `${c.team_no || '-'} · <b>${escapeHtml(tm(c)).toUpperCase()}</b>\n     👑 ${escapeHtml(tName(c))}`).join('\n')}</blockquote>`;
   return s;
 }
 
@@ -13163,7 +13180,7 @@ function aucText(S, warn) {
   const role = S.cur.prole || 'ar';
   return `🔨 <b>PLAYER ON THE BLOCK</b>\n<i>Set ${S.setNo}/${S.setTotal} · player ${inSet}/${Math.min(AUC_SET, S.total - (S.setNo - 1) * AUC_SET)} · overall ${S.n}/${S.total}</i>\n<blockquote><b>${escapeHtml(tName(S.cur))}</b>${S.cur.username ? ' · @' + escapeHtml(S.cur.username) : ''}\n${ROLE_ICON[role]} ${ROLE_LABEL[role]}</blockquote>` +
     (S.statTxt || '') +
-    (c ? `Highest bid: <b>${S.price}</b> by <b>${escapeHtml(tm(c))}</b>` : `Base price: <b>${S.price}</b> · no bids yet`) +
+    (c ? `Highest bid: <b>${S.price} CM</b> by <b>${escapeHtml(tm(c))}</b>` : `Base price: <b>${S.price} CM</b> · no bids yet`) +
     `\n${warn ? '⏳ <b>5 seconds left!</b>' : `⏱ Sold automatically after ${AUC_SECONDS}s without a higher bid`}\n<i>Captains and vice captains: tap a button or send /bid &lt;amount&gt;</i>`;
 }
 const aucKb = (S) => Markup.inlineKeyboard([aucAsk(S).map((p) => tbtn(`BID ${p}`, `ab:${S.tid}:${S.seq}:${p}`, 'success'))]);
@@ -13198,12 +13215,14 @@ async function aucFinalEdit(S, kind, text) {
 }
 function aucArm(S) {
   clearTimeout(S.timer); clearTimeout(S.warn);
+  if (S.paused) return;
   const seq = S.seq;
   S.warn = setTimeout(() => { if (S.seq === seq) aucEdit(S, true); }, (AUC_SECONDS - 5) * 1000);
   S.timer = setTimeout(() => aucClose(S, seq).catch((e) => console.error('auction close:', e.message)), AUC_SECONDS * 1000);
 }
 async function aucNext(S) {
   if (!tourAuc.has(String(S.tid))) return;
+  if (S.paused) { S.resumeNext = true; return; }
   const open = [...S.caps.values()].filter((c) => c.count < S.t.team_size - 1);
   if (!open.length || !S.queue.length) return aucFinish(S);
   if (S.noSetMsg) S.noSetMsg = false;
@@ -13214,7 +13233,7 @@ async function aucNext(S) {
     await sleepMs(2500);
   }
   S.cur = S.queue.shift(); S.n++;
-  S.seq++; S.price = S.t.base_price; S.bidder = null; S.bidMedia = false;
+  S.seq++; S.price = Number(S.cur.base_price) > 0 ? Number(S.cur.base_price) : S.t.base_price; S.bidder = null; S.bidMedia = false;
   S.statTxt = await aucStats(S.cur);
   const caption = aucText(S);
   const g = await aucGif('entry', S.cur.prole);
@@ -13246,7 +13265,7 @@ async function aucClose(S, seq) {
     S.sold++; S.setSold++;
     const c = S.caps.get(capId);
     await aucFinalEdit(S, 'sold', `🔨 <b>SOLD</b>\n<blockquote><b>${escapeHtml(tName(p))}</b>${p.username ? ' · @' + escapeHtml(p.username) : ''}\n${ROLE_ICON[role]} ${ROLE_LABEL[role]}</blockquote>to <b>${escapeHtml(tm(c))}</b> for <b>${price}</b>`);
-    await S.tg.sendMessage(S.chatId, `🔨 <b>SOLD!</b> ${tTag(p)} goes to <b>${escapeHtml(tm(c))}</b> (${tTag(c)}) for <b>${price}</b>\n<i>Purse left: ${c.purse} · squad ${c.count + 1}/${S.t.team_size}</i>`, { parse_mode: 'HTML' }).catch(() => {});
+    await S.tg.sendMessage(S.chatId, `🔨 <b>SOLD!</b> ${tTag(p)} goes to <b>${escapeHtml(tm(c))}</b> (${tTag(c)}) for <b>${price} CM</b>\n<i>Purse left: ${c.purse} CM · squad ${c.count + 1}/${S.t.team_size}</i>`, { parse_mode: 'HTML' }).catch(() => {});
   } else {
     S.unsold.push(p); S.setUnsold++;
     await q(`UPDATE tournament_players SET state='unsold' WHERE tid=$1 AND telegram_id=$2`, [S.tid, p.telegram_id]);
@@ -13293,7 +13312,7 @@ async function startAuction(tg, t) {
   const S = { tid: t.id, chatId, t, tg, seq: 0, queue: pool, total: pool.length, n: 0, setNo: 1, setTotal: Math.ceil(pool.length / AUC_SET), setSold: 0, setUnsold: 0, sold: 0, unsold: [], cur: null, price: 0, bidder: null, caps, bidMap, media: false, bidMedia: false, timer: null, warn: null, msgId: null, closing: false };
   tourAuc.set(String(t.id), S);
   await tSay(tg, chatId,
-    `🔨 <b>AUCTION STARTS</b> · <b>${escapeHtml(t.name)}</b>\n<blockquote>${pool.length} players in ${S.setTotal} set${S.setTotal === 1 ? '' : 's'} of ${AUC_SET} · ${capRows.length} teams\nSquad ${t.team_size} · base ${t.base_price}\nCaptains and vice captains bid with the buttons or with /bid &lt;amount&gt;. Each player is sold automatically after ${AUC_SECONDS}s without a higher bid.\nHost: /next (next player) · /nextset (skip this set) · /sold (sell now)</blockquote>\n` +
+    `🔨 <b>CRICMONSTER AUCTION</b> · <b>${escapeHtml(t.name)}</b>\n<blockquote>${pool.length} players in ${S.setTotal} set${S.setTotal === 1 ? '' : 's'} of ${AUC_SET} · ${capRows.length} teams\nSquad ${t.team_size} · base ${t.base_price}\nCaptains and vice captains bid with the buttons or with /bid &lt;amount&gt;. Each player is sold automatically after ${AUC_SECONDS}s without a higher bid.\nHost: /next (next player) · /nextset (skip this set) · /sold (sell now)</blockquote>\n` +
     capRows.map((c) => `${c.team_no || ''}. <b>${escapeHtml(tm(c))}</b> — ${tTag(c)}`).join('\n'));
   setTimeout(() => aucNext(S).catch((e) => console.error('auction next:', e.message)), 5000);
 }
@@ -13310,6 +13329,7 @@ bot.command(['abid', 'auction', 'startauction'], async (ctx) => {
 function placeBid(S, uid, price) {
   const capId = S.bidMap.get(uid), cap = capId && S.caps.get(capId);
   if (!cap) return 'Only captains and vice captains can bid.';
+  if (S.paused) return 'The auction is paused by the host.';
   if (S.closing) return 'This player is already closed.';
   if (cap.count >= S.t.team_size - 1) return 'Your squad is full.';
   const min = S.bidder ? S.price + 1 : S.price;
@@ -13535,7 +13555,7 @@ bot.command('setpurse', async (ctx) => {
   const amt = await setPurse(t, team, parseInt(a[1], 10));
   return ctx.reply(`Purse of <b>${escapeHtml(tm(team))}</b> is set to <b>${amt}</b>.`, trep(ctx));
 });
-bot.command(['addpurse', 'pluspurse'], async (ctx) => {
+bot.command(['addpurse', 'pluspurse', 'adjustpurse', 'adjustallpurse'], async (ctx) => {
   const t = await hostTour(ctx); if (!t) return;
   const a = cmdArgs(ctx).split(/\s+/).filter(Boolean);
   const num = (x) => (/^[+-]?\d+$/.test(x || '') ? parseInt(x, 10) : null);
@@ -13667,14 +13687,14 @@ bot.command(['auchelp', 'auctionhelp', 'auchelp_cmds'], (ctx) => ctx.reply(
   '/next — bring the next player now\n/nextset — skip to the next set (10 players per set)\n/sold — sell the current player now\n' +
   'The bot sells automatically if nobody bids higher for ' + AUC_SECONDS + ' seconds.</blockquote>\n' +
   '<b>4. Bidding (captains and vice captains)</b>\n<blockquote>Tap a BID button on the player card, or send /bid &lt;amount&gt; (example: /bid 250). The amount must be higher than the current bid and within your purse.</blockquote>\n' +
-  '<b>3b. Pick a player (host)</b>\n<blockquote>/bid @username or /bid 123456789 — bring that registered player on the block now (also /bid_start @username, or reply to the player). If he is already sold, the bot tells you which team has him.\n/unsold — list of unsold players\n/unsold_3 — bring unsold player number 3 on the block</blockquote>\n' +
+  '<b>2b. Add players yourself (host)</b><blockquote>/addreg 111 222 @user — add many players by id or @username (role words bat, bowl, ar allowed)\n/aucpause and /aucresume — pause the auction (captains get their squad in DM)\n/addplayers — many players at once, one per line: id | name | @user | role | base price\n/setbase &lt;id or @user&gt; &lt;price&gt; — own base price for one player\n/assign &lt;team&gt; &lt;id or @user&gt; [price] — put a player straight into a team\n/removeplayer &lt;team&gt; &lt;id or @user&gt; — remove him and refund the price\n/adjustpurse &lt;team&gt; +200 or -100 — change a purse (/adjustallpurse +200 for every team)\n/bidders — who can bid for each team\nFrom another group add the tournament ID first, for example /addplayers T12</blockquote>\n<b>3b. Pick a player (host)</b>\n<blockquote>/bid @username or /bid 123456789 — bring that registered player on the block now (also /bid_start @username, or reply to the player). If he is already sold, the bot tells you which team has him.\n/unsold — list of unsold players\n/unsold_3 — bring unsold player number 3 on the block</blockquote>\n' +
   '<b>5. Info</b>\n<blockquote>/teamlist — all teams and players\n/squads — every team squad\n/squad — your own team squad (or /squad &lt;team&gt;)\n/purse — purses of all teams\n/unsold — unsold players\n/schedule · /points · /orange · /purple · /mvp</blockquote>\n' +
   '<b>6. Card / GIF (owner)</b>\n<blockquote>The bot makes a player card automatically. To use your own GIF instead: reply to a GIF with /setaucgif entry|bid|sold bat|bowl|ar\n/aucgifs — list GIFs · /delaucgif entry|bid|sold bat|bowl|ar — remove</blockquote>\n' +
   '<i>More: /tourhelp</i>',
   { parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true }));
 
 bot.command(['tourhelp', 'tournamenthelp'], (ctx) => ctx.reply(
-  '<b>TOURNAMENT COMMANDS</b>\n<blockquote>/tournament — start or continue the setup\n/cap, /vc, /sq, /teamdp — manual tournament teams (host). From any group add the tournament ID first, for example /cap T12 Delhi 123456\n/tmatch [tournament name or ID like T12] [match no] — start a scheduled match in any group (with the ID, anyone can host it): pick the playing XI, then the toss (captain, VC or host)\n/fixer — add many matches at once (Team vs Team on each line, or /fixer all)\n/win &lt;team&gt; [match no] — free win, also during a live match (host)\n/postpone [match no] [date] — postpone a match; send it inside the live match group (host)\n/pdate &lt;match no&gt; &lt;date&gt; — set the new date (host)\n/register bat|bowl|ar — join as a player\n/registercap — join as a captain\n/teamlist — teams with numbers\n/purse — team purses\n\n<b>Host</b>\n/addcap_&lt;team&gt; @user — add or change a captain (new name = new team)\n/add_vc_&lt;team&gt; @user — vice captain (can bid)\n/rtm_&lt;team&gt; @player [price] — retention before the auction\n/tname &lt;team&gt; &lt;name&gt; — rename a team\n/setpurse [team] &lt;amt&gt; · /addpurse [team] +/-&lt;amt&gt;\n/tset size 6 purse 1000 base 50\n/abid — start the auction\n/bid &lt;amt&gt; — captains and vice captains\n/next — next player · /nextset — skip the set · /sold — sell now\n/addmatch · /delmatch · /schedule · /points\n/orange · /purple · /mvp · /finishtour · /endtour</blockquote>',
+  '<b>TOURNAMENT COMMANDS</b>\n<blockquote>/tournament — start or continue the setup\n/cap, /vc, /sq, /teamdp — manual tournament teams (host). From any group add the tournament ID first, for example /cap T12 Delhi 123456\n/tmatch [tournament name or ID like T12] [match no] — start a scheduled match in any group (with the ID, anyone can host it): pick the playing XI, then the toss (captain, VC or host)\n/tstats — pick a tournament, then flip through runs, wickets, highest score, best bowling, 4s, 6s, MVP\n/fixer — add many matches at once (Team vs Team on each line, or /fixer all)\n/win &lt;team&gt; [match no] — free win, also during a live match (host)\n/postpone [match no] [date] — postpone a match; send it inside the live match group (host)\n/pdate &lt;match no&gt; &lt;date&gt; — set the new date (host)\n/register bat|bowl|ar — join as a player\n/registercap — join as a captain\n/teamlist — teams with numbers\n/purse — team purses\n\n<b>Host</b>\n/addcap_&lt;team&gt; @user — add or change a captain (new name = new team)\n/add_vc_&lt;team&gt; @user — vice captain (can bid)\n/rtm_&lt;team&gt; @player [price] — retention before the auction\n/tname &lt;team&gt; &lt;name&gt; — rename a team\n/setpurse [team] &lt;amt&gt; · /addpurse [team] +/-&lt;amt&gt;\n/tset size 6 purse 1000 base 50\n/abid — start the auction\n/bid &lt;amt&gt; — captains and vice captains\n/next — next player · /nextset — skip the set · /sold — sell now\n/addmatch · /delmatch · /schedule · /points\n/orange · /purple · /mvp · /finishtour · /endtour</blockquote>',
   { parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true }));
 
 // ── schedule, results, points ──
@@ -14030,6 +14050,257 @@ bot.command(['fixer', 'fixtures_set', 'setfixtures'], async (ctx) => {
   msg += out.length ? `<blockquote expandable>${out.join('\n')}</blockquote>` : 'Nothing was added.\n';
   if (bad.length) msg += `${pe('warn')} <b>Skipped</b>\n<blockquote>${bad.join('\n')}</blockquote>`;
   return ctx.reply(msg + 'Start a match with /tmatch. See all with /schedule.', trep(ctx));
+});
+
+
+// ── r109: auction tools ported from the old auction bot: bulk add, assign, remove, bidders, per-player base price ──
+const PRE_AUCTION = ['setup', 'caps_manual', 'caps_reg', 'registration', 'awaiting_group', 'ready_auction'];
+// "123456789 | Name | @user | role | 200"  or  "@user bat 200"  or  "123456789 bowl"
+function parsePlayerLine(line) {
+  const out = { id: 0, username: null, name: null, role: null, base: null };
+  const parts = line.includes('|') ? line.split('|').map((x) => x.trim()).filter(Boolean) : line.split(/\s+/).filter(Boolean);
+  const words = [];
+  for (const p of parts) {
+    if (/^-?\d{5,}$/.test(p) && !out.id) out.id = Math.abs(parseInt(p, 10));
+    else if (/^@\w{3,}$/.test(p)) out.username = p.slice(1);
+    else if (/^\d{1,5}$/.test(p)) out.base = parseInt(p, 10);
+    else if (parseRole(p) && /^[a-z]+$/i.test(p) && p.length <= 8) out.role = parseRole(p);
+    else words.push(p);
+  }
+  if (words.length) out.name = words.join(' ').slice(0, 40);
+  return out;
+}
+async function lookupUser(p) {
+  if (p.id) { const r = (await q(`SELECT telegram_id, username, first_name, last_name FROM users WHERE telegram_id=$1`, [p.id])).rows[0]; if (r) return r; }
+  if (p.username) { const r = (await q(`SELECT telegram_id, username, first_name, last_name FROM users WHERE LOWER(username)=LOWER($1)`, [p.username])).rows[0]; if (r) return r; }
+  return null;
+}
+async function auctionHostTour(ctx, preOnly) {
+  const tk = takeTid(cmdArgs(ctx));
+  let t;
+  if (tk.tid) {
+    t = (await q(`SELECT * FROM tournaments WHERE id=$1 AND status NOT IN ('cancelled','done')`, [tk.tid])).rows[0];
+    if (!t) { await ctx.reply(`No running tournament has the ID T${tk.tid}.`, trep(ctx)); return null; }
+    if (!(Number(t.host_id) === ctx.from.id || isAdmin(ctx.from.id))) { await ctx.reply('Only the tournament host can use the tournament ID.', trep(ctx)); return null; }
+  } else {
+    if (!isGroup(ctx)) return null;
+    t = await activeTour(ctx.chat.id);
+    if (!t) { await ctx.reply('No tournament is open here.', trep(ctx)); return null; }
+    if (!(await canManageTour(ctx, t))) { await ctx.reply('Only the host can use this command.', trep(ctx)); return null; }
+  }
+  if (t.tmode === 'manual') { await ctx.reply('This is a Manual tournament, so there is no auction. Use /sq to fill the squads.', trep(ctx)); return null; }
+  if (preOnly && !PRE_AUCTION.includes(t.status)) { await ctx.reply('Players can be added only before the auction starts.', trep(ctx)); return null; }
+  return { t, rest: tk.rest };
+}
+// /addplayers  (also /addlist /autoadd): many players into the auction pool at once
+bot.command(['addplayers', 'addlist', 'autoadd', 'padd'], async (ctx) => {
+  const raw = String(ctx.message.text || '').replace(/^\/\w+(@\w+)?[ \t]*/, '');
+  const first = takeTid(raw.split('\n')[0]);
+  const h = await auctionHostTour(ctx, true); if (!h) return;
+  const t = h.t;
+  const body = first.tid ? [first.rest, ...raw.split('\n').slice(1)].join('\n') : raw;
+  const lines = body.split('\n').map((x) => x.trim()).filter(Boolean);
+  if (!lines.length) return ctx.reply(`${pe('list')} <b>ADD PLAYERS</b>\nOne player per line, any of these formats:\n<blockquote>/addplayers\n123456789 | Rahul | @rahul | bat | 200\n@sam bowl 150\n987654321 ar</blockquote>Order does not matter: id, @username, name, role (bat, bowl, ar) and base price. Only the id or @username is needed. Players who started this bot are found by themselves.\nFrom another group: /addplayers T${t.id}`, trep(ctx));
+  const ok = [], bad = [];
+  for (const line of lines.slice(0, 80)) {
+    const p = parsePlayerLine(line);
+    if (!p.id && !p.username) { bad.push(`${escapeHtml(line.slice(0, 40))} — no id or @username`); continue; }
+    const u = await lookupUser(p);
+    const id = u ? Number(u.telegram_id) : p.id;
+    if (!id) { bad.push(`${escapeHtml(line.slice(0, 40))} — @${escapeHtml(p.username)} has not started the bot, so send the id`); continue; }
+    const ex = (await tourPlayers(t.id)).find((r) => Number(r.telegram_id) === id);
+    if (ex && ex.role === 'captain') { bad.push(`${id} — is a captain`); continue; }
+    const name = p.name || (u ? [u.first_name, u.last_name].filter(Boolean).join(' ').trim() : '') || String(id);
+    const uname = p.username || (u && u.username) || null;
+    await q(`INSERT INTO tournament_players (tid, telegram_id, name, username, role, prole, base_price) VALUES ($1,$2,$3,$4,'player',$5,$6)
+             ON CONFLICT (tid, telegram_id) DO UPDATE SET name=COALESCE($3, tournament_players.name), username=COALESCE($4, tournament_players.username), prole=COALESCE($7, tournament_players.prole), base_price=COALESCE($6, tournament_players.base_price)`,
+      [t.id, id, name, uname, p.role || 'ar', p.base || null, p.role || null]);
+    ok.push(`${ROLE_ICON[p.role || 'ar']} ${escapeHtml(name)}${uname ? ' (@' + escapeHtml(uname) + ')' : ''}${p.base ? ' · base ' + p.base + ' CM' : ''}`);
+  }
+  const total = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='player'`, [t.id])).rows[0].c;
+  let msg = `${pe('ok')} <b>${ok.length} player${ok.length === 1 ? '' : 's'} added</b> · pool now ${total}\n`;
+  if (ok.length) msg += `<blockquote expandable>${ok.join('\n')}</blockquote>`;
+  if (bad.length) msg += `${pe('warn')} <b>Skipped</b>\n<blockquote>${bad.join('\n')}</blockquote>`;
+  return ctx.reply(msg, trep(ctx));
+});
+// /setbase <id or @user> <price>
+bot.command(['setbase', 'baseprice'], async (ctx) => {
+  const h = await auctionHostTour(ctx, true); if (!h) return;
+  const p = parsePlayerLine(h.rest);
+  if (!p.base || (!p.id && !p.username)) return ctx.reply(`${pe('warn')} Usage: /setbase &lt;id or @user&gt; &lt;price&gt;\nExample: /setbase @rahul 300`, trep(ctx));
+  const u = await lookupUser(p); const id = u ? Number(u.telegram_id) : p.id;
+  const r = await q(`UPDATE tournament_players SET base_price=$3 WHERE tid=$1 AND telegram_id=$2 AND role='player'`, [h.t.id, id, p.base]);
+  return ctx.reply(r.rowCount ? `${pe('ok')} Base price of that player is now <b>${p.base} CM</b>.` : `${pe('no')} That player is not in the pool.`, trep(ctx));
+});
+// /assign <team> <id or @user> <price>: put a player straight into a team and cut the purse
+bot.command(['assign', 'assignplayer'], async (ctx) => {
+  const h = await auctionHostTour(ctx, false); if (!h) return;
+  const t = h.t;
+  if (['auction'].includes(t.status) && tourAuc.has(String(t.id))) return ctx.reply(`${pe('warn')} The auction is running. Assign players after it ends, or before it starts.`, trep(ctx));
+  const { team, rest } = splitTeamArgs(h.rest);
+  const cap = team ? await findTeam(t, team) : null;
+  const p = parsePlayerLine(rest);
+  if (!cap || (!p.id && !p.username)) return ctx.reply(`${pe('warn')} Usage: /assign &lt;team&gt; &lt;id or @user&gt; [price]\nExample: /assign Delhi @rahul 250`, trep(ctx));
+  const u = await lookupUser(p); const id = u ? Number(u.telegram_id) : p.id;
+  const price = p.base || 0;
+  const rows = await tourPlayers(t.id);
+  const ex = rows.find((r) => Number(r.telegram_id) === id);
+  if (ex && ex.role === 'captain') return ctx.reply(`${pe('no')} That player is a captain.`, trep(ctx));
+  if (ex && ex.owner_id) return ctx.reply(`${pe('no')} That player is already in a team. Remove him first with /removeplayer.`, trep(ctx));
+  const purse = Number(cap.purse ?? t.purse);
+  if (price > purse) return ctx.reply(`${pe('no')} ${escapeHtml(tm(cap))} has only ${purse} CM.`, trep(ctx));
+  const name = p.name || (u ? [u.first_name, u.last_name].filter(Boolean).join(' ').trim() : '') || (ex && ex.name) || String(id);
+  await q(`INSERT INTO tournament_players (tid, telegram_id, name, username, role, prole) VALUES ($1,$2,$3,$4,'player',$5)
+           ON CONFLICT (tid, telegram_id) DO UPDATE SET name=COALESCE(tournament_players.name,$3)`, [t.id, id, name, p.username || (u && u.username) || null, p.role || 'ar']);
+  await q(`UPDATE tournament_players SET owner_id=$3, price=$4, state='sold' WHERE tid=$1 AND telegram_id=$2`, [t.id, id, cap.telegram_id, price]);
+  await setPurse(t, cap, purse - price);
+  return ctx.reply(`${pe('ok')} <b>${escapeHtml(name)}</b> joined <b>${escapeHtml(tm(cap))}</b> for <b>${price} CM</b>\nPurse left: <b>${purse - price} CM</b>`, trep(ctx));
+});
+// /removeplayer <team> <id or @user>: take a player out of a team and refund the price
+bot.command(['removeplayer', 'remplayer'], async (ctx) => {
+  const h = await auctionHostTour(ctx, false); if (!h) return;
+  const t = h.t;
+  if (tourAuc.has(String(t.id))) return ctx.reply(`${pe('warn')} The auction is running. Remove players after it ends.`, trep(ctx));
+  const { team, rest } = splitTeamArgs(h.rest);
+  const cap = team ? await findTeam(t, team) : null;
+  const p = parsePlayerLine(rest);
+  if (!cap || (!p.id && !p.username)) return ctx.reply(`${pe('warn')} Usage: /removeplayer &lt;team&gt; &lt;id or @user&gt;`, trep(ctx));
+  const u = await lookupUser(p); const id = u ? Number(u.telegram_id) : p.id;
+  const row = (await tourPlayers(t.id)).find((r) => Number(r.telegram_id) === id && Number(r.owner_id) === Number(cap.telegram_id));
+  if (!row) return ctx.reply(`${pe('no')} That player is not in ${escapeHtml(tm(cap))}.`, trep(ctx));
+  const refund = Number(row.price || 0);
+  await q(`UPDATE tournament_players SET owner_id=NULL, price=NULL, state=NULL WHERE tid=$1 AND telegram_id=$2`, [t.id, id]);
+  await q(`UPDATE tournament_players SET vc_id=NULL WHERE tid=$1 AND telegram_id=$2 AND vc_id=$3`, [t.id, cap.telegram_id, id]);
+  const newPurse = await setPurse(t, cap, Number(cap.purse ?? t.purse) + refund);
+  return ctx.reply(`${pe('ok')} <b>${escapeHtml(tName(row))}</b> left <b>${escapeHtml(tm(cap))}</b>.\nRefunded <b>${refund} CM</b>, purse is now <b>${newPurse} CM</b>. He is back in the pool for /unsold.`, trep(ctx));
+});
+// /bidders: who can bid for each team
+bot.command('bidders', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const t = await activeTour(ctx.chat.id);
+  if (!t) return ctx.reply('No tournament is open here.', trep(ctx));
+  const rows = await tourPlayers(t.id);
+  const caps = rows.filter((r) => r.role === 'captain');
+  if (!caps.length) return ctx.reply('No teams yet.', trep(ctx));
+  const lines = caps.map((c) => { const vc = c.vc_id ? rows.find((r) => Number(r.telegram_id) === Number(c.vc_id)) : null; return `<b>${escapeHtml(tm(c))}</b>\n👑 ${tTag(c)} · <code>${c.telegram_id}</code>${vc ? `\n🎖 ${tTag(vc)} · <code>${vc.telegram_id}</code>` : ''}`; });
+  return ctx.reply(`${pe('people')} <b>TEAM BIDDERS</b>\n<blockquote expandable>${lines.join('\n\n')}</blockquote>`, trep(ctx));
+});
+
+
+// ── r110: /addreg (quick add by ids), auction pause / resume ──
+bot.command(['addreg', 'regadd', 'bulkreg'], async (ctx) => {
+  const raw = String(ctx.message.text || '').replace(/^\/\w+(@\w+)?[ \t]*/, '');
+  const first = takeTid(raw.split('\n')[0]);
+  const h = await auctionHostTour(ctx, true); if (!h) return;
+  const t = h.t;
+  const body = first.tid ? [first.rest, ...raw.split('\n').slice(1)].join('\n') : raw;
+  const toks = body.split(/[\s,;]+/).filter(Boolean);
+  if (!toks.length) return ctx.reply(`${pe('list')} <b>ADD REGISTRATIONS</b>\nSend the user ids or @usernames of all players, in one message:\n<blockquote>/addreg 111111111 222222222 @rahul @sam\n/addreg bat 111111111 222222222 bowl 333333333 ar @sam</blockquote>A role word (bat, bowl, ar) applies to the players after it. Without a role the player is an All-rounder. They go straight into the auction pool.\nFrom another group: /addreg T${t.id} 111111111 222222222`, trep(ctx));
+  let role = 'ar';
+  const ok = [], bad = [];
+  const have = await tourPlayers(t.id);
+  for (const tok of toks.slice(0, 120)) {
+    const r = parseRole(tok);
+    if (r && /^[a-z]+$/i.test(tok)) { role = r; continue; }
+    const p = parsePlayerLine(tok);
+    if (!p.id && !p.username) { bad.push(`${escapeHtml(tok.slice(0, 30))} — not an id or @username`); continue; }
+    const u = await lookupUser(p);
+    const id = u ? Number(u.telegram_id) : p.id;
+    if (!id) { bad.push(`@${escapeHtml(p.username)} — has not started the bot, send the id instead`); continue; }
+    const ex = have.find((x) => Number(x.telegram_id) === id);
+    if (ex && ex.role === 'captain') { bad.push(`${id} — is a captain`); continue; }
+    const name = (u ? [u.first_name, u.last_name].filter(Boolean).join(' ').trim() : '') || String(id);
+    await q(`INSERT INTO tournament_players (tid, telegram_id, name, username, role, prole) VALUES ($1,$2,$3,$4,'player',$5)
+             ON CONFLICT (tid, telegram_id) DO UPDATE SET prole=$5`, [t.id, id, name, (u && u.username) || p.username || null, role]);
+    ok.push(`${ROLE_ICON[role]} ${escapeHtml(name)}${(u && u.username) || p.username ? ' (@' + escapeHtml((u && u.username) || p.username) + ')' : ''}`);
+  }
+  const total = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='player'`, [t.id])).rows[0].c;
+  let msg = `${pe('ok')} <b>${ok.length} registered</b> · pool now <b>${total}</b>\n`;
+  if (ok.length) msg += `<blockquote expandable>${ok.join('\n')}</blockquote>`;
+  if (bad.length) msg += `${pe('warn')} <b>Skipped</b>\n<blockquote>${bad.join('\n')}</blockquote>`;
+  return ctx.reply(msg, trep(ctx));
+});
+bot.command(['aucpause', 'pauseauction'], async (ctx) => {
+  const S = await runningAuction(ctx, true); if (!S) return;
+  if (S.paused) return ctx.reply('The auction is already paused. Send /aucresume to continue.', trep(ctx));
+  S.paused = true; clearTimeout(S.timer); clearTimeout(S.warn);
+  await ctx.reply(`${pe('stop')} <b>AUCTION PAUSED</b>\nBids are closed. The host sends /aucresume to continue.`, trep(ctx));
+  for (const c of S.caps.values()) {
+    const mine = (await tourPlayers(S.tid)).filter((p) => Number(p.owner_id) === Number(c.telegram_id));
+    await bot.telegram.sendMessage(c.telegram_id, `${pe('stop')} <b>AUCTION PAUSED</b>\n<b>${escapeHtml(tm(c))}</b> · purse ${c.purse} CM · squad ${mine.length + 1}/${S.t.team_size}\n${mine.length ? mine.map((p, i) => `${i + 1}. ${escapeHtml(tName(p))} · ${p.price || 0} CM`).join('\n') : 'No players bought yet.'}`, { parse_mode: 'HTML' }).catch(() => {});
+  }
+});
+bot.command(['aucresume', 'resumeauction'], async (ctx) => {
+  const S = await runningAuction(ctx, true); if (!S) return;
+  if (!S.paused) return ctx.reply('The auction is not paused.', trep(ctx));
+  S.paused = false;
+  await ctx.reply(`${pe('ok')} <b>AUCTION RESUMED</b>`, trep(ctx));
+  if (S.resumeNext) { S.resumeNext = false; return aucNext(S).catch((e) => console.error('auction next:', e.message)); }
+  if (S.cur && !S.closing) { aucArm(S); aucEdit(S, false).catch(() => {}); }
+});
+
+
+// ── r111: /tstats — pick a tournament, then flip through runs, wickets, highest score, best bowling, 4s, 6s, MVP ──
+const TST_KINDS = [
+  ['runs', '🟠 <b>MOST RUNS</b> (Orange Cap)', 'runs', 'runs'],
+  ['wkts', '🟣 <b>MOST WICKETS</b> (Purple Cap)', 'wkts', 'wkts'],
+  ['hs', '🎯 <b>HIGHEST SCORE</b>', 'hs', 'runs'],
+  ['bbf', '🎳 <b>BEST BOWLING FIGURES</b>', 'bbf', ''],
+  ['fours', '4️⃣ <b>MOST FOURS</b>', 'fours', 'fours'],
+  ['sixes', '6️⃣ <b>MOST SIXES</b>', 'sixes', 'sixes'],
+  ['mvp', '⭐ <b>MVP</b> (runs + 25 per wicket)', 'mvp', 'pts'],
+];
+async function tstText(t, kindIdx) {
+  const k = TST_KINDS[kindIdx];
+  const st = await tourStats(t);
+  const head = `🏆 <b>${escapeHtml(t.name).toUpperCase()}</b>\n${k[1]}\n<i>Page ${kindIdx + 1} of ${TST_KINDS.length}</i>\n\n`;
+  const done = (await q(`SELECT COUNT(*)::int AS c FROM tour_fixtures WHERE tid=$1 AND status='done' AND match_id IS NOT NULL`, [t.id])).rows[0].c;
+  if (!st.length) return head + 'No tournament match has finished yet.';
+  let rows;
+  if (k[0] === 'bbf') rows = st.filter((x) => x.bw > 0).sort((a, b) => b.bw - a.bw || a.br - b.br).slice(0, 10).map((x) => `<b>${escapeHtml(x.name)}</b> · ${x.bw}/${x.br}`);
+  else rows = st.filter((x) => x[k[2]] > 0).sort((a, b) => b[k[2]] - a[k[2]]).slice(0, 10).map((x) => `<b>${escapeHtml(x.name)}</b> · ${x[k[2]]} ${k[3]}`);
+  if (!rows.length) return head + 'Nobody is on this list yet.';
+  const medal = ['🥇', '🥈', '🥉'];
+  return head + `<blockquote>${rows.map((r, i) => `${medal[i] || (i + 1) + '.'} ${r}`).join('\n')}</blockquote>\n<i>${done} match${done === 1 ? '' : 'es'} counted</i>`;
+}
+const tstKb = (tid, i) => Markup.inlineKeyboard([
+  [tbtn('◀ 𝗕𝗔𝗖𝗞', `tst:${tid}:${(i + TST_KINDS.length - 1) % TST_KINDS.length}`, 'danger'), tbtn('𝗡𝗘𝗫𝗧 ▶', `tst:${tid}:${(i + 1) % TST_KINDS.length}`, 'primary')],
+  [tbtn('𝗧𝗢𝗨𝗥𝗡𝗔𝗠𝗘𝗡𝗧𝗦', 'tstl:0', 'success')],
+]);
+async function tstList(chatId) {
+  const { rows } = await q(`SELECT id, name, status FROM tournaments WHERE (group_chat_id=$1 OR auction_chat_id=$1) AND status<>'cancelled' ORDER BY id DESC LIMIT 12`, [chatId]);
+  if (!rows.length) return null;
+  return {
+    text: `📊 <b>TOURNAMENT STATS</b>\nChoose a tournament:`,
+    kb: Markup.inlineKeyboard(rows.map((r) => [tbtn(`${r.name}${['done'].includes(r.status) ? ' · finished' : ''}`.slice(0, 40), `tst:${r.id}:0`, r.status === 'done' ? undefined : 'primary')])),
+  };
+}
+bot.command(['tstats', 'tourstats'], async (ctx) => {
+  if (!isGroup(ctx)) return ctx.reply('Use /tstats in the tournament group.', trep(ctx));
+  const tk = takeTid(cmdArgs(ctx));
+  if (tk.tid) {
+    const t = (await q(`SELECT * FROM tournaments WHERE id=$1 AND status<>'cancelled'`, [tk.tid])).rows[0];
+    if (!t) return ctx.reply(`No tournament has the ID T${tk.tid}.`, trep(ctx));
+    return ctx.reply(await tstText(t, 0), { parse_mode: 'HTML', ...tstKb(t.id, 0), reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
+  }
+  const l = await tstList(ctx.chat.id);
+  if (!l) return ctx.reply('There is no tournament in this group yet.', trep(ctx));
+  return ctx.reply(l.text, { parse_mode: 'HTML', ...l.kb, reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
+});
+bot.action(/^tst:(\d+):(\d+)$/, async (ctx) => {
+  try {
+    const t = (await q(`SELECT * FROM tournaments WHERE id=$1`, [ctx.match[1]])).rows[0];
+    if (!t) return ctx.answerCbQuery('Tournament not found.', { show_alert: true });
+    const i = Math.min(TST_KINDS.length - 1, parseInt(ctx.match[2], 10));
+    await ctx.answerCbQuery().catch(() => {});
+    await ctx.editMessageText(await tstText(t, i), { parse_mode: 'HTML', ...tstKb(t.id, i) }).catch((e) => { if (!/not modified/i.test(e.message || '')) console.error('tst:', e.message); });
+  } catch (e) { console.error('tst action:', e.message); await ctx.answerCbQuery('Error').catch(() => {}); }
+});
+bot.action('tstl:0', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const l = ctx.chat ? await tstList(ctx.chat.id) : null;
+  if (!l) return;
+  await ctx.editMessageText(l.text, { parse_mode: 'HTML', ...l.kb }).catch(() => {});
 });
 
 // ── r97: /win (free win, also during a live match), /postpone, /pdate ──
@@ -14541,7 +14812,7 @@ const groupStartKb = () => Markup.inlineKeyboard([
   [btn('𝗦𝗢𝗟𝗢', 'm:solo', 'game', 'success'), btn('𝗧𝗘𝗔𝗠', 'm:team', 'people', 'success')],
   [btn('𝗧𝗢𝗨𝗥𝗡𝗔𝗠𝗘𝗡𝗧', 'm:tour', 'trophy', 'primary')],
 ]);
-async function initR96() { await q(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS tmode TEXT NOT NULL DEFAULT 'auto'`); await q(`ALTER TABLE tour_fixtures ADD COLUMN IF NOT EXISTS pdate TEXT`); }
+async function initR96() { await q(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS tmode TEXT NOT NULL DEFAULT 'auto'`); await q(`ALTER TABLE tour_fixtures ADD COLUMN IF NOT EXISTS pdate TEXT`); await q(`ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS base_price INT`); }
 bot.action('m:tour', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const kb = Markup.inlineKeyboard([
