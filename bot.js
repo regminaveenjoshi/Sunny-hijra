@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r111-2026-11-17-tstats'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r115-2026-11-17-live-tour'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -3650,15 +3650,27 @@ bot.action(/^jr:(Y|N):([^:]+):(\d+)$/, async (ctx) => {
 });
 bot.command(['join_solo', 'joinsolo'], joinSolo);
 
-bot.command('leavesolo', async (ctx) => {
+bot.command(['leavesolo', 'leave'], async (ctx) => {
   if (!isGroupOrDm(ctx)) return;
   try {
     const m = await getActiveMatch(ctx.chat.id);
-    if (!m || m.mode !== 'solo' || m.status !== 'waiting') return ctx.reply('❌ No open lobby');
+    if (!m || m.mode !== 'solo' || !['waiting', 'innings1'].includes(m.status)) return ctx.reply('❌ There is no solo match to leave');
     if (Number(m.host_telegram_id) === ctx.from.id)
       return ctx.reply('❌ The host cannot leave — use /endmatch');
     const p = await getPlayerByTg(m.id, ctx.from.id);
-    if (!p) return ctx.reply('❌ You are not in the lobby');
+    if (!p) return ctx.reply('❌ You are not in this match');
+    if (m.status === 'innings1') {
+      // live match: same clean-up as a kick (batting / bowling slot is refilled, numbers are refreshed)
+      const inn = await getInnings(m.id);
+      const inPlay = !!(inn && (inn.striker_player_id === p.id || inn.current_bowler_id === p.id));
+      if (inn) {
+        if (inn.striker_player_id === p.id) await q(`UPDATE innings SET striker_player_id=NULL WHERE id=$1`, [inn.id]);
+        if (inn.current_bowler_id === p.id) await q(`UPDATE innings SET current_bowler_id=NULL WHERE id=$1`, [inn.id]);
+      }
+      await delMatchPlayer(p);
+      await ctx.reply(`${pe('wave','👋')} ${mn(ctx.from)} left the match.`, { parse_mode: 'Markdown' });
+      return afterRemoveFix(m, inPlay);
+    }
     await q(`DELETE FROM match_players WHERE match_id=$1 AND telegram_id=$2`, [
       m.id,
       ctx.from.id,
@@ -4396,6 +4408,16 @@ async function afterRemoveFix(m, hadPlayerInPlay) {
     if (m.mode === 'solo') {
       const left = await getPlayers(m.id, 'A');
       if (left.length < 2) return await endSoloTooFew(m, inn);
+      // the one who left was the last batter still to bat: every remaining player is already out, so the match is over
+      const { rows: outR } = await q(`SELECT COUNT(*)::int AS c FROM batting_stats WHERE innings_id=$1 AND is_out=TRUE AND player_id = ANY($2::bigint[])`, [inn.id, left.map((p) => p.id)]);
+      if (outR[0].c >= left.length) {
+        clearTurnClock(m.id);
+        await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE innings_id=$1 AND is_resolved=FALSE`, [inn.id]);
+        await q(`UPDATE innings SET is_completed=TRUE WHERE id=$1`, [inn.id]);
+        await finishSolo(bot.telegram, Number(m.group_chat_id), m, (await getInnings(m.id)) || inn);
+        clearWarns(m.id); stopIdleWatch(m.id); endVote(m.id);
+        return;
+      }
       if (hadPlayerInPlay) {
         await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE innings_id=$1 AND is_resolved=FALSE`, [inn.id]);
         await q(`UPDATE innings SET ball_state='idle' WHERE id=$1`, [inn.id]).catch(() => {});
@@ -6133,7 +6155,9 @@ async function batTimeout({ m, inn, pend }) {
         : `> 👉 Type *0–6* now (${TURN_SECONDS}s)`),
     { parse_mode: 'Markdown' }
   );
-  if (isSolo && (await soloIdleHit(m, inn))) return;
+  // a timeout that removes the player is progress: the next player must get his turn, so the match is not closed here
+  if (isSolo && retire) soloIdleReset(m.id);
+  else if (isSolo && (await soloIdleHit(m, inn))) return;
 
   if (!retire) return ensureTurnClock(m.id); // same locked bowler number, fresh clock
 
@@ -6218,7 +6242,8 @@ async function bowlTimeout({ m, inn, pend }) {
       `> 🔁 This ball is cancelled.`,
     { parse_mode: 'Markdown' }
   );
-  if (isSolo && (await soloIdleHit(m, inn))) return;
+  if (isSolo && warn >= limit) soloIdleReset(m.id);
+  else if (isSolo && (await soloIdleHit(m, inn))) return;
 
   if (warn >= limit) {
     resetWarn(m.id, bowler.id, 'bowl');
@@ -12949,10 +12974,14 @@ async function linkAuctionGroup(tg, t, gid, replyChat, key) {
 async function registerPlayer(t, u, role) {
   if (t.status !== 'registration') return { ok: false, msg: 'Player registration is not open.' };
   role = role || 'ar';
-  const ex = await q(`SELECT role FROM tournament_players WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id]);
+  const ex = await q(`SELECT role, owner_id FROM tournament_players WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id]);
   const who = tTag({ telegram_id: u.id, name: fullName(u), username: u.username });
   if (ex.rows.length) {
     if (ex.rows[0].role === 'captain') return { ok: false, msg: 'You are a captain, so you do not need to register.' };
+    if (ex.rows[0].owner_id) {
+      const oc = (await q(`SELECT team_name, name FROM tournament_players WHERE tid=$1 AND telegram_id=$2`, [t.id, ex.rows[0].owner_id])).rows[0];
+      return { ok: false, msg: `You are already in another team${oc ? ': ' + (oc.team_name || oc.name) : ''}.` };
+    }
     await q(`UPDATE tournament_players SET prole=$3 WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id, role]);
     return { ok: true, silent: true, msg: `${who} is already registered. Role changed to <b>${ROLE_LABEL[role]}</b>.` };
   }
@@ -12970,15 +12999,30 @@ async function registerCaptain(t, u) {
   await addCaptain(t, { id: u.id, name: fullName(u), username: u.username });
   return { ok: true, n: n + 1, msg: `👑 ${tTag({ telegram_id: u.id, name: fullName(u), username: u.username })} is a captain. Captains so far: <b>${n + 1}</b>` };
 }
+// tournaments shown in the pickers: the MPL tournament is always on top, then the newest
+const tourOrder = 'ORDER BY (name ILIKE \'%mpl%\') DESC, id DESC';
+async function openTours(statusSql) {
+  return (await q(`SELECT id, name, status FROM tournaments WHERE ${statusSql} AND COALESCE(tmode,'auto')<>'manual' ${tourOrder} LIMIT 10`)).rows;
+}
 bot.command('register', async (ctx) => {
-  if (!isGroup(ctx)) return ctx.reply('Use /register in the tournament group.');
-  const t = await activeTour(ctx.chat.id);
-  if (!t) return ctx.reply('No tournament is open. An admin can start one with /tournament.', trep(ctx));
-  if (t.status !== 'registration') return ctx.reply('❌ Player registration is not open.', trep(ctx));
   const role = parseRole(cmdArgs(ctx).split(/\s+/)[0]);
-  if (!role) return ctx.reply('Choose your role to register:', { ...trep(ctx), reply_markup: roleKb(t.id).reply_markup });
-  const r = await registerPlayer(t, ctx.from, role);
-  return ctx.reply(r.ok ? r.msg : '❌ ' + r.msg, trep(ctx));
+  const ts = await openTours(`status='registration'`);
+  if (!ts.length) return ctx.reply('❌ No tournament has player registration open right now.', trep(ctx));
+  const kb = Markup.inlineKeyboard(ts.map((t) => [tbtn(`🏆 ${t.name}`.slice(0, 40), role ? `rg:${t.id}:${role}` : `rgt:${t.id}`, 'primary')]));
+  return ctx.reply(`📝 <b>PLAYER REGISTRATION</b>\nChoose the tournament you want to join${role ? ' as ' + ROLE_LABEL[role] : ''}:`, { parse_mode: 'HTML', reply_markup: kb.reply_markup, reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
+});
+bot.action(/^rgt:(\d+)$/, async (ctx) => {
+  const t = await getTour(ctx.match[1]);
+  if (!t || t.status !== 'registration') return ctx.answerCbQuery('Registration is closed.', { show_alert: true });
+  await ctx.answerCbQuery().catch(() => {});
+  return ctx.editMessageText(`📝 <b>${escapeHtml(t.name)}</b>\nChoose your role:`, { parse_mode: 'HTML', reply_markup: roleKb(t.id).reply_markup }).catch(() => {});
+});
+bot.action(/^rg:(\d+):(\w+)$/, async (ctx) => {
+  const t = await getTour(ctx.match[1]);
+  if (!t || t.status !== 'registration') return ctx.answerCbQuery('Registration is closed.', { show_alert: true });
+  const r = await registerPlayer(t, ctx.from, parseRole(ctx.match[2]) || 'ar');
+  await ctx.answerCbQuery(r.ok ? 'Registered' : r.msg, { show_alert: !r.ok });
+  if (r.ok) { await ctx.editMessageReplyMarkup(undefined).catch(() => {}); if (!r.silent) await tSay(ctx.telegram, ctx.chat.id, r.msg); }
 });
 bot.command(['registercap', 'regcap'], async (ctx) => {
   if (!isGroup(ctx)) return;
@@ -13024,15 +13068,19 @@ bot.command('tset', async (ctx) => {
   const t = await activeTour(ctx.chat.id);
   if (!t) return;
   if (!(await canManageTour(ctx, t))) return ctx.reply('Only the host or a group admin can change settings.', trep(ctx));
-  if (['auction', 'ready'].includes(t.status)) return ctx.reply('Settings are locked once the auction starts.', trep(ctx));
+  const live = ['auction', 'ready'].includes(t.status);
   const a = cmdArgs(ctx).toLowerCase().split(/\s+/);
-  const lim = { size: ['team_size', 2, 15], purse: ['purse', 100, 100000], base: ['base_price', 10, 10000] };
+  const lim = { size: ['team_size', 2, 30], purse: ['purse', 100, 100000], base: ['base_price', 10, 10000] };
   for (let i = 0; i + 1 < a.length; i += 2) {
     const L = lim[a[i]]; const v = parseInt(a[i + 1], 10);
     if (L && v >= L[1] && v <= L[2]) await q(`UPDATE tournaments SET ${L[0]}=$2 WHERE id=$1`, [t.id, v]);
   }
   const t2 = await getTour(t.id);
-  await q(`UPDATE tournament_players SET purse=$2 WHERE tid=$1 AND role='captain'`, [t.id, t2.purse]);
+  if (live) {
+    // auction already started: shift every captain purse by the change, so spent money is kept
+    const diff = Number(t2.purse) - Number(t.purse);
+    if (diff) await q(`UPDATE tournament_players SET purse=COALESCE(purse,0)+$2 WHERE tid=$1 AND role='captain'`, [t.id, diff]);
+  } else await q(`UPDATE tournament_players SET purse=$2 WHERE tid=$1 AND role='captain'`, [t.id, t2.purse]);
   return ctx.reply(`Settings: squad <b>${t2.team_size}</b> (captain included) · purse <b>${t2.purse}</b> · base price <b>${t2.base_price}</b>\nChange them with: /tset size 6 purse 1000 base 50`, trep(ctx));
 });
 bot.command(['endtour', 'canceltour'], async (ctx) => {
@@ -13318,13 +13366,41 @@ async function startAuction(tg, t) {
 }
 bot.command(['abid', 'auction', 'startauction'], async (ctx) => {
   if (!isGroup(ctx)) return;
-  const t = await activeTour(ctx.chat.id);
-  if (!t) return ctx.reply('No tournament is open. An admin can start one with /tournament.', trep(ctx));
-  if (!(await canManageTour(ctx, t))) return ctx.reply('Only the host or a group admin can start the auction.', trep(ctx));
-  if (tourAuc.has(String(t.id))) return ctx.reply('The auction is already running.', trep(ctx));
-  if (t.status === 'ready') return ctx.reply('The auction is finished. See /teamlist', trep(ctx));
-  if (t.status === 'auction' || t.status === 'ready_auction') return startAuction(ctx.telegram, t);
-  return ctx.reply('Finish the setup first: captains, player registration and the auction group ID. Send /tournament to continue.', trep(ctx));
+  // the tournament that already uses this group as its auction group starts directly
+  const here = await activeTour(ctx.chat.id);
+  if (here && Number(here.auction_chat_id) === Number(ctx.chat.id) && ['ready_auction', 'auction'].includes(here.status)) {
+    if (!(await canManageTour(ctx, here))) return ctx.reply('Only the host or a group admin can start the auction.', trep(ctx));
+    if (tourAuc.has(String(here.id))) return ctx.reply('The auction is already running.', trep(ctx));
+    return startAuction(ctx.telegram, here);
+  }
+  // otherwise pick a tournament here: this group becomes its auction group (MPL is always on top)
+  const uid = ctx.from.id;
+  const ts = (await openTours(`status IN ('setup','caps_manual','caps_reg','registration','awaiting_group','ready_auction','auction')`))
+    .filter(() => true);
+  const mine = [];
+  for (const t of ts) { const full = await getTour(t.id); if (isAdmin(uid) || Number(full.host_id) === uid || (await isGroupAdmin(Number(full.group_chat_id), uid).catch(() => false))) mine.push(t); }
+  if (!mine.length) return ctx.reply('No tournament of yours is ready for an auction. Only the tournament host or a group admin can start one.', trep(ctx));
+  const kb = Markup.inlineKeyboard(mine.map((t) => [tbtn(`🔨 ${t.name}`.slice(0, 40), `abd:${t.id}`, 'primary')]));
+  return ctx.reply(`🔨 <b>START AN AUCTION HERE</b>\nChoose the tournament. This group will be its auction group.`, { parse_mode: 'HTML', reply_markup: kb.reply_markup, reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
+});
+bot.action(/^abd:(\d+)$/, async (ctx) => {
+  try {
+    const t = await getTour(ctx.match[1]);
+    if (!t || ['cancelled', 'done', 'ready'].includes(t.status)) return ctx.answerCbQuery('This tournament is closed.', { show_alert: true });
+    const uid = ctx.from.id;
+    if (!(isAdmin(uid) || Number(t.host_id) === uid || (await isGroupAdmin(Number(t.group_chat_id), uid).catch(() => false)))) return ctx.answerCbQuery('Only the tournament host can do this.', { show_alert: true });
+    if (!ctx.chat || ctx.chat.type === 'private') return ctx.answerCbQuery('Use this in a group.', { show_alert: true });
+    if (tourAuc.has(String(t.id))) return ctx.answerCbQuery('The auction is already running.', { show_alert: true });
+    const rows = await tourPlayers(t.id);
+    const caps = rows.filter((r) => r.role === 'captain').length, pool = rows.filter((r) => r.role !== 'captain' && !r.owner_id).length;
+    if (caps < 2) return ctx.answerCbQuery('You need at least 2 captains first.', { show_alert: true });
+    if (!pool) return ctx.answerCbQuery('No players are registered yet.', { show_alert: true });
+    await ctx.answerCbQuery().catch(() => {});
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+    await q(`UPDATE tournaments SET auction_chat_id=$2, auction_chat_title=$3 WHERE id=$1`, [t.id, ctx.chat.id, ctx.chat.title || null]);
+    const fresh = await setTourStatus(t.id, 'ready_auction');
+    return startAuction(ctx.telegram, fresh);
+  } catch (e) { console.error('abd:', e.message); await ctx.answerCbQuery('Error').catch(() => {}); }
 });
 function placeBid(S, uid, price) {
   const capId = S.bidMap.get(uid), cap = capId && S.caps.get(capId);
@@ -13690,6 +13766,7 @@ bot.command(['auchelp', 'auctionhelp', 'auchelp_cmds'], (ctx) => ctx.reply(
   '<b>2b. Add players yourself (host)</b><blockquote>/addreg 111 222 @user — add many players by id or @username (role words bat, bowl, ar allowed)\n/aucpause and /aucresume — pause the auction (captains get their squad in DM)\n/addplayers — many players at once, one per line: id | name | @user | role | base price\n/setbase &lt;id or @user&gt; &lt;price&gt; — own base price for one player\n/assign &lt;team&gt; &lt;id or @user&gt; [price] — put a player straight into a team\n/removeplayer &lt;team&gt; &lt;id or @user&gt; — remove him and refund the price\n/adjustpurse &lt;team&gt; +200 or -100 — change a purse (/adjustallpurse +200 for every team)\n/bidders — who can bid for each team\nFrom another group add the tournament ID first, for example /addplayers T12</blockquote>\n<b>3b. Pick a player (host)</b>\n<blockquote>/bid @username or /bid 123456789 — bring that registered player on the block now (also /bid_start @username, or reply to the player). If he is already sold, the bot tells you which team has him.\n/unsold — list of unsold players\n/unsold_3 — bring unsold player number 3 on the block</blockquote>\n' +
   '<b>5. Info</b>\n<blockquote>/teamlist — all teams and players\n/squads — every team squad\n/squad — your own team squad (or /squad &lt;team&gt;)\n/purse — purses of all teams\n/unsold — unsold players\n/schedule · /points · /orange · /purple · /mvp</blockquote>\n' +
   '<b>6. Card / GIF (owner)</b>\n<blockquote>The bot makes a player card automatically. To use your own GIF instead: reply to a GIF with /setaucgif entry|bid|sold bat|bowl|ar\n/aucgifs — list GIFs · /delaucgif entry|bid|sold bat|bowl|ar — remove</blockquote>\n' +
+  '<b>7. More</b>\n<blockquote>/register in any group — choose a tournament (MPL is always on top)\n/abid in any group — choose a tournament and start its auction here\n/registercap — join as a captain\n/remcaptain @user — remove a captain\n/tstats — runs, wickets and other stats of any tournament\n/endtour — cancel the tournament\n/tset can be used even after the auction has started (purses change by the difference)</blockquote>\n' +
   '<i>More: /tourhelp</i>',
   { parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true }));
 
@@ -14267,24 +14344,61 @@ const tstKb = (tid, i) => Markup.inlineKeyboard([
   [tbtn('◀ 𝗕𝗔𝗖𝗞', `tst:${tid}:${(i + TST_KINDS.length - 1) % TST_KINDS.length}`, 'danger'), tbtn('𝗡𝗘𝗫𝗧 ▶', `tst:${tid}:${(i + 1) % TST_KINDS.length}`, 'primary')],
   [tbtn('𝗧𝗢𝗨𝗥𝗡𝗔𝗠𝗘𝗡𝗧𝗦', 'tstl:0', 'success')],
 ]);
-async function tstList(chatId) {
-  const { rows } = await q(`SELECT id, name, status FROM tournaments WHERE (group_chat_id=$1 OR auction_chat_id=$1) AND status<>'cancelled' ORDER BY id DESC LIMIT 12`, [chatId]);
+async function tstList() {
+  // every tournament that runs through this bot, running ones first, newest first
+  const { rows } = await q(`SELECT id, name, status FROM tournaments WHERE status<>'cancelled' ORDER BY (status='done'), id DESC LIMIT 30`);
   if (!rows.length) return null;
   return {
     text: `📊 <b>TOURNAMENT STATS</b>\nChoose a tournament:`,
-    kb: Markup.inlineKeyboard(rows.map((r) => [tbtn(`${r.name}${['done'].includes(r.status) ? ' · finished' : ''}`.slice(0, 40), `tst:${r.id}:0`, r.status === 'done' ? undefined : 'primary')])),
+    kb: Markup.inlineKeyboard(rows.map((r) => [tbtn(`${r.name} · T${r.id}${r.status === 'done' ? ' · finished' : ''}`.slice(0, 40), `tst:${r.id}:0`, r.status === 'done' ? undefined : 'primary')])),
   };
 }
+// /livetournament: every running tournament as a button (MPL on top), then Teams / Schedule / Points / Live matches / Stats
+async function ltList() {
+  return (await q(`SELECT id, name, status FROM tournaments WHERE status NOT IN ('cancelled','done') ORDER BY (name ILIKE '%mpl%') DESC, id DESC LIMIT 12`)).rows;
+}
+const ltKb = (tid, cur) => Markup.inlineKeyboard([
+  [tbtn('Teams', `lt:${tid}:t`, cur === 't' ? 'success' : 'primary'), tbtn('Schedule', `lt:${tid}:s`, cur === 's' ? 'success' : 'primary')],
+  [tbtn('Points', `lt:${tid}:p`, cur === 'p' ? 'success' : 'primary'), tbtn('Live matches', `lt:${tid}:l`, cur === 'l' ? 'success' : 'primary')],
+  [tbtn('Stats', `tst:${tid}:0`, 'primary'), tbtn('Back', 'lt:0', 'danger')],
+]);
+bot.command(['livetournament', 'livetour', 'live'], async (ctx) => {
+  const ts = await ltList();
+  if (!ts.length) return ctx.reply('No tournament is running right now.', trep(ctx));
+  return ctx.reply('🏆 <b>LIVE TOURNAMENTS</b>\nChoose one:', { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard(ts.map((t) => [tbtn(`🏆 ${t.name}`.slice(0, 40), `lt:${t.id}:t`, 'primary')])).reply_markup, reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
+});
+bot.action(/^lt:(\d+)(?::(\w))?$/, async (ctx) => {
+  try {
+    await ctx.answerCbQuery().catch(() => {});
+    if (ctx.match[1] === '0') {
+      const ts = await ltList();
+      return ctx.editMessageText('🏆 <b>LIVE TOURNAMENTS</b>\nChoose one:', { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard(ts.map((t) => [tbtn(`🏆 ${t.name}`.slice(0, 40), `lt:${t.id}:t`, 'primary')])).reply_markup }).catch(() => {});
+    }
+    const t = await getTour(ctx.match[1]);
+    if (!t) return;
+    const k = ctx.match[2] || 't';
+    let text;
+    if (k === 's') text = await scheduleText(t);
+    else if (k === 'p') {
+      const tb = await pointsTable(t);
+      text = `📊 <b>POINTS TABLE</b> · ${escapeHtml(t.name)}\n<i>Win = 2 points · tie = 1 point</i>\n\n` + (tb.length ? tb.map((r, i) => `<blockquote>${i + 1}. <b>${escapeHtml(r.name)}</b>\nP ${r.p} · W ${r.w} · L ${r.l} · T ${r.t} · <b>${r.pts} pts</b></blockquote>`).join('') : 'No teams yet.');
+    } else if (k === 'l') {
+      const caps = (await tourPlayers(t.id)).filter((r) => r.role === 'captain');
+      const rows = (await q(`SELECT f.no, f.t1, f.t2, m.status FROM tour_fixtures f JOIN matches m ON m.id=f.match_id WHERE f.tid=$1 AND m.status IN ('captains','toss','innings1','innings2') ORDER BY f.no`, [t.id]).catch(() => ({ rows: [] }))).rows;
+      text = `🔴 <b>LIVE MATCHES</b> · ${escapeHtml(t.name)}\n\n` + (rows.length ? rows.map((r) => `<blockquote>#${r.no}  <b>${escapeHtml(capName(caps, r.t1))}</b> vs <b>${escapeHtml(capName(caps, r.t2))}</b>\n${r.status === 'innings2' ? 'Second innings' : r.status === 'innings1' ? 'First innings' : 'Starting'}</blockquote>`).join('') : 'No match is being played right now.');
+    } else text = await tourText(t);
+    return ctx.editMessageText(text.slice(0, 4000), { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: ltKb(t.id, k).reply_markup }).catch(() => {});
+  } catch (e) { console.error('lt:', e.message); }
+});
 bot.command(['tstats', 'tourstats'], async (ctx) => {
-  if (!isGroup(ctx)) return ctx.reply('Use /tstats in the tournament group.', trep(ctx));
   const tk = takeTid(cmdArgs(ctx));
   if (tk.tid) {
     const t = (await q(`SELECT * FROM tournaments WHERE id=$1 AND status<>'cancelled'`, [tk.tid])).rows[0];
     if (!t) return ctx.reply(`No tournament has the ID T${tk.tid}.`, trep(ctx));
     return ctx.reply(await tstText(t, 0), { parse_mode: 'HTML', ...tstKb(t.id, 0), reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
   }
-  const l = await tstList(ctx.chat.id);
-  if (!l) return ctx.reply('There is no tournament in this group yet.', trep(ctx));
+  const l = await tstList();
+  if (!l) return ctx.reply('There is no tournament yet.', trep(ctx));
   return ctx.reply(l.text, { parse_mode: 'HTML', ...l.kb, reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
 });
 bot.action(/^tst:(\d+):(\d+)$/, async (ctx) => {
@@ -14298,7 +14412,7 @@ bot.action(/^tst:(\d+):(\d+)$/, async (ctx) => {
 });
 bot.action('tstl:0', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const l = ctx.chat ? await tstList(ctx.chat.id) : null;
+  const l = await tstList();
   if (!l) return;
   await ctx.editMessageText(l.text, { parse_mode: 'HTML', ...l.kb }).catch(() => {});
 });
