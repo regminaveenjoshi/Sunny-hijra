@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r115-2026-11-17-live-tour'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r116-2026-11-17-stats-exit'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -14340,9 +14340,10 @@ async function tstText(t, kindIdx) {
   const medal = ['🥇', '🥈', '🥉'];
   return head + `<blockquote>${rows.map((r, i) => `${medal[i] || (i + 1) + '.'} ${r}`).join('\n')}</blockquote>\n<i>${done} match${done === 1 ? '' : 'es'} counted</i>`;
 }
-const tstKb = (tid, i) => Markup.inlineKeyboard([
-  [tbtn('◀ 𝗕𝗔𝗖𝗞', `tst:${tid}:${(i + TST_KINDS.length - 1) % TST_KINDS.length}`, 'danger'), tbtn('𝗡𝗘𝗫𝗧 ▶', `tst:${tid}:${(i + 1) % TST_KINDS.length}`, 'primary')],
-  [tbtn('𝗧𝗢𝗨𝗥𝗡𝗔𝗠𝗘𝗡𝗧𝗦', 'tstl:0', 'success')],
+// fromLive: opened from /livetournament, so the last button exits back to that tournament window
+const tstKb = (tid, i, fromLive) => Markup.inlineKeyboard([
+  [tbtn('◀ 𝗕𝗔𝗖𝗞', `tst:${tid}:${(i + TST_KINDS.length - 1) % TST_KINDS.length}${fromLive ? ':L' : ''}`, 'danger'), tbtn('𝗡𝗘𝗫𝗧 ▶', `tst:${tid}:${(i + 1) % TST_KINDS.length}${fromLive ? ':L' : ''}`, 'primary')],
+  [fromLive ? tbtn('𝗘𝗫𝗜𝗧', `lt:${tid}:t`, 'danger') : tbtn('𝗧𝗢𝗨𝗥𝗡𝗔𝗠𝗘𝗡𝗧𝗦', 'tstl:0', 'success')],
 ]);
 async function tstList() {
   // every tournament that runs through this bot, running ones first, newest first
@@ -14360,7 +14361,7 @@ async function ltList() {
 const ltKb = (tid, cur) => Markup.inlineKeyboard([
   [tbtn('Teams', `lt:${tid}:t`, cur === 't' ? 'success' : 'primary'), tbtn('Schedule', `lt:${tid}:s`, cur === 's' ? 'success' : 'primary')],
   [tbtn('Points', `lt:${tid}:p`, cur === 'p' ? 'success' : 'primary'), tbtn('Live matches', `lt:${tid}:l`, cur === 'l' ? 'success' : 'primary')],
-  [tbtn('Stats', `tst:${tid}:0`, 'primary'), tbtn('Back', 'lt:0', 'danger')],
+  [tbtn('Stats', `tst:${tid}:0:L`, 'primary'), tbtn('Back', 'lt:0', 'danger')],
 ]);
 bot.command(['livetournament', 'livetour', 'live'], async (ctx) => {
   const ts = await ltList();
@@ -14401,13 +14402,13 @@ bot.command(['tstats', 'tourstats'], async (ctx) => {
   if (!l) return ctx.reply('There is no tournament yet.', trep(ctx));
   return ctx.reply(l.text, { parse_mode: 'HTML', ...l.kb, reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
 });
-bot.action(/^tst:(\d+):(\d+)$/, async (ctx) => {
+bot.action(/^tst:(\d+):(\d+)(?::(L))?$/, async (ctx) => {
   try {
     const t = (await q(`SELECT * FROM tournaments WHERE id=$1`, [ctx.match[1]])).rows[0];
     if (!t) return ctx.answerCbQuery('Tournament not found.', { show_alert: true });
     const i = Math.min(TST_KINDS.length - 1, parseInt(ctx.match[2], 10));
     await ctx.answerCbQuery().catch(() => {});
-    await ctx.editMessageText(await tstText(t, i), { parse_mode: 'HTML', ...tstKb(t.id, i) }).catch((e) => { if (!/not modified/i.test(e.message || '')) console.error('tst:', e.message); });
+    await ctx.editMessageText(await tstText(t, i), { parse_mode: 'HTML', ...tstKb(t.id, i, !!ctx.match[3]) }).catch((e) => { if (!/not modified/i.test(e.message || '')) console.error('tst:', e.message); });
   } catch (e) { console.error('tst action:', e.message); await ctx.answerCbQuery('Error').catch(() => {}); }
 });
 bot.action('tstl:0', async (ctx) => {
