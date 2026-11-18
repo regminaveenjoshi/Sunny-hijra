@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r119-2026-11-17-webadmin'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r120-2026-11-18-unstick'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -6000,8 +6000,14 @@ async function startBall(matchId) {
       : `⚠️ <b>${htag(bowler)}</b> — <b>open the bot's DM and press /start, then send 1–6 (${TURN_SECONDS}s)</b>`) +
     (hat ? `\n🎩 <b>HAT-TRICK BALL!</b>` : '') +
     (spamFreeOn(m) ? `\n🛡 <b>Spam-free: no number 3 times in a row</b>` : '');
-  const w = await sendCaptionedGif(tg, groupId, 'runup', html, { ...(bowlerIsBot ? {} : openBotDmKb()), _gp: bowler });
-  await q(`UPDATE pending_balls SET batting_message_id=$2 WHERE callback_token=$1`, [token, w.message_id]);
+  let w = null;
+  try {
+    w = await withTimeout(sendCaptionedGif(tg, groupId, 'runup', html, { ...(bowlerIsBot ? {} : openBotDmKb()), _gp: bowler }), 25000, 'run-up timeout');
+  } catch (e) {
+    console.error('run-up gif failed:', e.message);
+    try { w = await tg.sendMessage(groupId, stripPe(html), { parse_mode: 'HTML', ...(bowlerIsBot ? {} : openBotDmKb()) }); } catch (_) {}
+  }
+  if (w && w.message_id) await q(`UPDATE pending_balls SET batting_message_id=$2 WHERE callback_token=$1`, [token, w.message_id]);
   return true;
 }
 
@@ -8122,6 +8128,61 @@ bot.catch((err, ctx) => {
   console.error(`Bot error (${ctx?.updateType}):`, err);
 });
 
+// A live match must never sit still: if nobody is on the clock, find out why and push it forward again (solo and team)
+async function unstickMatch(matchId) {
+  const m = await getMatch(matchId);
+  if (!m || !['innings1', 'innings2'].includes(m.status)) return false;
+  let inn = await getInnings(matchId);
+  if (!inn) return false;
+  if (m.mode === 'solo') {
+    const left = await getPlayers(m.id, 'A');
+    if (left.length < 2) { await endSoloTooFew(m, inn); return true; }
+    const { rows: outR } = await q(`SELECT COUNT(*)::int AS c FROM batting_stats WHERE innings_id=$1 AND is_out=TRUE AND player_id = ANY($2::bigint[])`, [inn.id, left.map((p) => p.id)]);
+    if (outR[0].c >= left.length) {
+      clearTurnClock(m.id);
+      await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE innings_id=$1 AND is_resolved=FALSE`, [inn.id]);
+      await q(`UPDATE innings SET is_completed=TRUE WHERE id=$1`, [inn.id]);
+      await finishSolo(bot.telegram, Number(m.group_chat_id), m, (await getInnings(m.id)) || inn);
+      clearWarns(m.id); stopIdleWatch(m.id); endVote(m.id);
+      return true;
+    }
+    const gone = async (id) => !id || !(await getPlayer(id));
+    if (inn.ball_state === 'idle' && (await gone(inn.striker_player_id) || await gone(inn.current_bowler_id))) {
+      await soloAutoSetup(m, inn);
+      inn = await getInnings(matchId);
+    }
+  }
+  await ensureTurnClock(matchId);
+  return true;
+}
+const stuckSince = new Map();
+function startMatchWatchdog() {
+  setInterval(async () => {
+    try {
+      const { rows } = await q(`SELECT id FROM matches WHERE status IN ('innings1','innings2')`);
+      const seen = new Set();
+      for (const r of rows) {
+        const key = String(r.id); seen.add(key);
+        if (turnClocks.has(mkey(r.id))) { stuckSince.delete(key); continue; }
+        const first = stuckSince.get(key);
+        if (!first) { stuckSince.set(key, Date.now()); continue; }
+        if (Date.now() - first < 20000) continue; // give normal transitions time to finish
+        stuckSince.delete(key);
+        console.log('watchdog: unsticking match', r.id);
+        await unstickMatch(r.id).catch((e) => console.error('unstick:', e.message));
+      }
+      for (const k of [...stuckSince.keys()]) if (!seen.has(k)) stuckSince.delete(k);
+    } catch (e) { console.error('watchdog:', e.message); }
+  }, 10000);
+}
+bot.command(['unstick', 'resume', 'fixmatch'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  const m = await getActiveMatch(ctx.chat.id);
+  if (!m || !['innings1', 'innings2'].includes(m.status)) return ctx.reply('There is no live match here.');
+  if (Number(m.host_telegram_id) !== ctx.from.id && !isAdmin(ctx.from.id)) return ctx.reply('Only the host can use this.');
+  await unstickMatch(m.id);
+  return ctx.reply('The match was pushed forward.');
+});
 // After a restart the in-memory timers are gone: re-arm them for matches that are still open
 async function rearmAfterRestart() {
   try {
@@ -13563,7 +13624,18 @@ async function runningAuction(ctx, needHost) {
   if (!isGroup(ctx)) return null;
   const t = await activeTour(ctx.chat.id);
   const S = t && tourAuc.get(String(t.id));
-  if (!S || S.chatId !== ctx.chat.id) { await ctx.reply('No auction is running here.', trep(ctx)); return null; }
+  if (!S || S.chatId !== ctx.chat.id) {
+    // /next in a group whose live match has stopped: push the match instead
+    try {
+      const lm = await getActiveMatch(ctx.chat.id);
+      if (lm && ['innings1', 'innings2'].includes(lm.status) && /^\/next\b/i.test(ctx.message?.text || '') && (Number(lm.host_telegram_id) === ctx.from.id || isAdmin(ctx.from.id))) {
+        await unstickMatch(lm.id);
+        await ctx.reply('The match was pushed forward.');
+        return null;
+      }
+    } catch (_) {}
+    await ctx.reply('No auction is running here.', trep(ctx)); return null;
+  }
   if (needHost && !(await canManageTour(ctx, t))) { await ctx.reply('Only the host can use this command.', trep(ctx)); return null; }
   return S;
 }
@@ -15641,6 +15713,7 @@ async function main() {
     console.log(`DB latency: ${ms} ms per query` + (ms > 80 ? '  <-- SLOW: put the database in the same region as the bot host' : ''));
   } catch (_) {}
   await rearmAfterRestart();
+  try { startMatchWatchdog(); } catch (e) { console.error('watchdog:', e.message); }
   const me = await bot.telegram.getMe();
   BOT_USERNAME = me.username;
   console.log(`Bot @${me.username}`);
