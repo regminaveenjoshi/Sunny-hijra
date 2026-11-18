@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r120-2026-11-18-unstick'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r122-2026-11-18-uuid-fix'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -62,7 +62,11 @@ const fixUtf = (v) => (typeof v === 'string' ? v.replace(LONE_SURR, '') : v);
         for (const row of data.reply_markup.inline_keyboard) for (const b of row) if (b && typeof b.text === 'string') b.text = fixUtf(b.text);
       }
     }
-    return rawCall.call(this, method, data, ...rest);
+    const p = rawCall.call(this, method, data, ...rest);
+    // a Telegram call that never answers must not freeze a game: stop waiting after a while (the error is handled by the caller)
+    if (method === 'getUpdates' || method === 'getMe' || method === 'deleteWebhook') return p;
+    const ms = /^send(Video|Animation|Document|Photo|MediaGroup|Audio|Voice|VideoNote)$/.test(method) ? 120000 : 30000;
+    return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`Telegram ${method} timed out`)), ms).unref())]);
   };
 }
 bot.use(r50Gate); // ban list + owner feedback replies (defined below)
@@ -4409,7 +4413,7 @@ async function afterRemoveFix(m, hadPlayerInPlay) {
       const left = await getPlayers(m.id, 'A');
       if (left.length < 2) return await endSoloTooFew(m, inn);
       // the one who left was the last batter still to bat: every remaining player is already out, so the match is over
-      const { rows: outR } = await q(`SELECT COUNT(*)::int AS c FROM batting_stats WHERE innings_id=$1 AND is_out=TRUE AND player_id = ANY($2::bigint[])`, [inn.id, left.map((p) => p.id)]);
+      const { rows: outR } = await q(`SELECT COUNT(*)::int AS c FROM batting_stats WHERE innings_id=$1 AND is_out=TRUE AND player_id = ANY($2::uuid[])`, [inn.id, left.map((p) => p.id)]);
       if (outR[0].c >= left.length) {
         clearTurnClock(m.id);
         await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE innings_id=$1 AND is_resolved=FALSE`, [inn.id]);
@@ -7167,7 +7171,7 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
   // were removed (timeout / kick), which ended the game before the last player had batted.
   let soloOut = 0;
   if (isSolo && batSide.length) {
-    const { rows: so1 } = await q(`SELECT COUNT(*)::int AS c FROM batting_stats WHERE innings_id=$1 AND is_out=TRUE AND player_id = ANY($2::bigint[])`, [inn2.id, batSide.map((p) => p.id)]);
+    const { rows: so1 } = await q(`SELECT COUNT(*)::int AS c FROM batting_stats WHERE innings_id=$1 AND is_out=TRUE AND player_id = ANY($2::uuid[])`, [inn2.id, batSide.map((p) => p.id)]);
     soloOut = so1[0].c;
   }
   let ended = isSolo
@@ -8119,7 +8123,7 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
   } catch (e) {
     console.error('progressAfterBall failed:', e.message);
     try {
-      await ensureTurnClock(m.id);
+      await unstickMatch(m.id);
     } catch (_) {}
   }
 }
@@ -8137,7 +8141,7 @@ async function unstickMatch(matchId) {
   if (m.mode === 'solo') {
     const left = await getPlayers(m.id, 'A');
     if (left.length < 2) { await endSoloTooFew(m, inn); return true; }
-    const { rows: outR } = await q(`SELECT COUNT(*)::int AS c FROM batting_stats WHERE innings_id=$1 AND is_out=TRUE AND player_id = ANY($2::bigint[])`, [inn.id, left.map((p) => p.id)]);
+    const { rows: outR } = await q(`SELECT COUNT(*)::int AS c FROM batting_stats WHERE innings_id=$1 AND is_out=TRUE AND player_id = ANY($2::uuid[])`, [inn.id, left.map((p) => p.id)]);
     if (outR[0].c >= left.length) {
       clearTurnClock(m.id);
       await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE innings_id=$1 AND is_resolved=FALSE`, [inn.id]);
@@ -8159,11 +8163,12 @@ const stuckSince = new Map();
 function startMatchWatchdog() {
   setInterval(async () => {
     try {
-      const { rows } = await q(`SELECT id FROM matches WHERE status IN ('innings1','innings2')`);
+      const { rows } = await q(`SELECT id FROM matches WHERE status IN ('innings1','innings2') AND paused_at IS NULL`);
       const seen = new Set();
       for (const r of rows) {
         const key = String(r.id); seen.add(key);
-        if (turnClocks.has(mkey(r.id))) { stuckSince.delete(key); continue; }
+        const live = turnClocks.has(mkey(r.id)) ? await turnState(r.id).catch(() => null) : null;
+        if (live) { stuckSince.delete(key); continue; }
         const first = stuckSince.get(key);
         if (!first) { stuckSince.set(key, Date.now()); continue; }
         if (Date.now() - first < 20000) continue; // give normal transitions time to finish
@@ -8175,13 +8180,32 @@ function startMatchWatchdog() {
     } catch (e) { console.error('watchdog:', e.message); }
   }, 10000);
 }
-bot.command(['unstick', 'resume', 'fixmatch'], async (ctx) => {
+bot.command(['unstick', 'fixmatch'], async (ctx) => {
   if (!isGroup(ctx)) return;
-  const m = await getActiveMatch(ctx.chat.id);
-  if (!m || !['innings1', 'innings2'].includes(m.status)) return ctx.reply('There is no live match here.');
-  if (Number(m.host_telegram_id) !== ctx.from.id && !isAdmin(ctx.from.id)) return ctx.reply('Only the host can use this.');
-  await unstickMatch(m.id);
-  return ctx.reply('The match was pushed forward.');
+  try {
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m || !['innings1', 'innings2'].includes(m.status)) return ctx.reply('There is no live match here.');
+    if (Number(m.host_telegram_id) !== ctx.from.id && !isAdmin(ctx.from.id)) return ctx.reply('Only the host can use this.');
+    // a ball that has been waiting for a long time is dropped so a new one can start
+    const i0 = await getInnings(m.id);
+    if (i0 && i0.ball_state === 'waiting_bowl') {
+      const { rows: pb } = await q(`SELECT created_at FROM pending_balls WHERE innings_id=$1 AND is_resolved=FALSE ORDER BY id DESC LIMIT 1`, [i0.id]).catch(() => ({ rows: [] }));
+      const age = pb[0] && pb[0].created_at ? (Date.now() - new Date(pb[0].created_at).getTime()) / 1000 : 0; // unknown age: leave the ball alone
+      if (age > TURN_SECONDS + 15) {
+        await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE innings_id=$1 AND is_resolved=FALSE`, [i0.id]);
+        await q(`UPDATE innings SET ball_state='idle' WHERE id=$1`, [i0.id]);
+        clearTurnClock(m.id);
+      }
+    }
+    await unstickMatch(m.id);
+    const i1 = await getInnings(m.id);
+    const sp = i1 && i1.striker_player_id ? await getPlayer(i1.striker_player_id) : null;
+    const bw = i1 && i1.current_bowler_id ? await getPlayer(i1.current_bowler_id) : null;
+    return ctx.reply(`The match was pushed forward.\nBall state: ${i1 ? i1.ball_state : '-'}\nBatsman: ${sp ? sp.first_name || sp.username || sp.telegram_id : 'none'}\nBowler: ${bw ? bw.first_name || bw.username || bw.telegram_id : 'none'}`);
+  } catch (e) {
+    console.error('unstick:', e.message);
+    return ctx.reply('Could not push the match: ' + String(e.message).slice(0, 150)).catch(() => {});
+  }
 });
 // After a restart the in-memory timers are gone: re-arm them for matches that are still open
 async function rearmAfterRestart() {
