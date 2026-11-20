@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r125-2026-11-20-horror-mafia'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r128-2026-11-20-no-dup-team'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -4258,7 +4258,48 @@ bot.command('add', (ctx) => addPlayers(ctx, 'A', true));
 
 // ─── /remove /kick : host (or captain) removes a player instantly (no request) ───
 // Works in lobby and during live innings for both solo & team.
+// /remove <no> <team name>: take player number <no> of that team's squad list out (tournament teams). Returns true when it handled the command.
+async function tourRemoveByNo(ctx) {
+  try {
+    const tk = takeTid(cmdArgs(ctx));
+    const mm = /^(\d{1,2})\s+(.+)$/s.exec(String(tk.rest || '').trim());
+    if (!mm) return false;
+    let t;
+    if (tk.tid) {
+      t = (await q(`SELECT * FROM tournaments WHERE id=$1 AND status NOT IN ('cancelled','done')`, [tk.tid])).rows[0];
+      if (!t) { await ctx.reply(`No running tournament has the ID T${tk.tid}.`, trep(ctx)); return true; }
+    } else {
+      if (!isGroup(ctx)) return false;
+      t = await activeTour(ctx.chat.id);
+      if (!t) return false; // no tournament here: normal in-match /remove
+    }
+    if (!(await canManageTour(ctx, t))) { await ctx.reply('Only the tournament host or a group admin can remove squad players.', trep(ctx)); return true; }
+    const cap = await findTeam(t, mm[2].trim());
+    if (!cap) { await ctx.reply(`Team not found. Usage: /remove &lt;player no&gt; &lt;team name or team no&gt;, for example /remove 1 Delhi`, trep(ctx)); return true; }
+    if (t.tmode !== 'manual' && tourAuc.has(String(t.id))) { await ctx.reply(`${pe('warn')} The auction is running. Remove players after it ends.`, trep(ctx)); return true; }
+    const rows = await tourPlayers(t.id);
+    const mine = rows.filter((p) => p.role !== 'captain' && Number(p.owner_id) === Number(cap.telegram_id));
+    const no = Number(mm[1]);
+    const row = mine[no - 1];
+    if (!row) { await ctx.reply(`<b>${escapeHtml(tm(cap))}</b> has ${mine.length} player${mine.length === 1 ? '' : 's'} in the squad list, so number ${no} does not exist. Check /squad ${escapeHtml(tm(cap))}.`, trep(ctx)); return true; }
+    await q(`UPDATE tournament_players SET vc_id=NULL WHERE tid=$1 AND telegram_id=$2 AND vc_id=$3`, [t.id, cap.telegram_id, row.telegram_id]);
+    if (t.tmode === 'manual') {
+      await q(`DELETE FROM tournament_players WHERE tid=$1 AND telegram_id=$2 AND owner_id=$3 AND role='player'`, [t.id, row.telegram_id, cap.telegram_id]);
+      await ctx.reply(`${pe('ok')} <b>${escapeHtml(tName(row))}</b> removed from <b>${escapeHtml(tm(cap))}</b>. The squad numbers have moved up.`, trep(ctx));
+      return true;
+    }
+    const refund = Number(row.price || 0);
+    await q(`UPDATE tournament_players SET owner_id=NULL, price=NULL, state=NULL WHERE tid=$1 AND telegram_id=$2`, [t.id, row.telegram_id]);
+    const newPurse = await setPurse(t, cap, Number(cap.purse ?? t.purse) + refund);
+    await ctx.reply(`${pe('ok')} <b>${escapeHtml(tName(row))}</b> left <b>${escapeHtml(tm(cap))}</b>.\nRefunded <b>${refund} CM</b>, purse is now <b>${newPurse} CM</b>. He is back in the pool for /unsold.`, trep(ctx));
+    return true;
+  } catch (e) {
+    console.error('tour remove:', e.message);
+    return false;
+  }
+}
 async function removePlayers(ctx) {
+  if (await tourRemoveByNo(ctx)) return;
   if (!isGroup(ctx)) return;
   try {
     const m = await getActiveMatch(ctx.chat.id);
@@ -14451,7 +14492,7 @@ bot.command(['auchelp', 'auctionhelp', 'auchelp_cmds'], (ctx) => ctx.reply(
   '/next — bring the next player now\n/nextset — skip to the next set (10 players per set)\n/sold — sell the current player now\n' +
   'The bot sells automatically if nobody bids higher for ' + AUC_SECONDS + ' seconds.</blockquote>\n' +
   '<b>4. Bidding (captains and vice captains)</b>\n<blockquote>Tap a BID button on the player card, or send /bid &lt;amount&gt; (example: /bid 250). The amount must be higher than the current bid and within your purse.</blockquote>\n' +
-  '<b>2b. Add players yourself (host)</b><blockquote>/addreg 111 222 @user — add many players by id or @username (role words bat, bowl, ar allowed)\n/aucpause and /aucresume — pause the auction (captains get their squad in DM)\n/addplayers — many players at once, one per line: id | name | @user | role | base price\n/setbase &lt;id or @user&gt; &lt;price&gt; — own base price for one player\n/assign &lt;team&gt; &lt;id or @user&gt; [price] — put a player straight into a team\n/removeplayer &lt;team&gt; &lt;id or @user&gt; — remove him and refund the price\n/adjustpurse &lt;team&gt; +200 or -100 — change a purse (/adjustallpurse +200 for every team)\n/bidders — who can bid for each team\nFrom another group add the tournament ID first, for example /addplayers T12</blockquote>\n<b>3b. Pick a player (host)</b>\n<blockquote>/bid @username or /bid 123456789 — bring that registered player on the block now (also /bid_start @username, or reply to the player). If he is already sold, the bot tells you which team has him.\n/unsold — list of unsold players\n/unsold_3 — bring unsold player number 3 on the block</blockquote>\n' +
+  '<b>2b. Add players yourself (host)</b><blockquote>/addreg 111 222 @user — add many players by id or @username (role words bat, bowl, ar allowed)\n/aucpause and /aucresume — pause the auction (captains get their squad in DM)\n/addplayers — many players at once, one per line: id | name | @user | role | base price\n/setbase &lt;id or @user&gt; &lt;price&gt; — own base price for one player\n/assign &lt;team&gt; &lt;id or @user&gt; [price] — put a player straight into a team\n/removeplayer &lt;team&gt; &lt;id or @user&gt; — remove him and refund the price\n/remove &lt;no&gt; &lt;team&gt; — remove player number &lt;no&gt; from the squad list (example: /remove 1 Delhi)\n/adjustpurse &lt;team&gt; +200 or -100 — change a purse (/adjustallpurse +200 for every team)\n/bidders — who can bid for each team\nFrom another group add the tournament ID first, for example /addplayers T12</blockquote>\n<b>3b. Pick a player (host)</b>\n<blockquote>/bid @username or /bid 123456789 — bring that registered player on the block now (also /bid_start @username, or reply to the player). If he is already sold, the bot tells you which team has him.\n/unsold — list of unsold players\n/unsold_3 — bring unsold player number 3 on the block</blockquote>\n' +
   '<b>5. Info</b>\n<blockquote>/teamlist — all teams and players\n/squads — every team squad\n/squad — your own team squad (or /squad &lt;team&gt;)\n/purse — purses of all teams\n/unsold — unsold players\n/schedule · /points · /orange · /purple · /mvp</blockquote>\n' +
   '<b>6. Card / GIF (owner)</b>\n<blockquote>The bot makes a player card automatically. To use your own GIF instead: reply to a GIF with /setaucgif entry|bid|sold bat|bowl|ar\n/aucgifs — list GIFs · /delaucgif entry|bid|sold bat|bowl|ar — remove</blockquote>\n' +
   '<b>7. More</b>\n<blockquote>/register in any group — choose a tournament (MPL is always on top)\n/abid in any group — choose a tournament and start its auction here\n/registercap — join as a captain\n/remcaptain @user — remove a captain\n/tstats — runs, wickets and other stats of any tournament\n/endtour — cancel the tournament\n/tset can be used even after the auction has started (purses change by the difference)</blockquote>\n' +
@@ -15046,9 +15087,33 @@ async function tstList() {
 async function ltList() {
   return (await q(`SELECT id, name, status FROM tournaments WHERE status NOT IN ('cancelled','done') ORDER BY (name ILIKE '%mpl%') DESC, id DESC LIMIT 12`)).rows;
 }
-const ltKb = (tid, cur) => Markup.inlineKeyboard([
+// split long HTML text into pages at </blockquote> / blank-line boundaries so no tag is ever cut in half
+function htmlPages(text, max = 3600) {
+  const parts = text.split(/(?<=<\/blockquote>\n?)/);
+  const pages = [];
+  let cur = '';
+  for (let p of parts) {
+    while (p.length > max) { // a single block that is too long: cut at a line break and fix the tags
+      let cut = p.lastIndexOf('\n', max);
+      if (cut < 200) cut = max;
+      let head = p.slice(0, cut);
+      p = p.slice(cut);
+      const opened = /<blockquote>/g, closed = /<\/blockquote>/g;
+      const open = (head.match(opened) || []).length - (head.match(closed) || []).length;
+      if (open > 0) { head += '</blockquote>'; p = '<blockquote>' + p.replace(/^\n/, ''); }
+      if (cur && (cur + head).length > max) { pages.push(cur); cur = ''; }
+      cur += head; pages.push(cur); cur = '';
+    }
+    if (cur && (cur + p).length > max) { pages.push(cur); cur = ''; }
+    cur += p;
+  }
+  if (cur) pages.push(cur);
+  return pages.length ? pages : [''];
+}
+const ltKb = (tid, cur, page = 0, pages = 1) => Markup.inlineKeyboard([
   [tbtn('Teams', `lt:${tid}:t`, cur === 't' ? 'success' : 'primary'), tbtn('Schedule', `lt:${tid}:s`, cur === 's' ? 'success' : 'primary')],
   [tbtn('Points', `lt:${tid}:p`, cur === 'p' ? 'success' : 'primary'), tbtn('Live matches', `lt:${tid}:l`, cur === 'l' ? 'success' : 'primary')],
+  ...(pages > 1 ? [[tbtn('◀ Prev', `lt:${tid}:${cur}${(page + pages - 1) % pages}`, 'primary'), tbtn(`${page + 1}/${pages}`, `lt:${tid}:${cur}${page}`, 'primary'), tbtn('Next ▶', `lt:${tid}:${cur}${(page + 1) % pages}`, 'primary')]] : []),
   [tbtn('Stats', `tst:${tid}:0:L`, 'primary'), tbtn('Back', 'lt:0', 'danger')],
 ]);
 bot.command(['livetournament', 'livetour', 'live'], async (ctx) => {
@@ -15056,7 +15121,7 @@ bot.command(['livetournament', 'livetour', 'live'], async (ctx) => {
   if (!ts.length) return ctx.reply('No tournament is running right now.', trep(ctx));
   return ctx.reply('🏆 <b>LIVE TOURNAMENTS</b>\nChoose one:', { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard(ts.map((t) => [tbtn(`🏆 ${t.name}`.slice(0, 40), `lt:${t.id}:t`, 'primary')])).reply_markup, reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
 });
-bot.action(/^lt:(\d+)(?::(\w))?$/, async (ctx) => {
+bot.action(/^lt:(\d+)(?::([a-z])(\d*))?$/, async (ctx) => {
   try {
     await ctx.answerCbQuery().catch(() => {});
     if (ctx.match[1] === '0') {
@@ -15066,6 +15131,7 @@ bot.action(/^lt:(\d+)(?::(\w))?$/, async (ctx) => {
     const t = await getTour(ctx.match[1]);
     if (!t) return;
     const k = ctx.match[2] || 't';
+    const pg = Number(ctx.match[3] || 0);
     let text;
     if (k === 's') text = await scheduleText(t);
     else if (k === 'p') {
@@ -15076,7 +15142,10 @@ bot.action(/^lt:(\d+)(?::(\w))?$/, async (ctx) => {
       const rows = (await q(`SELECT f.no, f.t1, f.t2, m.status FROM tour_fixtures f JOIN matches m ON m.id=f.match_id WHERE f.tid=$1 AND m.status IN ('captains','toss','innings1','innings2') ORDER BY f.no`, [t.id]).catch(() => ({ rows: [] }))).rows;
       text = `🔴 <b>LIVE MATCHES</b> · ${escapeHtml(t.name)}\n\n` + (rows.length ? rows.map((r) => `<blockquote>#${r.no}  <b>${escapeHtml(capName(caps, r.t1))}</b> vs <b>${escapeHtml(capName(caps, r.t2))}</b>\n${r.status === 'innings2' ? 'Second innings' : r.status === 'innings1' ? 'First innings' : 'Starting'}</blockquote>`).join('') : 'No match is being played right now.');
     } else text = await tourText(t);
-    return ctx.editMessageText(text.slice(0, 4000), { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: ltKb(t.id, k).reply_markup }).catch(() => {});
+    const pages = htmlPages(text);
+    const page = Math.min(Math.max(pg, 0), pages.length - 1);
+    return ctx.editMessageText(pages[page], { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: ltKb(t.id, k, page, pages.length).reply_markup })
+      .catch((e) => { if (!/not modified/i.test(e.message || '')) console.error('lt edit:', e.message); });
   } catch (e) { console.error('lt:', e.message); }
 });
 bot.command(['tstats', 'tourstats'], async (ctx) => {
@@ -15718,6 +15787,10 @@ manCmd('cap', async (ctx) => {
   const rows = await tourPlayers(t.id);
   const mine = rows.find((r) => Number(r.telegram_id) === u.id);
   if (mine && mine.role === 'captain') return ctx.reply(`${escapeHtml(u.name)} is already the captain of <b>${escapeHtml(tm(mine))}</b>.`, trep(ctx));
+  if (mine && mine.owner_id) {
+    const o = rows.find((r) => Number(r.telegram_id) === Number(mine.owner_id));
+    return ctx.reply(`${escapeHtml(u.name)} is already a player in <b>${escapeHtml(o ? tm(o) : 'another team')}</b>. Remove him from that team first.`, trep(ctx));
+  }
   const old = await findTeam(t, team);
   const caps = rows.filter((r) => r.role === 'captain');
   if (!old) {
@@ -15746,6 +15819,10 @@ manCmd('vc', async (ctx) => {
   if (u.id === Number(cap.telegram_id)) return ctx.reply('The captain cannot also be the vice captain.', trep(ctx));
   const ex = (await tourPlayers(t.id)).find((r) => Number(r.telegram_id) === u.id);
   if (ex && ex.role === 'captain') return ctx.reply('That player is a captain of another team.', trep(ctx));
+  if (ex && ex.owner_id && Number(ex.owner_id) !== Number(cap.telegram_id)) {
+    const o = (await tourPlayers(t.id)).find((r) => Number(r.telegram_id) === Number(ex.owner_id));
+    return ctx.reply(`${escapeHtml(u.name)} is already in <b>${escapeHtml(o ? tm(o) : 'another team')}</b>. Remove him from that team first.`, trep(ctx));
+  }
   await ensurePlayerRow(t, u);
   await q(`UPDATE tournament_players SET owner_id=$3, state='sold', price=COALESCE(price,0) WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id, cap.telegram_id]);
   await q(`UPDATE tournament_players SET vc_id=$3 WHERE tid=$1 AND telegram_id=$2`, [t.id, cap.telegram_id, u.id]);
