@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r129-2026-11-21-removeteam'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r130-2026-11-21-renumber'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -14980,6 +14980,18 @@ bot.command(['removeplayer', 'remplayer'], async (ctx) => {
   const newPurse = await setPurse(t, cap, Number(cap.purse ?? t.purse) + refund);
   return ctx.reply(`${pe('ok')} <b>${escapeHtml(tName(row))}</b> left <b>${escapeHtml(tm(cap))}</b>.\nRefunded <b>${refund} CM</b>, purse is now <b>${newPurse} CM</b>. He is back in the pool for /unsold.`, trep(ctx));
 });
+// keep team numbers 1..N with no gaps (after a team is removed)
+async function renumberTeams(tid) {
+  await q(`UPDATE tournament_players tp SET team_no = r.n FROM (
+             SELECT telegram_id, ROW_NUMBER() OVER (ORDER BY team_no NULLS LAST, telegram_id)::int AS n
+             FROM tournament_players WHERE tid=$1 AND role='captain') r
+           WHERE tp.tid=$1 AND tp.telegram_id=r.telegram_id AND tp.role='captain' AND tp.team_no IS DISTINCT FROM r.n`, [tid]);
+}
+bot.command(['renumberteams', 'fixteamno'], async (ctx) => {
+  const h = await removeTeamTour(ctx); if (!h) return;
+  await renumberTeams(h.t.id);
+  return ctx.reply(`${pe('ok')} Team numbers are now 1, 2, 3... in the same order. See /teamlist`, trep(ctx));
+});
 // /removeteam <team name or no>: remove a whole team (captain + squad). Players go back to the pool (manual: deleted).
 async function removeTeamTour(ctx) {
   const tk = takeTid(cmdArgs(ctx));
@@ -15026,8 +15038,9 @@ bot.action(/^rtm:([yn]):(\d+):(-?\d+):(\d+)$/, async (ctx) => {
     if (t.tmode === 'manual') await q(`DELETE FROM tournament_players WHERE tid=$1 AND owner_id=$2 AND role='player'`, [t.id, capId]);
     else await q(`UPDATE tournament_players SET owner_id=NULL, price=NULL, state=NULL WHERE tid=$1 AND owner_id=$2`, [t.id, capId]);
     await q(`DELETE FROM tournament_players WHERE tid=$1 AND telegram_id=$2 AND role='captain'`, [t.id, capId]);
+    await renumberTeams(t.id);
     await ctx.answerCbQuery('Team removed').catch(() => {});
-    return ctx.editMessageText(`${pe('ok')} Team <b>${escapeHtml(tm(cap))}</b> removed.`, { parse_mode: 'HTML' }).catch(() => {});
+    return ctx.editMessageText(`${pe('ok')} Team <b>${escapeHtml(tm(cap))}</b> removed. Team numbers are renumbered 1, 2, 3...`, { parse_mode: 'HTML' }).catch(() => {});
   } catch (e) {
     console.error('rtm:', e.message);
     ctx.answerCbQuery('Error, try again').catch(() => {});
