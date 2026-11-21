@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r128-2026-11-20-no-dup-team'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r129-2026-11-21-removeteam'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -14492,7 +14492,7 @@ bot.command(['auchelp', 'auctionhelp', 'auchelp_cmds'], (ctx) => ctx.reply(
   '/next — bring the next player now\n/nextset — skip to the next set (10 players per set)\n/sold — sell the current player now\n' +
   'The bot sells automatically if nobody bids higher for ' + AUC_SECONDS + ' seconds.</blockquote>\n' +
   '<b>4. Bidding (captains and vice captains)</b>\n<blockquote>Tap a BID button on the player card, or send /bid &lt;amount&gt; (example: /bid 250). The amount must be higher than the current bid and within your purse.</blockquote>\n' +
-  '<b>2b. Add players yourself (host)</b><blockquote>/addreg 111 222 @user — add many players by id or @username (role words bat, bowl, ar allowed)\n/aucpause and /aucresume — pause the auction (captains get their squad in DM)\n/addplayers — many players at once, one per line: id | name | @user | role | base price\n/setbase &lt;id or @user&gt; &lt;price&gt; — own base price for one player\n/assign &lt;team&gt; &lt;id or @user&gt; [price] — put a player straight into a team\n/removeplayer &lt;team&gt; &lt;id or @user&gt; — remove him and refund the price\n/remove &lt;no&gt; &lt;team&gt; — remove player number &lt;no&gt; from the squad list (example: /remove 1 Delhi)\n/adjustpurse &lt;team&gt; +200 or -100 — change a purse (/adjustallpurse +200 for every team)\n/bidders — who can bid for each team\nFrom another group add the tournament ID first, for example /addplayers T12</blockquote>\n<b>3b. Pick a player (host)</b>\n<blockquote>/bid @username or /bid 123456789 — bring that registered player on the block now (also /bid_start @username, or reply to the player). If he is already sold, the bot tells you which team has him.\n/unsold — list of unsold players\n/unsold_3 — bring unsold player number 3 on the block</blockquote>\n' +
+  '<b>2b. Add players yourself (host)</b><blockquote>/addreg 111 222 @user — add many players by id or @username (role words bat, bowl, ar allowed)\n/aucpause and /aucresume — pause the auction (captains get their squad in DM)\n/addplayers — many players at once, one per line: id | name | @user | role | base price\n/setbase &lt;id or @user&gt; &lt;price&gt; — own base price for one player\n/assign &lt;team&gt; &lt;id or @user&gt; [price] — put a player straight into a team\n/removeplayer &lt;team&gt; &lt;id or @user&gt; — remove him and refund the price\n/removeteam &lt;team&gt; — remove a whole team (captain and squad)\n/remove &lt;no&gt; &lt;team&gt; — remove player number &lt;no&gt; from the squad list (example: /remove 1 Delhi)\n/adjustpurse &lt;team&gt; +200 or -100 — change a purse (/adjustallpurse +200 for every team)\n/bidders — who can bid for each team\nFrom another group add the tournament ID first, for example /addplayers T12</blockquote>\n<b>3b. Pick a player (host)</b>\n<blockquote>/bid @username or /bid 123456789 — bring that registered player on the block now (also /bid_start @username, or reply to the player). If he is already sold, the bot tells you which team has him.\n/unsold — list of unsold players\n/unsold_3 — bring unsold player number 3 on the block</blockquote>\n' +
   '<b>5. Info</b>\n<blockquote>/teamlist — all teams and players\n/squads — every team squad\n/squad — your own team squad (or /squad &lt;team&gt;)\n/purse — purses of all teams\n/unsold — unsold players\n/schedule · /points · /orange · /purple · /mvp</blockquote>\n' +
   '<b>6. Card / GIF (owner)</b>\n<blockquote>The bot makes a player card automatically. To use your own GIF instead: reply to a GIF with /setaucgif entry|bid|sold bat|bowl|ar\n/aucgifs — list GIFs · /delaucgif entry|bid|sold bat|bowl|ar — remove</blockquote>\n' +
   '<b>7. More</b>\n<blockquote>/register in any group — choose a tournament (MPL is always on top)\n/abid in any group — choose a tournament and start its auction here\n/registercap — join as a captain\n/remcaptain @user — remove a captain\n/tstats — runs, wickets and other stats of any tournament\n/endtour — cancel the tournament\n/tset can be used even after the auction has started (purses change by the difference)</blockquote>\n' +
@@ -14979,6 +14979,59 @@ bot.command(['removeplayer', 'remplayer'], async (ctx) => {
   await q(`UPDATE tournament_players SET vc_id=NULL WHERE tid=$1 AND telegram_id=$2 AND vc_id=$3`, [t.id, cap.telegram_id, id]);
   const newPurse = await setPurse(t, cap, Number(cap.purse ?? t.purse) + refund);
   return ctx.reply(`${pe('ok')} <b>${escapeHtml(tName(row))}</b> left <b>${escapeHtml(tm(cap))}</b>.\nRefunded <b>${refund} CM</b>, purse is now <b>${newPurse} CM</b>. He is back in the pool for /unsold.`, trep(ctx));
+});
+// /removeteam <team name or no>: remove a whole team (captain + squad). Players go back to the pool (manual: deleted).
+async function removeTeamTour(ctx) {
+  const tk = takeTid(cmdArgs(ctx));
+  let t;
+  if (tk.tid) {
+    t = (await q(`SELECT * FROM tournaments WHERE id=$1 AND status NOT IN ('cancelled','done')`, [tk.tid])).rows[0];
+    if (!t) { await ctx.reply(`No running tournament has the ID T${tk.tid}.`, trep(ctx)); return null; }
+  } else {
+    if (!isGroup(ctx)) { await ctx.reply('Use this in the tournament group, or add the ID: /removeteam T12 Delhi', trep(ctx)); return null; }
+    t = await activeTour(ctx.chat.id);
+    if (!t) { await ctx.reply('No tournament is open here.', trep(ctx)); return null; }
+  }
+  if (!(await canManageTour(ctx, t))) { await ctx.reply('Only the tournament host or a group admin can remove a team.', trep(ctx)); return null; }
+  if (t.tmode !== 'manual' && tourAuc.has(String(t.id))) { await ctx.reply(`${pe('warn')} The auction is running. Remove the team after it ends.`, trep(ctx)); return null; }
+  return { t, rest: tk.rest };
+}
+bot.command(['removeteam', 'delteam', 'rmteam'], async (ctx) => {
+  const h = await removeTeamTour(ctx); if (!h) return;
+  const { t } = h;
+  const key = String(h.rest || '').trim();
+  if (!key) return ctx.reply('Usage: /removeteam &lt;team name or team no&gt;\nExample: /removeteam Delhi', trep(ctx));
+  const cap = await findTeam(t, key);
+  if (!cap) return ctx.reply('Team not found. See /teamlist', trep(ctx));
+  const used = (await q(`SELECT 1 FROM tour_fixtures WHERE tid=$1 AND (t1=$2 OR t2=$2) LIMIT 1`, [t.id, cap.telegram_id])).rows.length;
+  if (used) return ctx.reply('This team already has fixtures, so it cannot be removed. Remove its matches from the schedule first.', trep(ctx));
+  const n = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND owner_id=$2`, [t.id, cap.telegram_id])).rows[0].c;
+  return ctx.reply(`${pe('warn')} Remove <b>${escapeHtml(tm(cap))}</b>?\n👑 Captain: ${escapeHtml(tName(cap))}\n👥 ${n} squad player${n === 1 ? '' : 's'} ${t.tmode === 'manual' ? 'will be deleted from the tournament' : 'will go back to the pool (/unsold)'}.`, {
+    ...trep(ctx),
+    reply_markup: Markup.inlineKeyboard([[tbtn('YES, REMOVE', `rtm:y:${t.id}:${cap.telegram_id}:${ctx.from.id}`, 'danger'), tbtn('CANCEL', `rtm:n:${t.id}:${cap.telegram_id}:${ctx.from.id}`, 'primary')]]).reply_markup,
+  });
+});
+bot.action(/^rtm:([yn]):(\d+):(-?\d+):(\d+)$/, async (ctx) => {
+  try {
+    const [, ans, tid, capId, who] = ctx.match;
+    if (ctx.from.id !== Number(who)) return ctx.answerCbQuery('Only the person who sent the command can confirm', { show_alert: true });
+    if (ans === 'n') { await ctx.answerCbQuery('Cancelled').catch(() => {}); return ctx.editMessageText('Cancelled. The team was not removed.').catch(() => {}); }
+    const t = await getTour(Number(tid));
+    if (!t || ['cancelled', 'done'].includes(t.status)) return ctx.answerCbQuery('Tournament is not running', { show_alert: true });
+    if (t.tmode !== 'manual' && tourAuc.has(String(t.id))) return ctx.answerCbQuery('The auction is running', { show_alert: true });
+    const cap = (await tourPlayers(t.id)).find((r) => r.role === 'captain' && Number(r.telegram_id) === Number(capId));
+    if (!cap) return ctx.answerCbQuery('Team already removed', { show_alert: true });
+    const used = (await q(`SELECT 1 FROM tour_fixtures WHERE tid=$1 AND (t1=$2 OR t2=$2) LIMIT 1`, [t.id, capId])).rows.length;
+    if (used) return ctx.answerCbQuery('This team has fixtures now', { show_alert: true });
+    if (t.tmode === 'manual') await q(`DELETE FROM tournament_players WHERE tid=$1 AND owner_id=$2 AND role='player'`, [t.id, capId]);
+    else await q(`UPDATE tournament_players SET owner_id=NULL, price=NULL, state=NULL WHERE tid=$1 AND owner_id=$2`, [t.id, capId]);
+    await q(`DELETE FROM tournament_players WHERE tid=$1 AND telegram_id=$2 AND role='captain'`, [t.id, capId]);
+    await ctx.answerCbQuery('Team removed').catch(() => {});
+    return ctx.editMessageText(`${pe('ok')} Team <b>${escapeHtml(tm(cap))}</b> removed.`, { parse_mode: 'HTML' }).catch(() => {});
+  } catch (e) {
+    console.error('rtm:', e.message);
+    ctx.answerCbQuery('Error, try again').catch(() => {});
+  }
 });
 // /bidders: who can bid for each team
 bot.command('bidders', async (ctx) => {
