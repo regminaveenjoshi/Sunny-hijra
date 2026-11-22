@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r130-2026-11-21-renumber'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r131-2026-11-22-broadcastpin'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -12413,29 +12413,37 @@ bot.command('gstats', ownerOnly(async (ctx) => {
   if (buf.trim()) await ctx.reply(buf, { disable_web_page_preview: true });
 }));
 // /broadcast [groups|users] <your text>   or reply to any message with /broadcast
-bot.command('broadcast', ownerOnly(async (ctx) => {
+// /broadcastpin does the same and also pins the message in every chat (groups need the bot to be admin with pin rights)
+async function runBroadcast(ctx, pin) {
+  const cmd = pin ? '/broadcastpin' : '/broadcast';
   let args = cmdArgs(ctx);
   let scope = 'all';
   const m1 = args.match(/^(groups|users|all)\b\s*/i);
   if (m1) { scope = m1[1].toLowerCase(); args = args.slice(m1[0].length); }
   const rep = ctx.message.reply_to_message;
-  if (!rep && !args) return ctx.reply('Usage: /broadcast [groups|users] <text>  or reply to a message with /broadcast');
+  if (!rep && !args) return ctx.reply(`Usage: ${cmd} [groups|users] <text>  or reply to a message with ${cmd}`);
   let targets = [];
   if (scope !== 'users') targets.push(...(await knownGroups()));
   if (scope !== 'groups') targets.push(...(await q(`SELECT telegram_id FROM users WHERE telegram_id > 0`)).rows.map((r) => Number(r.telegram_id)));
   targets = [...new Set(targets)].filter((id) => !banned.has(id));
-  await ctx.reply(`Broadcasting to ${targets.length} chats…`);
-  let ok = 0, fail = 0;
+  await ctx.reply(`Broadcasting${pin ? ' and pinning' : ''} to ${targets.length} chats…`);
+  let ok = 0, fail = 0, pinned = 0, pinFail = 0;
   for (const id of targets) {
     try {
-      if (rep) await ctx.telegram.copyMessage(id, ctx.chat.id, rep.message_id);
-      else await ctx.telegram.sendMessage(id, args, { disable_web_page_preview: true });
+      const sent = rep
+        ? await ctx.telegram.copyMessage(id, ctx.chat.id, rep.message_id)
+        : await ctx.telegram.sendMessage(id, args, { disable_web_page_preview: true });
       ok++;
+      if (pin && sent && sent.message_id) {
+        try { await ctx.telegram.pinChatMessage(id, sent.message_id, { disable_notification: true }); pinned++; } catch (_) { pinFail++; }
+      }
     } catch (_) { fail++; }
-    await sleep(60);
+    await sleep(pin ? 120 : 60);
   }
-  return ctx.reply(`Broadcast done. Delivered: ${ok} · Failed: ${fail}`);
-}));
+  return ctx.reply(`Broadcast done. Delivered: ${ok} · Failed: ${fail}` + (pin ? `\nPinned: ${pinned} · Could not pin: ${pinFail} (the bot needs pin rights in groups)` : ''));
+}
+bot.command('broadcast', ownerOnly((ctx) => runBroadcast(ctx, false)));
+bot.command(['broadcastpin', 'pinbroadcast', 'bpin'], ownerOnly((ctx) => runBroadcast(ctx, true)));
 
 // ── /feedback: user → owner DM → owner's reply goes back into the user's chat ──
 bot.command('feedback', async (ctx) => {
