@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r131-2026-11-22-broadcastpin'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r136-2026-11-23-solo-lobby-2min'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -63,6 +63,13 @@ const fixUtf = (v) => (typeof v === 'string' ? v.replace(LONE_SURR, '') : v);
       }
     }
     const p = rawCall.call(this, method, data, ...rest);
+    // tournament matches: when the bot asks a captain for /bat or /ball, also show the pick buttons
+    try {
+      if (data && /^send(Message|Animation|Video|Photo)$/.test(method) && Number(data.chat_id) < 0) {
+        const tx = String(data.text || data.caption || '');
+        if (tx.length < 4000 && /\/(bat|ball)\s*(<|&lt;)\s*no\./i.test(tx)) p.then(() => schedulePickOffer(Number(data.chat_id)), () => {});
+      }
+    } catch (_) {}
     // a Telegram call that never answers must not freeze a game: stop waiting after a while (the error is handled by the caller)
     if (method === 'getUpdates' || method === 'getMe' || method === 'deleteWebhook') return p;
     const ms = /^send(Video|Animation|Document|Photo|MediaGroup|Audio|Voice|VideoNote)$/.test(method) ? 120000 : 30000;
@@ -522,7 +529,7 @@ const COIN_FRAME_MS = 750; // speed of the coin-flip animation
 const DEFAULT_TEAM_SIZE = 100; // max players per team (effectively unlimited)
 const MIN_TEAM_PLAYERS = 2; // striker + non-striker
 const MAX_BOWLER_OVERS = 99; // no per-bowler over limit any more
-const LOBBY_SECONDS = 60; // solo lobby timer
+const LOBBY_SECONDS = 120; // solo lobby timer (2 minutes)
 const TEAM_JOIN_SECONDS = 45; // team lobby join window
 const TEAM_JOIN_WARN_LAST = 10; // send warning this many seconds before end
 const MAX_SOLO_PLAYERS = 100; // effectively unlimited
@@ -545,7 +552,7 @@ const TEAM_BOWLER_WARN_LIMIT = 2; // team: captain is tagged to choose the next 
 const BAT_RETIRE_LIMIT = 2; // batsman is retired OUT after this many missed turns
 const IDLE_WARN_SECONDS = 120; // host warning interval while the lobby / setup does not progress
 const IDLE_WARN_LIMIT = 5; // game is ended after this many host warnings
-const STUCK_MINUTES = 15; // active game with no response → auto-cancel so others can play
+const STUCK_MINUTES = 20; // active game with no response → auto-cancel so others can play
 const STUCK_CHECK_MS = 60 * 1000; // how often we scan for stuck games
 const matchActivity = new Map(); // matchId -> last activity ms
 function touchMatch(matchId) {
@@ -3035,11 +3042,11 @@ bot.command('help', async (ctx) => {
   await ctx.reply(
     `📖 *HOW TO PLAY*\n\n` +
       `*SOLO* (everyone bats until out)\n` +
-      `/startsolo — open lobby (60s)\n` +
+      `/startsolo — open lobby (2 min)\n` +
       `/join\\_solo — join (#1 bats, #2 bowls…)\n` +
       `/leavesolo — leave\n` +
       `/forcestart or /startgame — start (min 2)\n` +
-      `/extend30 — +30s\n` +
+      `/extend30 — +30s  ·  /extend60 — +60s\n` +
       `/soloball 3 or 6 — bowler changes every 3 or 6 balls (next player by number)\n` +
       `Then just type 0-6 when it is your turn to bat\n\n` +
       `*PROFILE*\n` +
@@ -3062,7 +3069,7 @@ bot.command('help', async (ctx) => {
       `/spam — host switches Spam-free / Spam mode\n` +
       `/penalty team a -5 reason — host deducts/adds team runs\n` +
       `/changehost — host: hand over instantly (tap or reply) · players: vote\n` +
-      `/changeover 10|15|20 — host: change the match overs while playing\n` +
+      `/changeover — host: change the match overs (1 to 20) while playing\n` +
       `/achievements — your achievement vault (opens in DM)\n` +
       `/changecap — host: direct · team: 2 votes of that team\n\n` +
       `*Rules*\n` +
@@ -3528,7 +3535,8 @@ function startLobbyTimer(matchId, chatId, hostId, telegram, seconds = LOBBY_SECO
         const pl = await getPlayers(matchId);
         await telegram.sendMessage(
           chatId,
-          `⏳ *${left}s* left  ·  ${pl.length} player${pl.length === 1 ? '' : 's'}  ·  /joinsolo`,
+          `⏳ *${left}s* left  ·  ${pl.length} player${pl.length === 1 ? '' : 's'}  ·  /joinsolo` +
+            (left === 30 ? `\nHost: send /extend60 to add 60 more seconds.` : ''),
           { parse_mode: 'Markdown' }
         );
       } catch (_) {}
@@ -3719,7 +3727,7 @@ bot.command('forcestart', async (ctx) => {
   }
 });
 
-bot.command('extend30', async (ctx) => {
+bot.command(['extend30', 'extend60', 'expend60'], async (ctx) => {
   if (!isGroup(ctx)) return;
   try {
     const m = await getActiveMatch(ctx.chat.id);
@@ -3730,7 +3738,7 @@ bot.command('extend30', async (ctx) => {
     const L = lobbies.get(m.id);
     if (!L) return ctx.reply('❌ Lobby timer not found');
 
-    const extra = 30;
+    const extra = /^\/(extend|expend)60\b/i.test(String(ctx.message?.text || '')) ? 60 : 30;
     const newLeft = Math.ceil((L.endsAt - Date.now()) / 1000) + extra;
     startLobbyTimer(m.id, ctx.chat.id, ctx.from.id, ctx.telegram, newLeft);
 
@@ -5588,16 +5596,16 @@ async function sendPickList(ctx, m, inn, kind) {
   await ctx.reply(t, { parse_mode: 'HTML', reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true });
 }
 
-async function batCmd(ctx) {
+async function batCmd(ctx, pre = null) {
   if (!isGroup(ctx)) return;
   try {
-    const m = await getActiveMatch(ctx.chat.id);
+    const m = pre ? pre.m : await getActiveMatch(ctx.chat.id);
     if (!m || !['innings1', 'innings2'].includes(m.status)) return ctx.reply('❌ No match in progress');
     if (m.mode === 'solo') return ctx.reply('ℹ️ Solo is automatic — just type 0-6');
 
     let inn = await getInnings(m.id);
     if (!inn) return ctx.reply('⏳ Please wait');
-    const sel = await pickPlayerArg(ctx, m, inn.batting_team);
+    const sel = pre ? { p: pre.p } : await pickPlayerArg(ctx, m, inn.batting_team);
     if (sel.list) return sendPickList(ctx, m, inn, 'bat');
     if (!['idle', 'waiting_bat'].includes(inn.ball_state)) return ctx.reply('⏳ A ball is pending');
     const team = await getTeam(m.id, inn.batting_team);
@@ -5657,18 +5665,18 @@ async function batCmd(ctx) {
     await ctx.reply('❌ ' + e.message);
   }
 }
-bot.command(['bat', 'batting'], batCmd);
+bot.command(['bat', 'batting'], (ctx) => batCmd(ctx));
 
-async function ballCmd(ctx) {
+async function ballCmd(ctx, pre = null) {
   if (!isGroup(ctx)) return;
   try {
-    const m = await getActiveMatch(ctx.chat.id);
+    const m = pre ? pre.m : await getActiveMatch(ctx.chat.id);
     if (!m || !['innings1', 'innings2'].includes(m.status)) return ctx.reply('❌ No match in progress');
     if (m.mode === 'solo') return ctx.reply('ℹ️ Solo has an automatic bowler');
 
     const inn = await getInnings(m.id);
     if (!inn) return ctx.reply('⏳ Please wait');
-    const sel = await pickPlayerArg(ctx, m, inn.bowling_team);
+    const sel = pre ? { p: pre.p } : await pickPlayerArg(ctx, m, inn.bowling_team);
     if (sel.list) return sendPickList(ctx, m, inn, 'bowl');
     if (inn.ball_state !== 'idle') return ctx.reply('⏳ Please wait');
     if (!inn.striker_player_id || !inn.non_striker_player_id)
@@ -5702,7 +5710,246 @@ async function ballCmd(ctx) {
     await ctx.reply('❌ ' + e.message);
   }
 }
-bot.command(['ball', 'bowling'], ballCmd);
+bot.command(['ball', 'bowling'], (ctx) => ballCmd(ctx));
+
+// ═══ r134: tournament matches — pick batters / bowlers with buttons, and the Impact Player swap ═══
+const pickOffered = new Map(); // matchId -> { key, chatId, msgId, at }
+const pickTimers = new Map(); // chatId -> timer
+function schedulePickOffer(chatId) {
+  clearTimeout(pickTimers.get(chatId));
+  pickTimers.set(chatId, setTimeout(() => { pickTimers.delete(chatId); offerPickButtons(chatId).catch((e) => console.error('pick offer:', e.message)); }, 1200));
+}
+const isTourMatch = async (mid) => !!(await q(`SELECT 1 FROM tour_fixtures WHERE match_id=$1 LIMIT 1`, [mid])).rows.length;
+async function pickEligible(m, inn, kind) {
+  const label = kind === 'bat' ? inn.batting_team : inn.bowling_team;
+  const pl = await getPlayers(m.id, label);
+  if (kind === 'bat') {
+    const { rows } = await q(`SELECT player_id, is_out FROM batting_stats WHERE innings_id=$1`, [inn.id]);
+    const out = new Set(rows.filter((r) => r.is_out).map((r) => r.player_id));
+    return pl.filter((p) => !out.has(p.id) && p.id !== inn.striker_player_id && p.id !== inn.non_striker_player_id);
+  }
+  const { rows } = await q(`SELECT player_id, balls_bowled FROM bowling_stats WHERE innings_id=$1`, [inn.id]);
+  const balls = new Map(rows.map((r) => [r.player_id, Number(r.balls_bowled) || 0]));
+  const maxB = Number(m.max_overs_per_bowler || MAX_BOWLER_OVERS) * 6;
+  return pl.filter((p) => {
+    const bb = balls.get(p.id) || 0;
+    if (bb >= maxB) return false;
+    if (inn.last_bowler_id === p.id && inn.balls_bowled % 6 === 0 && bb > 0) return false;
+    return true;
+  });
+}
+async function offerPickButtons(chatId) {
+  const m = await getActiveMatch(chatId);
+  if (!m || m.mode === 'solo' || !['innings1', 'innings2'].includes(m.status)) return;
+  if (!(await isTourMatch(m.id))) return;
+  const inn = await getInnings(m.id);
+  if (!inn) return;
+  let kind = null, head = '';
+  if (['idle', 'waiting_bat'].includes(inn.ball_state) && (!inn.striker_player_id || !inn.non_striker_player_id)) {
+    kind = 'bat';
+    head = !inn.striker_player_id ? (inn.balls_bowled > 0 ? 'choose NEW BATSMAN (striker)' : 'choose STRIKER') : 'choose NON-STRIKER';
+  } else if (inn.striker_player_id && inn.non_striker_player_id && !inn.current_bowler_id && inn.ball_state === 'idle') {
+    kind = 'bowl';
+    head = inn.balls_bowled === 0 ? 'choose opening BOWLER' : 'choose next BOWLER';
+  }
+  if (!kind) return;
+  const key = [inn.id, kind, inn.striker_player_id, inn.non_striker_player_id, inn.current_bowler_id, inn.balls_bowled].join('|');
+  const prev = pickOffered.get(m.id);
+  if (prev && prev.key === key && Date.now() - prev.at < 10 * 60000) return;
+  if (prev && prev.msgId) { try { await bot.telegram.deleteMessage(chatId, prev.msgId); } catch (_) {} }
+  const list = await pickEligible(m, inn, kind);
+  if (!list.length) return;
+  const team = kind === 'bat' ? inn.batting_team : inn.bowling_team;
+  const rows = list.map((p) => [tbtn(shortName(p, 28), `pk:${kind}:${p.telegram_id}`, 'primary')]);
+  const sent = await bot.telegram.sendMessage(chatId, `👑 ${await capTagOf(m, team)} ${head}:`, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) });
+  pickOffered.set(m.id, { key, chatId, msgId: sent.message_id, at: Date.now() });
+}
+async function pickCanAct(ctx, m, kind, inn) {
+  const team = await getTeam(m.id, kind === 'bat' ? inn.batting_team : inn.bowling_team);
+  const id = ctx.from.id;
+  return Number(team?.captain_id) === id || Number(m.host_telegram_id) === id || isAdmin(id);
+}
+bot.action(/^pk:(bat|bowl):(-?\d+)$/, async (ctx) => {
+  try {
+    const kind = ctx.match[1];
+    const tg = Number(ctx.match[2]);
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m || !['innings1', 'innings2'].includes(m.status)) return ctx.answerCbQuery('No match in progress', { show_alert: true });
+    const inn = await getInnings(m.id);
+    if (!inn) return ctx.answerCbQuery('Please wait');
+    if (!(await pickCanAct(ctx, m, kind, inn))) return ctx.answerCbQuery(`Only the ${kind === 'bat' ? 'batting' : 'bowling'} captain or the host can pick.`, { show_alert: true });
+    const p = await getPlayerByTg(m.id, tg);
+    const ok = p && (await pickEligible(m, inn, kind)).some((x) => x.id === p.id);
+    if (!ok) return ctx.answerCbQuery('That player cannot be picked right now.', { show_alert: true });
+    await ctx.answerCbQuery().catch(() => {});
+    let what = 'bowler';
+    if (kind === 'bat') what = !inn.striker_player_id ? 'striker' : !inn.non_striker_player_id ? 'non-striker' : 'striker';
+    const rp = ctx.callbackQuery.message && ctx.callbackQuery.message.message_id;
+    await ctx.telegram.sendMessage(ctx.chat.id, `❓ Confirm ${what}: ${escapeHtml(shortName(p, 28))}?`, {
+      parse_mode: 'HTML', reply_to_message_id: rp, allow_sending_without_reply: true,
+      ...Markup.inlineKeyboard([[btn('Confirm', `pc:y:${kind}:${tg}:${ctx.from.id}`, null, 'success'), btn('Cancel', `pc:n:${kind}:${tg}:${ctx.from.id}`, null, 'danger')]]),
+    });
+  } catch (e) { console.error('pk:', e.message); ctx.answerCbQuery('Error, try again').catch(() => {}); }
+});
+bot.action(/^pc:([yn]):(bat|bowl):(-?\d+):(\d+)$/, async (ctx) => {
+  try {
+    const [, ans, kind, tgS, who] = ctx.match;
+    if (ctx.from.id !== Number(who) && !isAdmin(ctx.from.id)) return ctx.answerCbQuery('Only the person who picked can confirm.', { show_alert: true });
+    const cm = ctx.callbackQuery.message;
+    await ctx.answerCbQuery().catch(() => {});
+    if (cm) { try { await ctx.telegram.deleteMessage(ctx.chat.id, cm.message_id); } catch (_) {} }
+    if (ans === 'n') return;
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m || !['innings1', 'innings2'].includes(m.status)) return;
+    const inn = await getInnings(m.id);
+    if (!inn) return;
+    const p = await getPlayerByTg(m.id, Number(tgS));
+    if (!p || !(await pickEligible(m, inn, kind)).some((x) => x.id === p.id)) return ctx.reply('❌ That player cannot be picked any more. Use the new list.');
+    const old = pickOffered.get(m.id);
+    if (old && old.msgId) { try { await ctx.telegram.deleteMessage(ctx.chat.id, old.msgId); } catch (_) {} pickOffered.delete(m.id); }
+    if (kind === 'bat') await batCmd(ctx, { m, p }); else await ballCmd(ctx, { m, p });
+    schedulePickOffer(ctx.chat.id);
+  } catch (e) { console.error('pc:', e.message); }
+});
+
+// ── Impact Player: bring one bench player in for someone who has not batted or bowled yet (once per team per match) ──
+let impactReady = false;
+async function impactInit() {
+  if (impactReady) return;
+  await q(`CREATE TABLE IF NOT EXISTS impact_used (match_id TEXT NOT NULL, team_label TEXT NOT NULL, in_tg BIGINT, out_tg BIGINT, at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (match_id, team_label))`);
+  impactReady = true;
+}
+async function impactCtx(m) {
+  const f = (await q(`SELECT f.*, t.host_id FROM tour_fixtures f JOIN tournaments t ON t.id=f.tid WHERE f.match_id=$1 LIMIT 1`, [m.id])).rows[0];
+  return f || null;
+}
+function impactCapId(f, L) { return Number(L === 'A' ? f.t1 : f.t2); }
+async function impactCanAct(ctx, m, f, L) {
+  const id = ctx.from.id;
+  if (isAdmin(id) || Number(f.host_id) === id || Number(m.host_telegram_id) === id) return true;
+  const capRow = (await q(`SELECT telegram_id, vc_id FROM tournament_players WHERE tid=$1 AND telegram_id=$2 AND role='captain'`, [f.tid, impactCapId(f, L)])).rows[0];
+  const mt = await getTeam(m.id, L);
+  return !!((capRow && (Number(capRow.telegram_id) === id || Number(capRow.vc_id || 0) === id)) || (mt && Number(mt.captain_id) === id));
+}
+async function impactLists(m, f, L) {
+  const capId = impactCapId(f, L);
+  const pool = (await q(`SELECT * FROM tournament_players WHERE tid=$1 AND (telegram_id=$2 OR owner_id=$2) ORDER BY (role='captain') DESC, telegram_id`, [f.tid, capId])).rows;
+  const playing = await getPlayers(m.id, L);
+  const on = new Set(playing.map((p) => Number(p.telegram_id)));
+  const bench = pool.filter((p) => !on.has(Number(p.telegram_id)));
+  return { playing, bench, pool };
+}
+async function impactOutCandidates(m, L, playing) {
+  const inn = await getInnings(m.id);
+  const out = [];
+  for (const p of playing) {
+    if (p.is_captain) continue;
+    if (inn && (inn.striker_player_id === p.id || inn.non_striker_player_id === p.id || inn.current_bowler_id === p.id)) continue;
+    const used = (await q(
+      `SELECT 1 FROM batting_stats bs JOIN innings i ON i.id=bs.innings_id WHERE i.match_id=$1 AND bs.player_id=$2
+       UNION ALL SELECT 1 FROM bowling_stats bw JOIN innings i ON i.id=bw.innings_id WHERE i.match_id=$1 AND bw.player_id=$2 LIMIT 1`, [m.id, p.id])).rows.length;
+    if (!used) out.push(p);
+  }
+  return out;
+}
+async function impactPanel(ctx, m, f, L) {
+  await impactInit();
+  const done = (await q(`SELECT 1 FROM impact_used WHERE match_id=$1 AND team_label=$2`, [String(m.id), L])).rows.length;
+  const mt = await getTeam(m.id, L);
+  if (done) return ctx.reply(`⚡ Team ${escapeHtml(mt?.team_name || L)} has already used its Impact Player.`, { parse_mode: 'HTML' });
+  const { playing, bench } = await impactLists(m, f, L);
+  if (!bench.length) return ctx.reply('ℹ️ There is nobody on the bench.');
+  const text = `⚡ <b>IMPACT PLAYER</b> · ${escapeHtml(mt?.team_name || 'Team ' + L)}\n` +
+    `<blockquote><b>Playing</b>\n${playing.map((p, i) => `${i + 1}. ${escapeHtml(shortName(p, 24))}`).join('\n')}</blockquote>\n` +
+    `<blockquote><b>Bench</b>\n${bench.map((p, i) => `${i + 1}. ${escapeHtml(tName(p))}`).join('\n')}</blockquote>\n` +
+    `Step 1: choose the player coming <b>IN</b> from the bench.`;
+  const rows = bench.map((p) => [tbtn(tName(p).slice(0, 30), `imi:${L}:${p.telegram_id}:${ctx.from.id}`, 'primary')]);
+  rows.push([tbtn('Close', `imx:${ctx.from.id}`, 'danger')]);
+  return ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) });
+}
+bot.command(['impact', 'impactplayer'], async (ctx) => {
+  if (!isGroup(ctx)) return;
+  try {
+    const m = await getActiveMatch(ctx.chat.id);
+    if (!m || m.mode === 'solo' || !['captains', 'toss', 'innings1', 'innings2'].includes(m.status)) return ctx.reply('❌ No team match is running here.');
+    const f = await impactCtx(m);
+    if (!f) return ctx.reply('❌ Impact Player works in tournament matches only.');
+    const allowed = [];
+    for (const L of ['A', 'B']) if (await impactCanAct(ctx, m, f, L)) allowed.push(L);
+    if (!allowed.length) return ctx.reply('❌ Only a team captain, VC or the host can use the Impact Player.');
+    if (allowed.length === 1) return impactPanel(ctx, m, f, allowed[0]);
+    const ta = await getTeam(m.id, 'A'), tb = await getTeam(m.id, 'B');
+    return ctx.reply('⚡ <b>IMPACT PLAYER</b>\nWhich team?', { parse_mode: 'HTML', ...Markup.inlineKeyboard([[tbtn(String(ta?.team_name || 'Team A').slice(0, 28), `imt:A:${ctx.from.id}`, 'primary')], [tbtn(String(tb?.team_name || 'Team B').slice(0, 28), `imt:B:${ctx.from.id}`, 'primary')]]) });
+  } catch (e) { console.error('impact:', e.message); ctx.reply('❌ ' + e.message); }
+});
+async function impactGuard(ctx, who) {
+  if (ctx.from.id !== Number(who) && !isAdmin(ctx.from.id)) { await ctx.answerCbQuery('This panel belongs to someone else. Send /impact.', { show_alert: true }); return null; }
+  const m = await getActiveMatch(ctx.chat.id);
+  if (!m || !['captains', 'toss', 'innings1', 'innings2'].includes(m.status)) { await ctx.answerCbQuery('No match in progress', { show_alert: true }); return null; }
+  const f = await impactCtx(m);
+  if (!f) { await ctx.answerCbQuery('Not a tournament match', { show_alert: true }); return null; }
+  return { m, f };
+}
+bot.action(/^imx:(\d+)$/, async (ctx) => { if (ctx.from.id !== Number(ctx.match[1]) && !isAdmin(ctx.from.id)) return ctx.answerCbQuery('Not your panel'); await ctx.answerCbQuery().catch(() => {}); try { await ctx.deleteMessage(); } catch (_) {} });
+bot.action(/^imt:(A|B):(\d+)$/, async (ctx) => {
+  try {
+    const g = await impactGuard(ctx, ctx.match[2]); if (!g) return;
+    const L = ctx.match[1];
+    if (!(await impactCanAct(ctx, g.m, g.f, L))) return ctx.answerCbQuery('You cannot act for this team.', { show_alert: true });
+    await ctx.answerCbQuery().catch(() => {});
+    try { await ctx.deleteMessage(); } catch (_) {}
+    return impactPanel(ctx, g.m, g.f, L);
+  } catch (e) { console.error('imt:', e.message); }
+});
+bot.action(/^imi:(A|B):(-?\d+):(\d+)$/, async (ctx) => {
+  try {
+    const g = await impactGuard(ctx, ctx.match[3]); if (!g) return;
+    const [, L, inS] = ctx.match;
+    if (!(await impactCanAct(ctx, g.m, g.f, L))) return ctx.answerCbQuery('You cannot act for this team.', { show_alert: true });
+    const { playing, bench } = await impactLists(g.m, g.f, L);
+    const inP = bench.find((p) => Number(p.telegram_id) === Number(inS));
+    if (!inP) return ctx.answerCbQuery('That player is no longer on the bench.', { show_alert: true });
+    const outs = await impactOutCandidates(g.m, L, playing);
+    if (!outs.length) return ctx.answerCbQuery('Nobody can go out: everyone has batted, bowled or is at the crease.', { show_alert: true });
+    await ctx.answerCbQuery().catch(() => {});
+    const rows = outs.map((p) => [tbtn(shortName(p, 28), `imo:${L}:${inS}:${p.telegram_id}:${ctx.from.id}`, 'danger')]);
+    rows.push([tbtn('Back', `imt:${L}:${ctx.from.id}`, 'primary'), tbtn('Close', `imx:${ctx.from.id}`, 'danger')]);
+    return ctx.editMessageText(`⚡ <b>IMPACT PLAYER</b>\nIN: <b>${escapeHtml(tName(inP))}</b>\nStep 2: choose the playing player going <b>OUT</b>.\n<i>Only players who have not batted or bowled yet, and are not at the crease, can go out.</i>`, { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }).catch(() => {});
+  } catch (e) { console.error('imi:', e.message); }
+});
+bot.action(/^imo:(A|B):(-?\d+):(-?\d+):(\d+)$/, async (ctx) => {
+  try {
+    const g = await impactGuard(ctx, ctx.match[4]); if (!g) return;
+    const [, L, inS, outS] = ctx.match;
+    if (!(await impactCanAct(ctx, g.m, g.f, L))) return ctx.answerCbQuery('You cannot act for this team.', { show_alert: true });
+    const { playing, bench } = await impactLists(g.m, g.f, L);
+    const inP = bench.find((p) => Number(p.telegram_id) === Number(inS));
+    const outP = (await impactOutCandidates(g.m, L, playing)).find((p) => Number(p.telegram_id) === Number(outS));
+    if (!inP || !outP) return ctx.answerCbQuery('The lists changed. Send /impact again.', { show_alert: true });
+    await ctx.answerCbQuery().catch(() => {});
+    return ctx.editMessageText(`⚡ <b>CONFIRM IMPACT PLAYER</b>\nIN: <b>${escapeHtml(tName(inP))}</b>\nOUT: <b>${escapeHtml(shortName(outP, 28))}</b>\n<i>Each team can do this only once in the match.</i>`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[btn('Confirm', `imc:${L}:${inS}:${outS}:${ctx.from.id}`, null, 'success'), btn('Cancel', `imx:${ctx.from.id}`, null, 'danger')]]) }).catch(() => {});
+  } catch (e) { console.error('imo:', e.message); }
+});
+bot.action(/^imc:(A|B):(-?\d+):(-?\d+):(\d+)$/, async (ctx) => {
+  try {
+    const g = await impactGuard(ctx, ctx.match[4]); if (!g) return;
+    const [, L, inS, outS] = ctx.match;
+    await impactInit();
+    if (!(await impactCanAct(ctx, g.m, g.f, L))) return ctx.answerCbQuery('You cannot act for this team.', { show_alert: true });
+    const { playing, bench } = await impactLists(g.m, g.f, L);
+    const inP = bench.find((p) => Number(p.telegram_id) === Number(inS));
+    const outP = (await impactOutCandidates(g.m, L, playing)).find((p) => Number(p.telegram_id) === Number(outS));
+    if (!inP || !outP) return ctx.answerCbQuery('The lists changed. Send /impact again.', { show_alert: true });
+    const ins = await q(`INSERT INTO impact_used (match_id, team_label, in_tg, out_tg) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING team_label`, [String(g.m.id), L, inP.telegram_id, outP.telegram_id]);
+    if (!ins.rows.length) return ctx.answerCbQuery('This team has already used its Impact Player.', { show_alert: true });
+    await q(`UPDATE match_players SET telegram_id=$2, username=$3, first_name=$4, last_name=NULL WHERE id=$1`, [outP.id, inP.telegram_id, inP.username || null, inP.name || null]);
+    await ctx.answerCbQuery('Impact Player done').catch(() => {});
+    const mt = await getTeam(g.m.id, L);
+    await ctx.editMessageText(`⚡ <b>IMPACT PLAYER</b> · ${escapeHtml(mt?.team_name || 'Team ' + L)}\n🔼 IN: <b>${escapeHtml(tName(inP))}</b>\n🔽 OUT: <b>${escapeHtml(shortName(outP, 28))}</b>`, { parse_mode: 'HTML' }).catch(() => {});
+    pickOffered.delete(g.m.id);
+    schedulePickOffer(ctx.chat.id);
+  } catch (e) { console.error('imc:', e.message); ctx.answerCbQuery('Error, try again').catch(() => {}); }
+});
 
 
 // ─── /call — a captain calls the whole team: one tag message in the group + a DM with a "Play Match" button ───
@@ -16209,7 +16456,7 @@ bot.action(/^ac:(\d+):(\w+):(\d+)$/, async (ctx) => {
 
 
 // ═════════════ r78: /changeover 10 | 15 | 20 — change the match overs while the match is live ═════════════
-const CO_OPTIONS = [10, 15, 20];
+const CO_OPTIONS = Array.from({ length: 20 }, (_, i) => i + 1); // 1..20 overs
 async function coApply(ctx, m, overs, viaButton) {
   const fail = (t) => (viaButton ? ctx.answerCbQuery(t, { show_alert: true }) : ctx.reply(t, { parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true }));
   if (!m || !['innings1', 'innings2'].includes(m.status)) return fail('The overs can be changed only while a match is being played.');
@@ -16220,7 +16467,7 @@ async function coApply(ctx, m, overs, viaButton) {
   if (overs === prev) return fail(`The match is already set to ${prev} overs.`);
   const inn = await getInnings(m.id);
   const doneNow = inn ? Math.ceil((inn.balls_bowled || 0) / 6) : 0;
-  if (overs <= doneNow) return fail(`${doneNow} overs are already bowled in this innings. Choose a higher number.`);
+  if (overs <= doneNow) return fail(`${doneNow} overs are already bowled in this innings. Choose ${doneNow + 1} or more.`);
   if (inn && inn.innings_number === 2) {
     const { rows } = await q(`SELECT balls_bowled FROM innings WHERE match_id=$1 AND innings_number=1`, [m.id]);
     const first = rows[0] ? Math.ceil((rows[0].balls_bowled || 0) / 6) : 0;
@@ -16249,16 +16496,27 @@ bot.command('changeover', async (ctx) => {
   if (!m) return ctx.reply('There is no active match in this group.');
   const n = parseInt(cmdArgs(ctx).split(/\s+/)[0], 10);
   if (n) {
-    if (!CO_OPTIONS.includes(n)) return ctx.reply(`Choose one of: ${CO_OPTIONS.join(' / ')} overs.`, { reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
+    if (!CO_OPTIONS.includes(n)) return ctx.reply('Choose a number of overs from 1 to 20.', { reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
     return coApply(ctx, m, n, false);
   }
   if (!(Number(m.host_telegram_id) === ctx.from.id || isAdmin(ctx.from.id))) return ctx.reply('Only the host can change the overs.', { reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
   const prev = Number(m.total_overs) || DEFAULT_OVERS;
-  return ctx.reply(`<b>CHANGEOVER</b>\nCurrent length: <b>${prev}</b> overs. Choose the new length:`, {
+  const inn0 = await getInnings(m.id);
+  const done0 = inn0 ? Math.ceil((inn0.balls_bowled || 0) / 6) : 0;
+  let min = done0 + 1;
+  if (inn0 && inn0.innings_number === 2) {
+    const { rows } = await q(`SELECT balls_bowled FROM innings WHERE match_id=$1 AND innings_number=1`, [m.id]);
+    min = Math.max(min, rows[0] ? Math.ceil((rows[0].balls_bowled || 0) / 6) : 0);
+  }
+  const opts = CO_OPTIONS.filter((o) => o >= min);
+  if (!opts.length) return ctx.reply(`${done0} overs are already bowled, so the match length cannot be changed any more.`, { reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
+  const rows = [];
+  for (let i = 0; i < opts.length; i += 5) rows.push(opts.slice(i, i + 5).map((o) => btn(String(o), `co:${m.id}:${o}`, null, o === prev ? 'primary' : 'success')));
+  return ctx.reply(`<b>CHANGEOVER</b>\nCurrent length: <b>${prev}</b> overs.${done0 ? ` ${done0} overs are already bowled, so the minimum is ${min}.` : ''}\nChoose the new length (only the host can change it):`, {
     parse_mode: 'HTML',
     reply_to_message_id: ctx.message?.message_id,
     allow_sending_without_reply: true,
-    reply_markup: Markup.inlineKeyboard([CO_OPTIONS.map((o) => btn(`${o} OVERS`, `co:${m.id}:${o}`, null, o === prev ? 'primary' : 'success'))]).reply_markup,
+    reply_markup: Markup.inlineKeyboard(rows).reply_markup,
   });
 });
 bot.action(/^co:(.+):(\d+)$/, async (ctx) => {
