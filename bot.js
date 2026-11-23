@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r136-2026-11-23-solo-lobby-2min'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r137-2026-11-23-captain-dup-guard'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -13890,6 +13890,14 @@ async function resolveUsers(ctx, text) {
   const missing = [...ids].filter((i) => !found.some((f) => f.id === i)).map(String).concat([...names].filter((n) => !found.some((f) => (f.username || '').toLowerCase() === n)).map((n) => '@' + n));
   return { found, missing };
 }
+// a person who already plays for another team (squad / VC) cannot become a captain; returns the reason, or null when it is fine
+async function captainBlock(t, u) {
+  const rows = await tourPlayers(t.id);
+  const mine = rows.find((r) => Number(r.telegram_id) === Number(u.id));
+  if (!mine || !mine.owner_id) return null;
+  const o = rows.find((r) => Number(r.telegram_id) === Number(mine.owner_id));
+  return `${u.name || 'This user'} already plays for ${o ? tm(o) : 'another team'}. Remove him from that team first.`;
+}
 async function addCaptain(t, u, teamName) {
   const ex = (await q(`SELECT team_no FROM tournament_players WHERE tid=$1 AND telegram_id=$2`, [t.id, u.id])).rows[0];
   const no = (ex && ex.team_no) || (await q(`SELECT COALESCE(MAX(team_no),0)::int+1 AS n FROM tournament_players WHERE tid=$1`, [t.id])).rows[0].n;
@@ -13914,7 +13922,7 @@ async function handleSetupText(ctx, st, text) {
     const have = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='captain'`, [t.id])).rows[0].c;
     const out = [];
     let n = have;
-    for (const u of found) { if (n >= 8) { out.push('Maximum 8 captains.'); break; } await addCaptain(t, u); n++; out.push(`👑 ${escapeHtml(u.name)} is a captain`); }
+    for (const u of found) { if (n >= 8) { out.push('Maximum 8 captains.'); break; } const blk = await captainBlock(t, u); if (blk) { out.push(escapeHtml(blk)); continue; } await addCaptain(t, u); n++; out.push(`👑 ${escapeHtml(u.name)} is a captain`); }
     if (missing.length) out.push(`Not found (they must start this bot first): ${escapeHtml(missing.join(', '))}`);
     if (!found.length && !missing.length) out.push('I could not read any ID or @username. Send them again.');
     if (n >= 2) {
@@ -13969,6 +13977,8 @@ async function registerCaptain(t, u) {
   if (ex.rows.length && ex.rows[0].role === 'captain') return { ok: false, msg: 'You are already a captain.' };
   const n = (await q(`SELECT COUNT(*)::int AS c FROM tournament_players WHERE tid=$1 AND role='captain'`, [t.id])).rows[0].c;
   if (n >= 8) return { ok: false, msg: 'There are already 8 captains.' };
+  const blk = await captainBlock(t, { id: u.id, name: fullName(u) });
+  if (blk) return { ok: false, msg: blk };
   await addCaptain(t, { id: u.id, name: fullName(u), username: u.username });
   return { ok: true, n: n + 1, msg: `👑 ${tTag({ telegram_id: u.id, name: fullName(u), username: u.username })} is a captain. Captains so far: <b>${n + 1}</b>` };
 }
@@ -14024,7 +14034,7 @@ bot.command(['addcaptain', 'addcap'], async (ctx) => {
   }
   if (!found.length && !missing.length) return ctx.reply('Usage: /addcaptain @user  (or reply to a user, or send a user ID)', trep(ctx));
   const out = [];
-  for (const u of found) { await addCaptain(t, u); out.push(`👑 ${escapeHtml(u.name)} is a captain`); }
+  for (const u of found) { const blk = await captainBlock(t, u); if (blk) { out.push(escapeHtml(blk)); continue; } await addCaptain(t, u); out.push(`👑 ${escapeHtml(u.name)} is a captain`); }
   if (missing.length) out.push(`Not found (they must start this bot first): ${escapeHtml(missing.join(', '))}`);
   return ctx.reply(out.join('\n'), trep(ctx));
 });
