@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r137-2026-11-23-captain-dup-guard'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r138-2026-11-23-lastball-wicket-strike'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -8202,6 +8202,11 @@ async function resolveBall(telegram, m, inn, pend, batNum, batMsgId) {
         const tmp = newStriker;
         newStriker = newNon;
         newNon = tmp;
+      } else if (!isSolo && endOver && isWicket && nonId) {
+        // wicket on the last ball of the over: the new batsman takes the dismissed batsman's end, then the ends change for the new over,
+        // so the batsman who was at the non-striker's end faces the first ball and the new batsman stands at the non-striker's end
+        newStriker = nonId;
+        newNon = null;
       }
 
       // Solo: new bowler every 3 balls; team: clear on over end
