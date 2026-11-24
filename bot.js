@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r138-2026-11-23-lastball-wicket-strike'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r143-2026-11-24-pickclock-firstfree'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -4270,8 +4270,17 @@ bot.command('add', (ctx) => addPlayers(ctx, 'A', true));
 async function tourRemoveByNo(ctx) {
   try {
     const tk = takeTid(cmdArgs(ctx));
-    const mm = /^(\d{1,2})\s+(.+)$/s.exec(String(tk.rest || '').trim());
-    if (!mm) return false;
+    let mm = /^(\d{1,2})\s+(.+)$/s.exec(String(tk.rest || '').trim());
+    let byUser = null;
+    if (!mm) {
+      // /remove <team name> <@user | id>
+      const w = String(tk.rest || '').trim().split(/\s+/);
+      if (w.length < 2) return false;
+      const last = w[w.length - 1];
+      if (!/^@?\w+$/.test(last)) return false;
+      byUser = last.replace(/^@/, '').toLowerCase();
+      mm = [null, '0', w.slice(0, -1).join(' ')];
+    }
     let t;
     if (tk.tid) {
       t = (await q(`SELECT * FROM tournaments WHERE id=$1 AND status NOT IN ('cancelled','done')`, [tk.tid])).rows[0];
@@ -4283,12 +4292,20 @@ async function tourRemoveByNo(ctx) {
     }
     if (!(await canManageTour(ctx, t))) { await ctx.reply('Only the tournament host or a group admin can remove squad players.', trep(ctx)); return true; }
     const cap = await findTeam(t, mm[2].trim());
+    if (!cap && byUser) return false;
     if (!cap) { await ctx.reply(`Team not found. Usage: /remove &lt;player no&gt; &lt;team name or team no&gt;, for example /remove 1 Delhi`, trep(ctx)); return true; }
     if (t.tmode !== 'manual' && tourAuc.has(String(t.id))) { await ctx.reply(`${pe('warn')} The auction is running. Remove players after it ends.`, trep(ctx)); return true; }
     const rows = await tourPlayers(t.id);
     const mine = rows.filter((p) => p.role !== 'captain' && Number(p.owner_id) === Number(cap.telegram_id));
-    const no = Number(mm[1]);
-    const row = mine[no - 1];
+    let no = Number(mm[1]);
+    let row = mine[no - 1];
+    if (byUser) {
+      row = rows.find((p) => (String(p.telegram_id) === byUser || String(p.username || '').toLowerCase() === byUser) && p.role === 'captain' && Number(p.telegram_id) === Number(cap.telegram_id));
+      if (row) { await ctx.reply(`That player is the captain of <b>${escapeHtml(tm(cap))}</b>. To replace him use /cap ${escapeHtml(tm(cap))} &lt;new captain&gt;, to delete the whole team use /removeteam ${escapeHtml(tm(cap))}.`, trep(ctx)); return true; }
+      row = mine.find((p) => String(p.telegram_id) === byUser || String(p.username || '').toLowerCase() === byUser);
+      no = mine.indexOf(row) + 1;
+      if (!row) { await ctx.reply(`That player is not in the squad of <b>${escapeHtml(tm(cap))}</b>.`, trep(ctx)); return true; }
+    }
     if (!row) { await ctx.reply(`<b>${escapeHtml(tm(cap))}</b> has ${mine.length} player${mine.length === 1 ? '' : 's'} in the squad list, so number ${no} does not exist. Check /squad ${escapeHtml(tm(cap))}.`, trep(ctx)); return true; }
     await q(`UPDATE tournament_players SET vc_id=NULL WHERE tid=$1 AND telegram_id=$2 AND vc_id=$3`, [t.id, cap.telegram_id, row.telegram_id]);
     if (t.tmode === 'manual') {
@@ -4447,9 +4464,9 @@ async function promptMissing(m) {
     if (!inn) return;
     const gid = Number(m.group_chat_id);
     if (!inn.striker_player_id)
-      await bot.telegram.sendMessage(gid, `👑 ${await capTagOf(m, inn.batting_team)} — send your *new batsman*: /bat <no.>`, { parse_mode: 'Markdown' });
+      { await bot.telegram.sendMessage(gid, `👑 ${await capTagOf(m, inn.batting_team)} — send your *new batsman*: /bat <no.>`, { parse_mode: 'Markdown' }); armPickClock(m.id, 'bat').catch(() => {}); }
     if (!inn.current_bowler_id && inn.ball_state === 'idle' && (inn.balls_bowled === 0 || inn.balls_bowled % 6 !== 0))
-      await bot.telegram.sendMessage(gid, `👑 ${await capTagOf(m, inn.bowling_team)} — send your *new bowler*: /ball <no.>`, { parse_mode: 'Markdown' });
+      { await bot.telegram.sendMessage(gid, `👑 ${await capTagOf(m, inn.bowling_team)} — send your *new bowler*: /ball <no.>`, { parse_mode: 'Markdown' }); armPickClock(m.id, 'bowl').catch(() => {}); }
   } catch (e) { console.error('promptMissing:', e.message); }
 }
 // after a manual removal: keep the game alive (solo: re-pick batsman/bowler, or end if too few left)
@@ -4844,6 +4861,46 @@ async function cancelMatchNow(m, telegram = null) {
     }
   }
 }
+
+// /restore — reply to the "CricMonster_Match_<id>.txt" file (or the latest ended match of this group) to reopen a match that ended by mistake
+bot.command('restore', async (ctx) => {
+  if (!isGroup(ctx)) return ctx.reply('Use /restore in the match group, as a reply to the match data file.');
+  try {
+    const chatId = ctx.chat.id;
+    const rep = ctx.message && ctx.message.reply_to_message;
+    let mid = null;
+    const fn = rep && rep.document && rep.document.file_name;
+    const fm = fn && /Match_([0-9a-fA-F-]+)\.txt$/.exec(fn);
+    if (fm) mid = fm[1];
+    let m = null;
+    if (mid) m = (await q(`SELECT * FROM matches WHERE id::text=$1`, [mid])).rows[0];
+    else m = (await q(`SELECT * FROM matches WHERE group_chat_id=$1 AND status IN ('completed','cancelled') ORDER BY COALESCE(completed_at, created_at) DESC LIMIT 1`, [chatId])).rows[0];
+    if (!m) return ctx.reply('No finished match found. Reply to the match data file with /restore.');
+    if (Number(m.group_chat_id) !== Number(chatId)) return ctx.reply('That match file belongs to another group.');
+    const allowed = Number(m.host_telegram_id) === ctx.from.id || isAdmin(ctx.from.id) || (await isGroupAdmin(chatId, ctx.from.id));
+    if (!allowed) return ctx.reply('Only the match host or a group admin can restore a match.');
+    if (!['completed', 'cancelled'].includes(m.status)) return ctx.reply('That match is still running, nothing to restore.');
+    if (await getActiveMatch(chatId)) return ctx.reply('Another match is running in this group. End it first, then use /restore.');
+    const { rows: inns } = await q(`SELECT * FROM innings WHERE match_id=$1 ORDER BY innings_number DESC LIMIT 1`, [m.id]);
+    const inn = inns[0];
+    if (!inn) return ctx.reply('This match has no innings to restore (it ended before the first ball).');
+    const n = Number(inn.innings_number);
+    await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE match_id=$1 AND is_resolved=FALSE`, [m.id]);
+    await q(`UPDATE innings SET is_completed=FALSE, ball_state='idle' WHERE id=$1`, [inn.id]);
+    await q(`UPDATE matches SET status=$2, current_innings=$3, winner_team=NULL, completed_at=NULL WHERE id=$1`, [m.id, n >= 2 ? 'innings2' : 'innings1', n]);
+    await q(`DELETE FROM match_awards WHERE match_id=$1`, [String(m.id)]).catch(() => {});
+    await q(`UPDATE tour_fixtures SET status='pending', winner=NULL WHERE match_id=$1 AND status='done'`, [m.id]).catch(() => {});
+    touchMatch(m.id);
+    const m2 = await getMatch(m.id);
+    await ctx.reply(`✅ *Match restored.*\n> Innings ${n}: *${inn.total_runs}/${inn.total_wickets}* (${oversStr(inn.balls_bowled)} ov)\n> The game continues from here.`, { parse_mode: 'Markdown' });
+    try { startIdleWatch(m.id, [m2.status, m2.setup_phase || '', 0, 0].join('|')); } catch (_) {}
+    await promptMissing(m2);
+    await ensureTurnClock(m.id);
+  } catch (e) {
+    console.error('restore:', e.message);
+    ctx.reply('Could not restore the match: ' + String(e.message || e).slice(0, 120)).catch(() => {});
+  }
+});
 
 bot.command('endmatch', async (ctx) => {
   if (!isGroupOrDm(ctx)) return;
@@ -10786,19 +10843,75 @@ async function sendOverEnd(telegram, m, inn, finalOver = false) {
   const groupId = Number(m.group_chat_id);
   const overNo = Math.floor((inn.balls_bowled - 1) / 6) + 1;
   const ovSum = await overSummary(m.id, inn);
-  const tag = finalOver ? '' : `\n👑 ${await capTagOf(m, inn.bowling_team)} — please send your *new bowler*: /ball <no.>`;
-  const caption = `🔔 *Over ${overNo} complete!*\n${ovSum}${tag}`;
+  const caption = `🔔 *Over ${overNo} complete!*\n${ovSum}`;
+  let sent = false;
   try {
     const img = await renderOverGraph(m, inn);
     if (img) {
       await telegram.sendPhoto(groupId, { source: img }, { caption, parse_mode: 'Markdown' });
-      return;
+      sent = true;
     }
   } catch (e) {
     console.error('over graph failed:', e.message);
     reportCardError('Over graph', e).catch(() => {});
   }
-  await telegram.sendMessage(groupId, caption, { parse_mode: 'Markdown' });
+  if (!sent) await telegram.sendMessage(groupId, caption, { parse_mode: 'Markdown' }).catch(() => telegram.sendMessage(groupId, stripPe(caption.replace(/\*/g, ''))).catch(() => {}));
+  // separate message: tag the bowling captain to send the new bowler
+  if (!finalOver && m.mode !== 'solo') {
+    try {
+      const capTag = await capTagOf(m, inn.bowling_team);
+      await telegram.sendMessage(groupId, `🎳 *Over ${overNo} is done.*\n👑 ${capTag} — please choose your *new bowler* for the next over: /ball <no.>`, { parse_mode: 'Markdown' });
+      armPickClock(m.id, 'bowl').catch(() => {});
+    } catch (e) { console.error('over-end tag failed:', e.message); }
+  }
+}
+
+// Selection clock: while a captain still has to pick a batsman/bowler (team matches).
+// Warnings at start, 60s, 30s, 10s. On time-up: -TURN_PENALTY runs (same as a batsman) and the next limit is 10s shorter (min 30s).
+const pickClocks = new Map();
+const pickMiss = new Map(); // matchId|kind -> time-ups so far
+const PICK_SECONDS = { bowl: 180, bat: 60 };
+const PICK_MAX_MISS = 4; // 1st time-up is only a warning, then 3 penalties
+async function armPickClock(matchId, kind) {
+  const k = mkey(matchId);
+  const old = pickClocks.get(k);
+  if (old) old.t.forEach(clearTimeout);
+  const missN = pickMiss.get(k + kind) || 0;
+  const base = Math.max(30, PICK_SECONDS[kind] - 10 * Math.max(0, missN - 1));
+  const missing = async () => {
+    const m = await getMatch(matchId);
+    if (!m || !['innings1', 'innings2'].includes(m.status)) return null;
+    const inn = await getInnings(matchId);
+    if (!inn) return null;
+    const need = kind === 'bat' ? !inn.striker_player_id : !inn.current_bowler_id && inn.ball_state === 'idle';
+    return need ? { m, inn } : null;
+  };
+  const what = kind === 'bat' ? 'new batsman: /bat <no.>' : 'new bowler: /ball <no.>';
+  const mk = (left) => setTimeout(async () => {
+    try {
+      const x = await missing();
+      if (!x) { pickMiss.delete(k + kind); return; }
+      const team = kind === 'bat' ? x.inn.batting_team : x.inn.bowling_team;
+      const tag = await capTagOf(x.m, team);
+      const gid = Number(x.m.group_chat_id);
+      if (left > 0) {
+        await bot.telegram.sendMessage(gid, `⚠️ *${left}s left!*\n👑 ${tag} — send your *${what}*`, { parse_mode: 'Markdown' });
+        return;
+      }
+      const n = (pickMiss.get(k + kind) || 0) + 1;
+      pickMiss.set(k + kind, n);
+      const pen = n >= 2;
+      if (pen) await applyTeamPenalty(x.m, team);
+      const next = Math.max(30, PICK_SECONDS[kind] - 10 * Math.max(0, n - 1));
+      await bot.telegram.sendMessage(gid,
+        `⏰ *TIME UP*\n> ${tag} did not choose within ${base}s.\n${pen ? `> 💥 Penalty: *-${TURN_PENALTY} runs* for Team ${team}  (warning ${n - 1}/${PICK_MAX_MISS - 1})\n` : `> ⚠️ First warning, no penalty this time. Next time-up costs *-${TURN_PENALTY} runs*.\n`}` +
+        (n < PICK_MAX_MISS ? `> 👉 Send your *${what}* (${next}s)` : `> The match is waiting. Send your *${what}* right now.`),
+        { parse_mode: 'Markdown' });
+      if (n < PICK_MAX_MISS) armPickClock(matchId, kind).catch(() => {});
+    } catch (e) { console.error('pick clock:', e.message); }
+  }, (base - left) * 1000);
+  const marks = [...new Set([base, 60, 30, 10].filter((x) => x <= base))];
+  pickClocks.set(k, { t: [...marks.map(mk), mk(0)] });
 }
 
 // ── partnership ──
@@ -16123,11 +16236,11 @@ manCmd('cap', async (ctx) => {
   const rows = await tourPlayers(t.id);
   const mine = rows.find((r) => Number(r.telegram_id) === u.id);
   if (mine && mine.role === 'captain') return ctx.reply(`${escapeHtml(u.name)} is already the captain of <b>${escapeHtml(tm(mine))}</b>.`, trep(ctx));
-  if (mine && mine.owner_id) {
+  const old = await findTeam(t, team);
+  if (mine && mine.owner_id && !(old && Number(mine.owner_id) === Number(old.telegram_id))) {
     const o = rows.find((r) => Number(r.telegram_id) === Number(mine.owner_id));
     return ctx.reply(`${escapeHtml(u.name)} is already a player in <b>${escapeHtml(o ? tm(o) : 'another team')}</b>. Remove him from that team first.`, trep(ctx));
   }
-  const old = await findTeam(t, team);
   const caps = rows.filter((r) => r.role === 'captain');
   if (!old) {
     if (caps.length >= 32) return ctx.reply('Maximum 32 teams.', trep(ctx));
