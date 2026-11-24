@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r143-2026-11-24-pickclock-firstfree'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r145-2026-11-24-cap-selfowner-fix'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -4314,7 +4314,7 @@ async function tourRemoveByNo(ctx) {
       return true;
     }
     const refund = Number(row.price || 0);
-    await q(`UPDATE tournament_players SET owner_id=NULL, price=NULL, state=NULL WHERE tid=$1 AND telegram_id=$2`, [t.id, row.telegram_id]);
+    await q(`UPDATE tournament_players SET owner_id=NULL, price=NULL, state='registered' WHERE tid=$1 AND telegram_id=$2`, [t.id, row.telegram_id]);
     const newPurse = await setPurse(t, cap, Number(cap.purse ?? t.purse) + refund);
     await ctx.reply(`${pe('ok')} <b>${escapeHtml(tName(row))}</b> left <b>${escapeHtml(tm(cap))}</b>.\nRefunded <b>${refund} CM</b>, purse is now <b>${newPurse} CM</b>. He is back in the pool for /unsold.`, trep(ctx));
     return true;
@@ -15358,7 +15358,7 @@ bot.command(['removeplayer', 'remplayer'], async (ctx) => {
   const row = (await tourPlayers(t.id)).find((r) => Number(r.telegram_id) === id && Number(r.owner_id) === Number(cap.telegram_id));
   if (!row) return ctx.reply(`${pe('no')} That player is not in ${escapeHtml(tm(cap))}.`, trep(ctx));
   const refund = Number(row.price || 0);
-  await q(`UPDATE tournament_players SET owner_id=NULL, price=NULL, state=NULL WHERE tid=$1 AND telegram_id=$2`, [t.id, id]);
+  await q(`UPDATE tournament_players SET owner_id=NULL, price=NULL, state='registered' WHERE tid=$1 AND telegram_id=$2`, [t.id, id]);
   await q(`UPDATE tournament_players SET vc_id=NULL WHERE tid=$1 AND telegram_id=$2 AND vc_id=$3`, [t.id, cap.telegram_id, id]);
   const newPurse = await setPurse(t, cap, Number(cap.purse ?? t.purse) + refund);
   return ctx.reply(`${pe('ok')} <b>${escapeHtml(tName(row))}</b> left <b>${escapeHtml(tm(cap))}</b>.\nRefunded <b>${refund} CM</b>, purse is now <b>${newPurse} CM</b>. He is back in the pool for /unsold.`, trep(ctx));
@@ -15419,7 +15419,7 @@ bot.action(/^rtm:([yn]):(\d+):(-?\d+):(\d+)$/, async (ctx) => {
     const used = (await q(`SELECT 1 FROM tour_fixtures WHERE tid=$1 AND (t1=$2 OR t2=$2) LIMIT 1`, [t.id, capId])).rows.length;
     if (used) return ctx.answerCbQuery('This team has fixtures now', { show_alert: true });
     if (t.tmode === 'manual') await q(`DELETE FROM tournament_players WHERE tid=$1 AND owner_id=$2 AND role='player'`, [t.id, capId]);
-    else await q(`UPDATE tournament_players SET owner_id=NULL, price=NULL, state=NULL WHERE tid=$1 AND owner_id=$2`, [t.id, capId]);
+    else await q(`UPDATE tournament_players SET owner_id=NULL, price=NULL, state='registered' WHERE tid=$1 AND owner_id=$2`, [t.id, capId]);
     await q(`DELETE FROM tournament_players WHERE tid=$1 AND telegram_id=$2 AND role='captain'`, [t.id, capId]);
     await renumberTeams(t.id);
     await ctx.answerCbQuery('Team removed').catch(() => {});
@@ -16237,7 +16237,7 @@ manCmd('cap', async (ctx) => {
   const mine = rows.find((r) => Number(r.telegram_id) === u.id);
   if (mine && mine.role === 'captain') return ctx.reply(`${escapeHtml(u.name)} is already the captain of <b>${escapeHtml(tm(mine))}</b>.`, trep(ctx));
   const old = await findTeam(t, team);
-  if (mine && mine.owner_id && !(old && Number(mine.owner_id) === Number(old.telegram_id))) {
+  if (mine && mine.owner_id && Number(mine.owner_id) !== u.id && !(old && Number(mine.owner_id) === Number(old.telegram_id))) {
     const o = rows.find((r) => Number(r.telegram_id) === Number(mine.owner_id));
     return ctx.reply(`${escapeHtml(u.name)} is already a player in <b>${escapeHtml(o ? tm(o) : 'another team')}</b>. Remove him from that team first.`, trep(ctx));
   }
@@ -16250,8 +16250,8 @@ manCmd('cap', async (ctx) => {
   const used = (await q(`SELECT 1 FROM tour_fixtures WHERE tid=$1 AND (t1=$2 OR t2=$2) LIMIT 1`, [t.id, old.telegram_id])).rows.length;
   if (used) return ctx.reply('This team already has fixtures, so its captain cannot be changed now.', trep(ctx));
   await ensurePlayerRow(t, u);
-  await q(`UPDATE tournament_players SET owner_id=$3 WHERE tid=$1 AND owner_id=$2`, [t.id, old.telegram_id, u.id]);
-  await q(`UPDATE tournament_players SET role='captain', team_no=$3, team_name=$4, logo_id=$5, grp=$6, vc_id=$7, purse=$8, owner_id=NULL, price=NULL, state=NULL WHERE tid=$1 AND telegram_id=$2`,
+  await q(`UPDATE tournament_players SET owner_id=$3 WHERE tid=$1 AND owner_id=$2 AND telegram_id<>$3`, [t.id, old.telegram_id, u.id]);
+  await q(`UPDATE tournament_players SET role='captain', team_no=$3, team_name=$4, logo_id=$5, grp=$6, vc_id=$7, purse=$8, owner_id=NULL, price=NULL, state='registered' WHERE tid=$1 AND telegram_id=$2`,
     [t.id, u.id, old.team_no, old.team_name, old.logo_id, old.grp, old.vc_id, old.purse]);
   await q(`UPDATE tournament_players SET role='player', owner_id=$3, price=0, state='sold', team_no=NULL, team_name=NULL, logo_id=NULL, grp=NULL, vc_id=NULL, purse=NULL WHERE tid=$1 AND telegram_id=$2`, [t.id, old.telegram_id, u.id]);
   return ctx.reply(`👑 <b>${escapeHtml(u.name)}</b> is now the captain of <b>${escapeHtml(tm(old))}</b>. ${escapeHtml(tName(old))} stays in the squad.`, trep(ctx));
@@ -16261,7 +16261,7 @@ manCmd('vc', async (ctx) => {
   const { team, rest } = splitTeamArgs(manArgs(ctx));
   if (!team || !rest) return ctx.reply('Usage: /vc &lt;team name&gt; &lt;player id or @user&gt;', trep(ctx));
   const cap = await findTeam(t, team);
-  if (!cap) return ctx.reply('Team not found. Create it first with /cap <team name> <captain id>', trep(ctx));
+  if (!cap) return ctx.reply('Team not found. Create it first with /cap &lt;team name&gt; &lt;captain id&gt;', trep(ctx));
   const { found, missing } = await resolveUsers(ctx, rest);
   if (!found.length) return ctx.reply(`I do not know ${escapeHtml(missing.join(', ') || 'that player')}. They must start this bot once first.`, trep(ctx));
   const u = found[0];
@@ -16282,7 +16282,7 @@ manCmd(['sq', 'squadadd', 'addsq'], async (ctx) => {
   const { team, rest } = splitTeamArgs(manArgs(ctx));
   if (!team) return ctx.reply('Usage: /sq &lt;team name&gt; &lt;id or @user ...&gt;\nTo see a squad: /sq &lt;team name&gt;', trep(ctx));
   const cap = await findTeam(t, team);
-  if (!cap) return ctx.reply('Team not found. Create it with /cap <team name> <captain id>', trep(ctx));
+  if (!cap) return ctx.reply('Team not found. Create it with /cap &lt;team name&gt; &lt;captain id&gt;', trep(ctx));
   const rows = await tourPlayers(t.id);
   const listSq = () => rows.filter((r) => Number(r.owner_id) === Number(cap.telegram_id));
   if (!rest) {
