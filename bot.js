@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r145-2026-11-24-cap-selfowner-fix'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r148-2026-11-26-retired-label-sqplayer'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -1779,7 +1779,7 @@ async function scoreboardRich(matchId) {
       .filter((x) => x.r || (striker && x.p.id === striker.id))
       .sort((a, b) => (b.r?.runs || 0) - (a.r?.runs || 0))
       .slice(0, 10)
-      .map(({ p, r }) => [(striker && p.id === striker.id ? '🏃 ' : r?.is_out ? '❌ ' : '') + richName(p), bat(r)]);
+      .map(({ p, r }) => [(striker && p.id === striker.id ? '🏃 ' : r?.is_out ? '❌ ' : '') + richName(p) + retTag(r), bat(r)]);
     if (rows.length) h += richTable(['Player', 'Score'], rows);
     if (bowler) h += `<p>🎳 <b>${richName(bowler)}</b></p>`;
     h += `<p>⏱ ${TURN_SECONDS}s · bowl 1–6 in DM · bat 0–6 here</p>`;
@@ -1832,7 +1832,7 @@ async function scoreboardRich(matchId) {
     const isStr = striker && p.id === striker.id;
     const isNon = non && p.id === non.id;
     if (!r && !isStr && !isNon) continue;
-    batRows.push([(isStr ? '🏃 ' : isNon ? '🏏 ' : r?.is_out ? '❌ ' : '') + richName(p), bat(r)]);
+    batRows.push([(isStr ? '🏃 ' : isNon ? '🏏 ' : r?.is_out ? '❌ ' : '') + richName(p) + retTag(r), bat(r)]);
   }
   if (batRows.length) h += richTable([`Team ${inn.batting_team} batting`, 'Score'], batRows);
   if (!striker) h += `<p>⏳ batting captain: /bat &lt;no.&gt;</p>`;
@@ -2159,7 +2159,7 @@ async function scoreboard(matchId) {
     );
     if (bsr.length) {
       const rowsT = bsr.map((r) => [
-        tblName(r) + (striker && r.player_id === striker.id ? '*' : r.is_out ? '-' : ''),
+        tblName(r) + (striker && r.player_id === striker.id ? '*' : r.is_out ? '-' : '') + retTag(r),
         `${r.runs || 0}(${r.balls_faced || 0})`,
         `${r.fours || 0}/${r.sixes || 0}`,
         r.balls_faced > 0 ? ((r.runs * 100) / r.balls_faced).toFixed(1) : '0.0',
@@ -2185,7 +2185,7 @@ async function scoreboard(matchId) {
       else if (s && (s.balls_faced || 0) > 0) icon = '✅';
 
       const runs = s ? `${s.runs || 0}(${s.balls_faced || 0})` : '—';
-      t += `│ ${icon} ${p.roster_position}. ${mn(p)}  ${runs}\n`;
+      t += `│ ${icon} ${p.roster_position}. ${mn(p)}  ${runs}${retTag(s)}\n`;
     }
     t += `└${'─'.repeat(20)}┘\n`;
 
@@ -2282,7 +2282,7 @@ async function teamScoreboard(match, inn) {
     const runs = r?.runs || 0;
     const balls = r?.balls_faced || 0;
     batRows.push([
-      tblName(p) + (isStr ? '*' : r?.is_out ? '-' : ''),
+      tblName(p) + (isStr ? '*' : r?.is_out ? '-' : '') + retTag(r),
       `${runs}(${balls})`,
       `${r?.fours || 0}/${r?.sixes || 0}`,
       balls > 0 ? ((runs * 100) / balls).toFixed(1) : '0.0',
@@ -4046,6 +4046,7 @@ async function joinTeam(ctx, label) {
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [m.id, ctx.from.id, label, rows[0].n, ctx.from.username || null, ctx.from.first_name || null, ctx.from.last_name || null]
     );
+    if (['innings1', 'innings2'].includes(m.status)) logEv(m.id, 'added', `ADDED: ${evName({ first_name: ctx.from.first_name, last_name: ctx.from.last_name, username: ctx.from.username, telegram_id: ctx.from.id })} joined Team ${label} (#${rows[0].n}) during the match.`);
     await upsertUser(ctx.from);
 
     await ctx.reply(
@@ -4249,6 +4250,7 @@ bot.action(/^inv:(Y|N):(.+)$/, async (ctx) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [m.id, inv.user.id, inv.label, rows[0].n, inv.user.username || null, inv.user.first_name || null, inv.user.last_name || null]
     );
+    if (['innings1', 'innings2'].includes(m.status)) logEv(m.id, 'added', `ADDED: ${evName({ first_name: inv.user.first_name, last_name: inv.user.last_name, username: inv.user.username, telegram_id: inv.user.id })} joined Team ${inv.label} (#${rows[0].n}) during the match.`);
     await upsertUser({ id: inv.user.id, username: inv.user.username, first_name: inv.user.first_name }).catch(() => {});
     await ctx.answerCbQuery('You joined!');
     await editCard(
@@ -4297,8 +4299,10 @@ async function tourRemoveByNo(ctx) {
     if (t.tmode !== 'manual' && tourAuc.has(String(t.id))) { await ctx.reply(`${pe('warn')} The auction is running. Remove players after it ends.`, trep(ctx)); return true; }
     const rows = await tourPlayers(t.id);
     const mine = rows.filter((p) => p.role !== 'captain' && Number(p.owner_id) === Number(cap.telegram_id));
+    // numbers follow the squad list: the vice captain is shown separately and is not numbered
+    const numbered = mine.filter((p) => !cap.vc_id || Number(p.telegram_id) !== Number(cap.vc_id));
     let no = Number(mm[1]);
-    let row = mine[no - 1];
+    let row = numbered[no - 1];
     if (byUser) {
       row = rows.find((p) => (String(p.telegram_id) === byUser || String(p.username || '').toLowerCase() === byUser) && p.role === 'captain' && Number(p.telegram_id) === Number(cap.telegram_id));
       if (row) { await ctx.reply(`That player is the captain of <b>${escapeHtml(tm(cap))}</b>. To replace him use /cap ${escapeHtml(tm(cap))} &lt;new captain&gt;, to delete the whole team use /removeteam ${escapeHtml(tm(cap))}.`, trep(ctx)); return true; }
@@ -4306,7 +4310,7 @@ async function tourRemoveByNo(ctx) {
       no = mine.indexOf(row) + 1;
       if (!row) { await ctx.reply(`That player is not in the squad of <b>${escapeHtml(tm(cap))}</b>.`, trep(ctx)); return true; }
     }
-    if (!row) { await ctx.reply(`<b>${escapeHtml(tm(cap))}</b> has ${mine.length} player${mine.length === 1 ? '' : 's'} in the squad list, so number ${no} does not exist. Check /squad ${escapeHtml(tm(cap))}.`, trep(ctx)); return true; }
+    if (!row) { await ctx.reply(`<b>${escapeHtml(tm(cap))}</b> has ${numbered.length} numbered player${numbered.length === 1 ? '' : 's'} in the squad list, so number ${no} does not exist. Check /squad ${escapeHtml(tm(cap))}.`, trep(ctx)); return true; }
     await q(`UPDATE tournament_players SET vc_id=NULL WHERE tid=$1 AND telegram_id=$2 AND vc_id=$3`, [t.id, cap.telegram_id, row.telegram_id]);
     if (t.tmode === 'manual') {
       await q(`DELETE FROM tournament_players WHERE tid=$1 AND telegram_id=$2 AND owner_id=$3 AND role='player'`, [t.id, row.telegram_id, cap.telegram_id]);
@@ -4435,7 +4439,32 @@ async function renumberRoster(matchId, label) {
   }
 }
 // delete one match player; #4 becomes #3 when #3 leaves
+function retTag(r) { return r && r.is_out && /retired/i.test(String(r.dismissal_type || '')) ? ' (retired out)' : ''; }
+const evName = (p) => String(([p.first_name, p.last_name].filter(Boolean).join(' ').trim()) || (p.username ? '@' + p.username : p.telegram_id || 'Player')).slice(0, 40);
+async function logEv(matchId, kind, text) {
+  try {
+    const { rows } = await q(`SELECT innings_number, balls_bowled FROM innings WHERE match_id=$1 ORDER BY innings_number DESC LIMIT 1`, [matchId]);
+    const i = rows[0];
+    await q(`INSERT INTO match_events (match_id, innings_no, ov, kind, text) VALUES ($1,$2,$3,$4,$5)`,
+      [String(matchId), i ? i.innings_number : null, i ? `${Math.floor(i.balls_bowled / 6)}.${i.balls_bowled % 6}` : null, kind, String(text).slice(0, 600)]);
+  } catch (e) { console.error('logEv:', e.message); }
+}
+async function playerSnap(p) {
+  try {
+    const b = (await q(`SELECT i.innings_number, bs.runs, bs.balls_faced, bs.is_out FROM batting_stats bs JOIN innings i ON i.id=bs.innings_id WHERE bs.player_id=$1 ORDER BY i.innings_number`, [p.id])).rows;
+    const w = (await q(`SELECT i.innings_number, ws.balls_bowled, ws.runs_conceded, ws.wickets FROM bowling_stats ws JOIN innings i ON i.id=ws.innings_id WHERE ws.player_id=$1 ORDER BY i.innings_number`, [p.id])).rows;
+    const parts = [];
+    for (const r of b) parts.push(`Batting (innings ${r.innings_number}): ${r.runs} runs off ${r.balls_faced} balls${r.is_out ? ', out' : ''}.`);
+    for (const r of w) parts.push(`Bowling (innings ${r.innings_number}): ${oversStr(r.balls_bowled)} ov, ${r.runs_conceded} runs, ${r.wickets} wickets.`);
+    return parts.length ? parts.join(' ') : 'Had not batted or bowled yet.';
+  } catch (_) { return ''; }
+}
 async function delMatchPlayer(pl) {
+  try {
+    const mm = await getMatch(pl.match_id);
+    if (mm && ['innings1', 'innings2'].includes(mm.status))
+      await logEv(pl.match_id, 'removed', `REMOVED: ${evName(pl)} (Team ${pl.team_label}) was removed from the match. ${await playerSnap(pl)}`);
+  } catch (_) {}
   try {
     await q(`UPDATE innings SET last_bowler_id=NULL WHERE last_bowler_id=$1`, [pl.id]).catch(() => {});
     await q(`DELETE FROM match_players WHERE id=$1`, [pl.id]);
@@ -4891,6 +4920,7 @@ bot.command('restore', async (ctx) => {
     await q(`DELETE FROM match_awards WHERE match_id=$1`, [String(m.id)]).catch(() => {});
     await q(`UPDATE tour_fixtures SET status='pending', winner=NULL WHERE match_id=$1 AND status='done'`, [m.id]).catch(() => {});
     touchMatch(m.id);
+    await logEv(m.id, 'restored', `RESTORED: the match was reopened by ${evName({ first_name: ctx.from.first_name, last_name: ctx.from.last_name, username: ctx.from.username, telegram_id: ctx.from.id })}.`);
     const m2 = await getMatch(m.id);
     await ctx.reply(`✅ *Match restored.*\n> Innings ${n}: *${inn.total_runs}/${inn.total_wickets}* (${oversStr(inn.balls_bowled)} ov)\n> The game continues from here.`, { parse_mode: 'Markdown' });
     try { startIdleWatch(m.id, [m2.status, m2.setup_phase || '', 0, 0].join('|')); } catch (_) {}
@@ -6000,6 +6030,7 @@ bot.action(/^imc:(A|B):(-?\d+):(-?\d+):(\d+)$/, async (ctx) => {
     const ins = await q(`INSERT INTO impact_used (match_id, team_label, in_tg, out_tg) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING team_label`, [String(g.m.id), L, inP.telegram_id, outP.telegram_id]);
     if (!ins.rows.length) return ctx.answerCbQuery('This team has already used its Impact Player.', { show_alert: true });
     await q(`UPDATE match_players SET telegram_id=$2, username=$3, first_name=$4, last_name=NULL WHERE id=$1`, [outP.id, inP.telegram_id, inP.username || null, inP.name || null]);
+    logEv(g.m.id, 'impact', `IMPACT PLAYER (Team ${L}): ${tName(inP)} came IN, ${shortName(outP, 28)} went OUT.`);
     await ctx.answerCbQuery('Impact Player done').catch(() => {});
     const mt = await getTeam(g.m.id, L);
     await ctx.editMessageText(`⚡ <b>IMPACT PLAYER</b> · ${escapeHtml(mt?.team_name || 'Team ' + L)}\n🔼 IN: <b>${escapeHtml(tName(inP))}</b>\n🔽 OUT: <b>${escapeHtml(shortName(outP, 28))}</b>`, { parse_mode: 'HTML' }).catch(() => {});
@@ -6496,6 +6527,10 @@ async function batTimeout({ m, inn, pend }) {
   if (!striker) return;
 
   const warn = bumpWarn(m.id, striker.id, 'bat');
+  if (!isSolo) {
+    await logEv(m.id, 'timeout', `TIMEOUT: ${evName(striker)} (Team ${inn.batting_team}) did not play within ${TURN_SECONDS}s while batting. Penalty -${TURN_PENALTY} runs. Warning ${warn}/${BAT_RETIRE_LIMIT}.`);
+    if (warn >= BAT_RETIRE_LIMIT) await logEv(m.id, 'retired', `RETIRED OUT: ${evName(striker)} (Team ${inn.batting_team}) was given out after ${BAT_RETIRE_LIMIT} timeouts. ${await playerSnap(striker)}`);
+  }
   if (isSolo) await applyPlayerPenalty(inn, striker);
   else await applyTeamPenalty(m, inn.batting_team);
 
@@ -6518,7 +6553,7 @@ async function batTimeout({ m, inn, pend }) {
 
   resetWarn(m.id, striker.id, 'bat');
   await q(`UPDATE pending_balls SET is_resolved=TRUE WHERE innings_id=$1 AND is_resolved=FALSE`, [inn.id]);
-  await q(`UPDATE batting_stats SET is_out=TRUE WHERE innings_id=$1 AND player_id=$2`, [inn.id, striker.id]);
+  await q(`UPDATE batting_stats SET is_out=TRUE, dismissal_type='retired out' WHERE innings_id=$1 AND player_id=$2`, [inn.id, striker.id]);
   await q(
     `UPDATE innings SET total_wickets=total_wickets+1, striker_player_id=NULL, ball_state='idle' WHERE id=$1`,
     [inn.id]
@@ -6597,6 +6632,7 @@ async function bowlTimeout({ m, inn, pend }) {
       `> 🔁 This ball is cancelled.`,
     { parse_mode: 'Markdown' }
   );
+  if (!isSolo) await logEv(m.id, 'timeout', `TIMEOUT: ${evName(bowler)} (Team ${inn.bowling_team}) did not send a bowling number within ${TURN_SECONDS}s. Penalty -${TURN_PENALTY} runs. Warning ${warn}/${limit}.`);
   if (isSolo && warn >= limit) soloIdleReset(m.id);
   else if (isSolo && (await soloIdleHit(m, inn))) return;
 
@@ -7233,6 +7269,13 @@ async function buildMatchDataText(matchId) {
     if (!innDels.length) lines.push('    (no deliveries)');
     lines.push('');
   }
+  try {
+    const { rows: evs } = await q(`SELECT * FROM match_events WHERE match_id=$1 ORDER BY id`, [String(matchId)]);
+    lines.push('── MATCH EVENTS (timeouts, joins, removals, substitutes) ──');
+    if (!evs.length) lines.push('  (none)');
+    for (const e of evs) lines.push(`  [${new Date(e.at).toISOString().slice(11, 19)} UTC] Innings ${e.innings_no || '-'} · over ${e.ov || '-'} — ${e.text}`);
+    lines.push('');
+  } catch (_) {}
   lines.push('══════════════════════════════════════');
   lines.push(`Generated by Cric Monster · ${new Date().toISOString()}`);
   return lines.join('\n');
@@ -7517,9 +7560,16 @@ async function progressAfterBall(telegram, m0, inn2, isWicket) {
     const { rows: so1 } = await q(`SELECT COUNT(*)::int AS c FROM batting_stats WHERE innings_id=$1 AND is_out=TRUE AND player_id = ANY($2::uuid[])`, [inn2.id, batSide.map((p) => p.id)]);
     soloOut = so1[0].c;
   }
+  // team: all out = every player who is STILL in the team is out except the last one. total_wickets also counts players
+  // who were removed (timeout / kick), so players added later would never get their turn with the plain counter.
+  let teamOut = inn2.total_wickets;
+  if (!isSolo && !so && batSide.length) {
+    const { rows: to1 } = await q(`SELECT COUNT(*)::int AS c FROM batting_stats WHERE innings_id=$1 AND is_out=TRUE AND player_id = ANY($2::uuid[])`, [inn2.id, batSide.map((p) => p.id)]);
+    teamOut = to1[0].c;
+  }
   let ended = isSolo
     ? soloOut >= nBat
-    : inn2.total_wickets >= wkCap || inn2.balls_bowled >= maxBalls;
+    : (so ? inn2.total_wickets >= wkCap : teamOut >= wkCap) || inn2.balls_bowled >= maxBalls;
   if (!isSolo && isChase && m.target && inn2.total_runs >= m.target) ended = true;
 
   let matchFinished = false;
@@ -10902,6 +10952,7 @@ async function armPickClock(matchId, kind) {
       pickMiss.set(k + kind, n);
       const pen = n >= 2;
       if (pen) await applyTeamPenalty(x.m, team);
+      logEv(x.m.id, 'timeout', `CAPTAIN TIMEOUT: Team ${team} captain did not choose the ${kind === 'bat' ? 'new batsman' : 'new bowler'} within ${base}s. ${pen ? 'Penalty -' + TURN_PENALTY + ' runs.' : 'First warning, no penalty.'} (time-up ${n})`);
       const next = Math.max(30, PICK_SECONDS[kind] - 10 * Math.max(0, n - 1));
       await bot.telegram.sendMessage(gid,
         `⏰ *TIME UP*\n> ${tag} did not choose within ${base}s.\n${pen ? `> 💥 Penalty: *-${TURN_PENALTY} runs* for Team ${team}  (warning ${n - 1}/${PICK_MAX_MISS - 1})\n` : `> ⚠️ First warning, no penalty this time. Next time-up costs *-${TURN_PENALTY} runs*.\n`}` +
@@ -12741,14 +12792,33 @@ async function knownGroups() {
   );
   return rows.map((r) => Number(r.id));
 }
-bot.command('stats', ownerOnly(async (ctx) => {
+const statsOwner = ownerOnly(async (ctx) => {
   if (ctx.chat.type !== 'private') return;
   const groups = await knownGroups();
   const u = await q(`SELECT COUNT(*)::int AS n FROM users WHERE telegram_id > 0`);
   const mt = await q(`SELECT COUNT(*)::int AS n FROM matches`);
   const live = await q(`SELECT COUNT(*)::int AS n FROM matches WHERE status NOT IN ('completed','cancelled')`);
   return ctx.reply(`Total groups: ${groups.length}\nTotal users: ${u.rows[0].n}\nTotal matches: ${mt.rows[0].n}\nLive matches: ${live.rows[0].n}`);
-}));
+});
+async function matchLogCmd(ctx) {
+  try {
+    const m = (await getActiveMatch(ctx.chat.id)) || (await q(`SELECT * FROM matches WHERE group_chat_id=$1 ORDER BY created_at DESC LIMIT 1`, [ctx.chat.id])).rows[0];
+    if (!m) return ctx.reply('No match found in this group.');
+    const { rows: inns } = await q(`SELECT * FROM innings WHERE match_id=$1 ORDER BY innings_number`, [m.id]);
+    const { rows: evs } = await q(`SELECT * FROM match_events WHERE match_id=$1 ORDER BY id`, [String(m.id)]);
+    let t = `MATCH LOG (${m.status})\n`;
+    for (const i of inns) t += `Innings ${i.innings_number}: Team ${i.batting_team} ${i.total_runs}/${i.total_wickets} (${oversStr(i.balls_bowled)} ov)\n`;
+    t += '\nEVENTS\n';
+    if (!evs.length) t += 'No timeouts, joins, removals or substitutes were recorded for this match.';
+    for (const e of evs) t += `\n[Innings ${e.innings_no || '-'} · over ${e.ov || '-'}] ${e.text}\n`;
+    return sendLong(ctx.telegram, ctx.chat.id, t, {});
+  } catch (e) { console.error('matchlog:', e.message); }
+}
+bot.command('stats', async (ctx, next) => {
+  if (ctx.chat && ctx.chat.type !== 'private') return matchLogCmd(ctx);
+  return statsOwner(ctx, next);
+});
+bot.command(['matchlog', 'mlog'], (ctx) => (ctx.chat && ctx.chat.type !== 'private' ? matchLogCmd(ctx) : ctx.reply('Use /matchlog in the match group.')));
 bot.command('gstats', ownerOnly(async (ctx) => {
   if (ctx.chat.type !== 'private') return;
   const groups = await knownGroups();
@@ -14684,6 +14754,44 @@ bot.command('squads', async (ctx) => {
   }
   if (msg.trim()) await ctx.reply(msg, trep(ctx));
 });
+// /sqplayer [T<id>] [team] — sends every team's captain, vice captain and squad (numbers, usernames, ids) one team at a time, ready to copy
+bot.command(['sqplayer', 'sqplayers'], async (ctx) => {
+  try {
+    const tk = takeTid(cmdArgs(ctx));
+    let t;
+    if (tk.tid) {
+      t = (await q(`SELECT * FROM tournaments WHERE id=$1 AND status NOT IN ('cancelled','done')`, [tk.tid])).rows[0];
+      if (!t) return ctx.reply(`No running tournament has the ID T${tk.tid}.`);
+    } else {
+      if (!isGroup(ctx)) return ctx.reply('Use this in the tournament group, or add the tournament ID: /sqplayer T12');
+      t = await activeTour(ctx.chat.id);
+      if (!t) return ctx.reply('No tournament is open in this group.');
+    }
+    if (!(await canManageTour(ctx, t))) return ctx.reply('Only the tournament host or a group admin can use this.');
+    const rows = await tourPlayers(t.id);
+    let caps = rows.filter((r) => r.role === 'captain').sort((a, b) => (a.team_no || 0) - (b.team_no || 0));
+    const want = String(tk.rest || '').trim();
+    if (want) { const one = await findTeam(t, want); caps = one ? [one] : []; }
+    if (!caps.length) return ctx.reply(want ? 'Team not found.' : 'This tournament has no teams yet.');
+    const idOf = (p) => `<code>${p.telegram_id}</code>`;
+    const unameOf = (p) => (p.username ? `<code>@${escapeHtml(p.username)}</code>` : 'no username');
+    const chat = ctx.chat.id;
+    for (const c of caps) {
+      const vc = c.vc_id ? rows.find((x) => Number(x.telegram_id) === Number(c.vc_id)) : null;
+      const sq = rows.filter((p) => Number(p.owner_id) === Number(c.telegram_id) && p.role !== 'captain' && (!vc || Number(p.telegram_id) !== Number(vc.telegram_id)));
+      let s = `<b>${c.team_no || '-'} · ${escapeHtml(tm(c)).toUpperCase()}</b>\n` +
+        `Team name: <code>${escapeHtml(tm(c))}</code>\n` +
+        `Captain: ${escapeHtml(tName(c))} · ${unameOf(c)} · ${idOf(c)}\n` +
+        (vc ? `Vice captain: ${escapeHtml(tName(vc))} · ${unameOf(vc)} · ${idOf(vc)}\n` : 'Vice captain: not set\n') +
+        `Squad: ${sq.length} player${sq.length === 1 ? '' : 's'}\n`;
+      sq.forEach((p, i) => { s += `${i + 1}. ${escapeHtml(tName(p))} · ${unameOf(p)} · ${idOf(p)}\n`; });
+      if (sq.length) s += `\n<code>/sq ${escapeHtml(tm(c))} ${sq.map((p) => p.telegram_id).join(' ')}</code>`;
+      await ctx.telegram.sendMessage(chat, s, { parse_mode: 'HTML' }).catch((e) => console.error('sqplayer:', e.message));
+      await new Promise((r) => setTimeout(r, 700));
+    }
+  } catch (e) { console.error('sqplayer:', e.message); }
+});
+
 bot.command('squad', async (ctx) => {
   if (!isGroup(ctx)) return;
   const tk = takeTid(cmdArgs(ctx));
@@ -16698,6 +16806,10 @@ async function main() {
     updated_by TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await q(`CREATE TABLE IF NOT EXISTS match_events (
+    id BIGSERIAL PRIMARY KEY, match_id TEXT NOT NULL, at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    innings_no INT, ov TEXT, kind TEXT, text TEXT)`);
+  await q(`CREATE INDEX IF NOT EXISTS match_events_mid ON match_events (match_id)`).catch(() => {});
   await q(`CREATE TABLE IF NOT EXISTS match_awards (
     match_id TEXT NOT NULL,
     telegram_id BIGINT NOT NULL,
