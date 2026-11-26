@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r148-2026-11-26-retired-label-sqplayer'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r149-2026-11-26-sqplayer-design'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -14773,19 +14773,20 @@ bot.command(['sqplayer', 'sqplayers'], async (ctx) => {
     const want = String(tk.rest || '').trim();
     if (want) { const one = await findTeam(t, want); caps = one ? [one] : []; }
     if (!caps.length) return ctx.reply(want ? 'Team not found.' : 'This tournament has no teams yet.');
-    const idOf = (p) => `<code>${p.telegram_id}</code>`;
-    const unameOf = (p) => (p.username ? `<code>@${escapeHtml(p.username)}</code>` : 'no username');
+    const L = '\u200E'; // keeps right-to-left names from scrambling the line
+    const contact = (p) => `${p.username ? `<code>@${escapeHtml(p.username)}</code>` : '<i>no username</i>'}  ·  <code>${p.telegram_id}</code>`;
     const chat = ctx.chat.id;
     for (const c of caps) {
       const vc = c.vc_id ? rows.find((x) => Number(x.telegram_id) === Number(c.vc_id)) : null;
       const sq = rows.filter((p) => Number(p.owner_id) === Number(c.telegram_id) && p.role !== 'captain' && (!vc || Number(p.telegram_id) !== Number(vc.telegram_id)));
-      let s = `<b>${c.team_no || '-'} · ${escapeHtml(tm(c)).toUpperCase()}</b>\n` +
-        `Team name: <code>${escapeHtml(tm(c))}</code>\n` +
-        `Captain: ${escapeHtml(tName(c))} · ${unameOf(c)} · ${idOf(c)}\n` +
-        (vc ? `Vice captain: ${escapeHtml(tName(vc))} · ${unameOf(vc)} · ${idOf(vc)}\n` : 'Vice captain: not set\n') +
-        `Squad: ${sq.length} player${sq.length === 1 ? '' : 's'}\n`;
-      sq.forEach((p, i) => { s += `${i + 1}. ${escapeHtml(tName(p))} · ${unameOf(p)} · ${idOf(p)}\n`; });
-      if (sq.length) s += `\n<code>/sq ${escapeHtml(tm(c))} ${sq.map((p) => p.telegram_id).join(' ')}</code>`;
+      const bar = '━━━━━━━━━━━━━━━━━━';
+      let s = `🏆 <b>${c.team_no || '-'} · ${escapeHtml(tm(c)).toUpperCase()}</b>\n${bar}\n` +
+        `🏷 Team name: <code>${escapeHtml(tm(c))}</code>\n\n` +
+        `<blockquote>👑 <b>Captain</b>\n${L}${escapeHtml(tName(c))}\n${contact(c)}` +
+        (vc ? `\n\n🎖 <b>Vice Captain</b>\n${L}${escapeHtml(tName(vc))}\n${contact(vc)}` : '\n\n🎖 <b>Vice Captain</b>\n<i>not set</i>') + `</blockquote>\n` +
+        `<blockquote>👥 <b>Squad</b>  ·  ${sq.length} player${sq.length === 1 ? '' : 's'}` +
+        (sq.length ? '\n' + sq.map((p, i) => `\n<b>${i + 1}.</b> ${L}${escapeHtml(tName(p))}\n      ${contact(p)}`).join('\n') : '\n<i>No players yet</i>') + `</blockquote>`;
+      if (sq.length) s += `\n📋 <b>Copy to add again</b>\n<code>/sq ${escapeHtml(tm(c))} ${sq.map((p) => p.telegram_id).join(' ')}</code>`;
       await ctx.telegram.sendMessage(chat, s, { parse_mode: 'HTML' }).catch((e) => console.error('sqplayer:', e.message));
       await new Promise((r) => setTimeout(r, 700));
     }
