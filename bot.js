@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r149-2026-11-26-sqplayer-design'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r150-2026-11-27-remove-byname-refresh-nostart'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -4273,15 +4273,12 @@ async function tourRemoveByNo(ctx) {
   try {
     const tk = takeTid(cmdArgs(ctx));
     let mm = /^(\d{1,2})\s+(.+)$/s.exec(String(tk.rest || '').trim());
-    let byUser = null;
+    let byWords = null;
     if (!mm) {
-      // /remove <team name> <@user | id>
-      const w = String(tk.rest || '').trim().split(/\s+/);
-      if (w.length < 2) return false;
-      const last = w[w.length - 1];
-      if (!/^@?\w+$/.test(last)) return false;
-      byUser = last.replace(/^@/, '').toLowerCase();
-      mm = [null, '0', w.slice(0, -1).join(' ')];
+      // /remove <team name> <@user | id | name>   or   /remove <@user | id | name>
+      byWords = String(tk.rest || '').trim().split(/\s+/).filter(Boolean);
+      if (!byWords.length) return false;
+      mm = [null, '0', ''];
     }
     let t;
     if (tk.tid) {
@@ -4292,24 +4289,48 @@ async function tourRemoveByNo(ctx) {
       t = await activeTour(ctx.chat.id);
       if (!t) return false; // no tournament here: normal in-match /remove
     }
+    if (byWords && !(await canManageTour(ctx, t))) return false;
     if (!(await canManageTour(ctx, t))) { await ctx.reply('Only the tournament host or a group admin can remove squad players.', trep(ctx)); return true; }
-    const cap = await findTeam(t, mm[2].trim());
-    if (!cap && byUser) return false;
-    if (!cap) { await ctx.reply(`Team not found. Usage: /remove &lt;player no&gt; &lt;team name or team no&gt;, for example /remove 1 Delhi`, trep(ctx)); return true; }
-    if (t.tmode !== 'manual' && tourAuc.has(String(t.id))) { await ctx.reply(`${pe('warn')} The auction is running. Remove players after it ends.`, trep(ctx)); return true; }
     const rows = await tourPlayers(t.id);
+    let cap = null, row = null, no = 0;
+    if (byWords) {
+      const lc = (x) => String(x || '').toLowerCase().trim();
+      const isMatch = (p, tg) => {
+        const bare = tg.replace(/^@/, '');
+        return String(p.telegram_id) === bare || lc(p.username) === lc(bare) || lc(tName(p)) === lc(tg) || lc(p.name) === lc(tg);
+      };
+      let teamSeen = null;
+      for (let k = 0; k < byWords.length && !row; k++) {
+        const target = byWords.slice(k).join(' ');
+        if (k === 0) {
+          if (await getActiveMatch(ctx.chat.id).catch(() => null)) continue; // a match is running: /remove belongs to the match
+          const hit = rows.filter((p) => p.role !== 'captain' && p.owner_id && isMatch(p, target));
+          if (hit.length === 1) { row = hit[0]; cap = rows.find((c) => c.role === 'captain' && Number(c.telegram_id) === Number(row.owner_id)); }
+        } else {
+          const c = await findTeam(t, byWords.slice(0, k).join(' '));
+          if (!c) continue;
+          teamSeen = c;
+          const sq = rows.filter((p) => p.role !== 'captain' && Number(p.owner_id) === Number(c.telegram_id));
+          const hit = sq.filter((p) => isMatch(p, target));
+          if (hit.length === 1) { row = hit[0]; cap = c; }
+          else if (rows.some((p) => p.role === 'captain' && Number(p.telegram_id) === Number(c.telegram_id) && isMatch(p, target))) {
+            await ctx.reply(`That player is the captain of <b>${escapeHtml(tm(c))}</b>. To replace him use /cap ${escapeHtml(tm(c))} &lt;new captain&gt;, to delete the whole team use /removeteam ${escapeHtml(tm(c))}.`, trep(ctx)); return true;
+          }
+        }
+      }
+      if (!row) {
+        if (teamSeen) { await ctx.reply(`That player is not in the squad of <b>${escapeHtml(tm(teamSeen))}</b>. Use his id, @username or exact name.`, trep(ctx)); return true; }
+        return false;
+      }
+    } else {
+      cap = await findTeam(t, mm[2].trim());
+      if (!cap) { await ctx.reply(`Team not found. Usage: /remove &lt;player no&gt; &lt;team name or team no&gt;, for example /remove 1 Delhi`, trep(ctx)); return true; }
+    }
+    if (t.tmode !== 'manual' && tourAuc.has(String(t.id))) { await ctx.reply(`${pe('warn')} The auction is running. Remove players after it ends.`, trep(ctx)); return true; }
     const mine = rows.filter((p) => p.role !== 'captain' && Number(p.owner_id) === Number(cap.telegram_id));
     // numbers follow the squad list: the vice captain is shown separately and is not numbered
     const numbered = mine.filter((p) => !cap.vc_id || Number(p.telegram_id) !== Number(cap.vc_id));
-    let no = Number(mm[1]);
-    let row = numbered[no - 1];
-    if (byUser) {
-      row = rows.find((p) => (String(p.telegram_id) === byUser || String(p.username || '').toLowerCase() === byUser) && p.role === 'captain' && Number(p.telegram_id) === Number(cap.telegram_id));
-      if (row) { await ctx.reply(`That player is the captain of <b>${escapeHtml(tm(cap))}</b>. To replace him use /cap ${escapeHtml(tm(cap))} &lt;new captain&gt;, to delete the whole team use /removeteam ${escapeHtml(tm(cap))}.`, trep(ctx)); return true; }
-      row = mine.find((p) => String(p.telegram_id) === byUser || String(p.username || '').toLowerCase() === byUser);
-      no = mine.indexOf(row) + 1;
-      if (!row) { await ctx.reply(`That player is not in the squad of <b>${escapeHtml(tm(cap))}</b>.`, trep(ctx)); return true; }
-    }
+    if (!byWords) { no = Number(mm[1]); row = numbered[no - 1]; }
     if (!row) { await ctx.reply(`<b>${escapeHtml(tm(cap))}</b> has ${numbered.length} numbered player${numbered.length === 1 ? '' : 's'} in the squad list, so number ${no} does not exist. Check /squad ${escapeHtml(tm(cap))}.`, trep(ctx)); return true; }
     await q(`UPDATE tournament_players SET vc_id=NULL WHERE tid=$1 AND telegram_id=$2 AND vc_id=$3`, [t.id, cap.telegram_id, row.telegram_id]);
     if (t.tmode === 'manual') {
@@ -13975,7 +13996,42 @@ async function setTourStatus(id, status, extra = '') { await q(`UPDATE tournamen
 async function canManageTour(ctx, t) {
   return Number(t.host_id) === ctx.from.id || isAdmin(ctx.from.id) || (await isGroupAdmin(Number(t.group_chat_id), ctx.from.id));
 }
-const tourPlayers = async (tid) => (await q(`SELECT * FROM tournament_players WHERE tid=$1 ORDER BY role DESC, telegram_id`, [tid])).rows;
+// names are always taken fresh from the users table (kept up to date on every message); the telegram id is the permanent key
+const tourPlayers = async (tid) => (await q(
+  `SELECT tp.*,
+          COALESCE(NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''), tp.name) AS name,
+          COALESCE(u.username, tp.username) AS username
+     FROM tournament_players tp LEFT JOIN users u ON u.telegram_id = tp.telegram_id
+    WHERE tp.tid=$1 ORDER BY tp.role DESC, tp.telegram_id`, [tid])).rows;
+// ask Telegram for the current name of every tournament player who is in this chat, and store it
+async function refreshTourNames(tg, chatId, t) {
+  const rows = (await q(`SELECT telegram_id FROM tournament_players WHERE tid=$1`, [t.id])).rows;
+  let changed = 0;
+  for (const r of rows) {
+    try {
+      const cm = await tg.getChatMember(chatId, Number(r.telegram_id));
+      const u = cm && cm.user;
+      if (!u || u.is_bot) continue;
+      const full = [u.first_name, u.last_name].filter(Boolean).join(' ').trim();
+      const up = await q(`UPDATE users SET first_name=$2, last_name=$3, username=$4 WHERE telegram_id=$1 AND (first_name IS DISTINCT FROM $2 OR last_name IS DISTINCT FROM $3 OR username IS DISTINCT FROM $4)`, [r.telegram_id, u.first_name || null, u.last_name || null, u.username || null]);
+      const up2 = await q(`UPDATE tournament_players SET name=$3, username=$4 WHERE tid=$1 AND telegram_id=$2 AND (name IS DISTINCT FROM $3 OR username IS DISTINCT FROM $4)`, [t.id, r.telegram_id, full || null, u.username || null]);
+      if (up.rowCount || up2.rowCount) changed++;
+    } catch (_) { /* not in this chat */ }
+    await new Promise((x) => setTimeout(x, 60));
+  }
+  return changed;
+}
+bot.command('refreshnames', async (ctx) => {
+  try {
+    const tk = takeTid(cmdArgs(ctx));
+    const t = tk.tid ? (await q(`SELECT * FROM tournaments WHERE id=$1`, [tk.tid])).rows[0] : (isGroup(ctx) ? await activeTour(ctx.chat.id) : null);
+    if (!t) return ctx.reply('No tournament found. Use /refreshnames in the tournament group.');
+    if (!(await canManageTour(ctx, t))) return ctx.reply('Only the tournament host or a group admin can use this.');
+    const wait = await ctx.reply('Refreshing player names...');
+    const n = await refreshTourNames(ctx.telegram, ctx.chat.id, t);
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, undefined, `Done. ${n} name${n === 1 ? '' : 's'} updated. IDs never change.`).catch(() => {});
+  } catch (e) { console.error('refreshnames:', e.message); }
+});
 async function tourText(t) {
   const rows = await tourPlayers(t.id);
   const caps = rows.filter((r) => r.role === 'captain').sort((a, b) => (a.team_no || 99) - (b.team_no || 99));
@@ -14075,7 +14131,22 @@ async function resolveUsers(ctx, text) {
   if (!ids.size && !names.size) return { found: [], missing: [] };
   const { rows } = await q(`SELECT telegram_id, username, first_name, last_name FROM users WHERE telegram_id = ANY($1::bigint[]) OR LOWER(username) = ANY($2::text[])`, [[...ids], [...names]]);
   const found = rows.map((r) => ({ id: Number(r.telegram_id), username: r.username, name: fullName(r) || r.username || String(r.telegram_id) }));
-  const missing = [...ids].filter((i) => !found.some((f) => f.id === i)).map(String).concat([...names].filter((n) => !found.some((f) => (f.username || '').toLowerCase() === n)).map((n) => '@' + n));
+  // people who never started the bot: ask Telegram (works when they are in this chat), otherwise add them by id alone
+  for (const i of [...ids].filter((i) => !found.some((f) => f.id === i))) {
+    let nm = null, un = null;
+    try {
+      const cm = await ctx.telegram.getChatMember(ctx.chat.id, i);
+      if (cm && cm.user && !cm.user.is_bot) { nm = [cm.user.first_name, cm.user.last_name].filter(Boolean).join(' ').trim(); un = cm.user.username || null; }
+    } catch (_) {}
+    found.push({ id: i, username: un, name: nm || un || `Player ${i}` });
+  }
+  for (const n of [...names].filter((n) => !found.some((f) => (f.username || '').toLowerCase() === n))) {
+    try {
+      const c = await ctx.telegram.getChat('@' + n);
+      if (c && c.type === 'private' && c.id) found.push({ id: Number(c.id), username: c.username || n, name: [c.first_name, c.last_name].filter(Boolean).join(' ').trim() || n });
+    } catch (_) {}
+  }
+  const missing = [...names].filter((n) => !found.some((f) => (f.username || '').toLowerCase() === n)).map((n) => '@' + n);
   return { found, missing };
 }
 // a person who already plays for another team (squad / VC) cannot become a captain; returns the reason, or null when it is fine
@@ -14768,6 +14839,7 @@ bot.command(['sqplayer', 'sqplayers'], async (ctx) => {
       if (!t) return ctx.reply('No tournament is open in this group.');
     }
     if (!(await canManageTour(ctx, t))) return ctx.reply('Only the tournament host or a group admin can use this.');
+    await refreshTourNames(ctx.telegram, ctx.chat.id, t).catch(() => {});
     const rows = await tourPlayers(t.id);
     let caps = rows.filter((r) => r.role === 'captain').sort((a, b) => (a.team_no || 0) - (b.team_no || 0));
     const want = String(tk.rest || '').trim();
