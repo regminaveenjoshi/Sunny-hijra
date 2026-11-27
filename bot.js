@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 pool.on('error', (e) => console.error('pg pool error:', e.message));
 
-const BOT_VERSION = 'r150-2026-11-27-remove-byname-refresh-nostart'; // shown by /testcard and in the logs so you can see which file is deployed
+const BOT_VERSION = 'r152-2026-11-27-fast-refresh'; // shown by /testcard and in the logs so you can see which file is deployed
 const bot = new Telegraf(BOT_TOKEN);
 // Cutting a name with slice() can split an emoji / fancy letter in half. Telegram then refuses the text
 // ("text must be encoded in UTF-8"). Clean every outgoing text and caption once, here.
@@ -13968,7 +13968,7 @@ function startGrowthTicks() {
 const AUC_SET = 10; // players per set
 const tourAuc = new Map(); // tournament id -> live auction state
 const tourSetup = new Map(); // `${chat}:${user}` -> { tid, step }
-const tName = (r) => String(r.name || (r.username ? '@' + r.username : 'Player')).slice(0, 24);
+const tName = (r) => { const nm = r.name && !/^Player \d+$/.test(r.name) ? r.name : ''; return String(nm || (r.username ? '@' + r.username : r.name || 'Player')).slice(0, 24); };
 const tTag = (r) => `<a href="tg://user?id=${Number(r.telegram_id)}">${escapeHtml(tName(r))}</a>`;
 const fullName = (u) => [u.first_name, u.last_name].filter(Boolean).join(' ').trim();
 const trep = (ctx) => ({ parse_mode: 'HTML', reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
@@ -14006,19 +14006,24 @@ const tourPlayers = async (tid) => (await q(
 // ask Telegram for the current name of every tournament player who is in this chat, and store it
 async function refreshTourNames(tg, chatId, t) {
   const rows = (await q(`SELECT telegram_id FROM tournament_players WHERE tid=$1`, [t.id])).rows;
+  // only the tournament's own players, looked up in this chat and the tournament group
+  const list = [...new Set([Number(chatId), Number(t.group_chat_id)])];
   let changed = 0;
-  for (const r of rows) {
-    try {
-      const cm = await tg.getChatMember(chatId, Number(r.telegram_id));
-      const u = cm && cm.user;
-      if (!u || u.is_bot) continue;
-      const full = [u.first_name, u.last_name].filter(Boolean).join(' ').trim();
-      const up = await q(`UPDATE users SET first_name=$2, last_name=$3, username=$4 WHERE telegram_id=$1 AND (first_name IS DISTINCT FROM $2 OR last_name IS DISTINCT FROM $3 OR username IS DISTINCT FROM $4)`, [r.telegram_id, u.first_name || null, u.last_name || null, u.username || null]);
-      const up2 = await q(`UPDATE tournament_players SET name=$3, username=$4 WHERE tid=$1 AND telegram_id=$2 AND (name IS DISTINCT FROM $3 OR username IS DISTINCT FROM $4)`, [t.id, r.telegram_id, full || null, u.username || null]);
-      if (up.rowCount || up2.rowCount) changed++;
-    } catch (_) { /* not in this chat */ }
-    await new Promise((x) => setTimeout(x, 60));
-  }
+  const one = async (r) => {
+    for (const cid of list) {
+      try {
+        const cm = await tg.getChatMember(cid, Number(r.telegram_id));
+        const u = cm && cm.user;
+        if (!u || u.is_bot) continue;
+        const full = [u.first_name, u.last_name].filter(Boolean).join(' ').trim();
+        const up = await q(`UPDATE users SET first_name=$2, last_name=$3, username=$4 WHERE telegram_id=$1 AND (first_name IS DISTINCT FROM $2 OR last_name IS DISTINCT FROM $3 OR username IS DISTINCT FROM $4)`, [r.telegram_id, u.first_name || null, u.last_name || null, u.username || null]);
+        const up2 = await q(`UPDATE tournament_players SET name=$3, username=$4 WHERE tid=$1 AND telegram_id=$2 AND (name IS DISTINCT FROM $3 OR username IS DISTINCT FROM $4)`, [t.id, r.telegram_id, full || null, u.username || null]);
+        if (up.rowCount || up2.rowCount) changed++;
+        return;
+      } catch (_) { /* not in this chat */ }
+    }
+  };
+  for (let i = 0; i < rows.length; i += 10) await Promise.all(rows.slice(i, i + 10).map(one)); // 10 at a time
   return changed;
 }
 bot.command('refreshnames', async (ctx) => {
